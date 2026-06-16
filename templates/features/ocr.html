@@ -1,0 +1,104 @@
+<div class="card">
+    <h2><i class="fas fa-file-alt"></i> Document OCR & Text Extraction</h2>
+    <p>Upload an image (JPG, PNG, BMP, TIFF) or PDF to extract text using OCR. Supports multiple languages.</p>
+    <form id="ocrForm" enctype="multipart/form-data">
+        <div class="input-group">
+            <input type="file" id="ocrFile" accept=".png,.jpg,.jpeg,.bmp,.tiff,.pdf" required>
+            <select id="ocrLang">
+                <option value="eng">English</option>
+                <option value="spa">Spanish</option>
+                <option value="fra">French</option>
+                <option value="deu">German</option>
+                <option value="ita">Italian</option>
+                <option value="por">Portuguese</option>
+                <option value="rus">Russian</option>
+                <option value="jpn">Japanese</option>
+                <option value="kor">Korean</option>
+                <option value="zho">Chinese (Simplified)</option>
+                <option value="ara">Arabic</option>
+                <option value="hin">Hindi</option>
+                <option value="tur">Turkish</option>
+                <option value="nld">Dutch</option>
+                <option value="pol">Polish</option>
+                <option value="swe">Swedish</option>
+                <option value="nor">Norwegian</option>
+                <option value="dan">Danish</option>
+                <option value="fin">Finnish</option>
+                <option value="heb">Hebrew</option>
+            </select>
+            <button type="submit" id="ocrSubmitBtn" class="primary"><i class="fas fa-microchip"></i> Extract Text</button>
+        </div>
+        <div id="ocrStatus" class="help-text"></div>
+        <div id="ocrResult" class="empty-state">Upload a file and click Extract Text.</div>
+    </form>
+</div>
+
+<script>
+    (function() {
+        const form = document.getElementById('ocrForm');
+        const fileInput = document.getElementById('ocrFile');
+        const langSelect = document.getElementById('ocrLang');
+        const statusDiv = document.getElementById('ocrStatus');
+        const resultDiv = document.getElementById('ocrResult');
+
+        let currentTaskId = null;
+        let pollInterval = null;
+
+        form.addEventListener('submit', async function(e) {
+            e.preventDefault();
+            const file = fileInput.files[0];
+            if (!file) {
+                showToast('Select a file', true);
+                return;
+            }
+            const lang = langSelect.value;
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('language', lang);
+
+            try {
+                const resp = await fetch('/ocr/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await resp.json();
+                if (data.error) throw new Error(data.error);
+                currentTaskId = data.task_id;
+                statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Processing OCR (this may take a while)...';
+                resultDiv.innerHTML = '<div class="empty-state">Please wait...</div>';
+                if (pollInterval) clearInterval(pollInterval);
+                pollInterval = setInterval(pollOcrTask, 2000);
+            } catch (err) {
+                showToast(err.message, true);
+            }
+        });
+
+        async function pollOcrTask() {
+            if (!currentTaskId) return;
+            try {
+                const resp = await fetch(`/progress/${currentTaskId}`);
+                const task = await resp.json();
+                if (task.error) {
+                    clearInterval(pollInterval);
+                    statusDiv.innerHTML = `<span style="color:#ff8a8a;">Error: ${task.error}</span>`;
+                    resultDiv.innerHTML = '<div class="empty-state">OCR failed.</div>';
+                    return;
+                }
+                const progress = task.progress || 0;
+                if (task.status === 'done') {
+                    clearInterval(pollInterval);
+                    statusDiv.innerHTML = `✅ Done! <a href="/download/${task.output_file}" target="_blank">Download text file</a>`;
+                    resultDiv.innerHTML = `<div class="empty-state">✅ OCR completed. <a href="/download/${task.output_file}">${task.output_file}</a></div>`;
+                } else if (task.status === 'error') {
+                    clearInterval(pollInterval);
+                    statusDiv.innerHTML = `<span style="color:#ff8a8a;">❌ Error: ${task.error_msg}</span>`;
+                    resultDiv.innerHTML = '<div class="empty-state">OCR failed.</div>';
+                } else {
+                    statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Processing (${progress}%)...`;
+                }
+            } catch (err) {
+                console.error(err);
+            }
+        }
+    })();
+</script>
