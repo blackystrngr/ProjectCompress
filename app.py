@@ -12,14 +12,12 @@ import hashlib
 import subprocess
 from flask import Flask, render_template, jsonify, request, send_from_directory
 from waitress import serve
+from werkzeug.exceptions import NotFound
 from config import SECRET_KEY, MAX_CONTENT_LENGTH, UPLOAD_FOLDER, TASKS_DIR
 from tasks import get_all_task_ids, load_task, save_task
 from features import register_all_features
 
-# Webhook secret – set environment variable or use config
 WEBHOOK_SECRET = "atomisfake"
-
-# Path to your SSH deploy key
 GITHUB_DEPLOY_KEY = os.path.expanduser('~/.ssh/github_deploy')
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -39,11 +37,18 @@ def create_app():
     # Register all feature routes
     register_all_features(app)
 
-    # ---------- Webhook endpoint – fetches and hard resets ----------
+    # ---------- 404 handler for missing endpoints ----------
+    @app.errorhandler(NotFound)
+    def handle_not_found(e):
+        # If the request is for an API-like path, return JSON
+        if request.path.startswith(('/api', '/get_tasks', '/progress')):
+            return jsonify({'error': 'Endpoint not found'}), 404
+        # For HTML requests, redirect to home or show a simple message
+        return render_template('index.html'), 404
+
+    # ---------- Webhook endpoint ----------
     @app.route('/webhook', methods=['POST'])
     def webhook():
-        """GitHub webhook – fetches, resets to origin/main, and restarts."""
-        # Verify signature (optional)
         signature = request.headers.get('X-Hub-Signature-256')
         if signature and WEBHOOK_SECRET:
             payload = request.get_data()
@@ -52,58 +57,38 @@ def create_app():
                 logger.warning("Invalid webhook signature")
                 return jsonify({'error': 'Invalid signature'}), 401
 
-        # Only react to 'push' events
         event = request.headers.get('X-GitHub-Event')
         if event != 'push':
             return jsonify({'message': 'Ignored event'}), 200
 
         logger.info("Received push event – fetching latest code...")
-
-        # Set environment to use the deploy key
         env = os.environ.copy()
         env['GIT_SSH_COMMAND'] = f'ssh -i {GITHUB_DEPLOY_KEY} -o StrictHostKeyChecking=no'
 
         try:
-            # 1. Fetch the latest changes
             fetch_cmd = ['git', 'fetch', 'origin', 'main']
-            fetch_result = subprocess.run(
-                fetch_cmd,
-                cwd=REPO_DIR,
-                capture_output=True,
-                text=True,
-                env=env
-            )
+            fetch_result = subprocess.run(fetch_cmd, cwd=REPO_DIR, capture_output=True, text=True, env=env)
             if fetch_result.returncode != 0:
                 logger.error(f"Git fetch failed: {fetch_result.stderr}")
                 return jsonify({'error': 'Git fetch failed', 'details': fetch_result.stderr}), 500
-            logger.info(f"Git fetch succeeded: {fetch_result.stdout}")
 
-            # 2. Reset the working directory to origin/main (discard local changes)
             reset_cmd = ['git', 'reset', '--hard', 'origin/main']
-            reset_result = subprocess.run(
-                reset_cmd,
-                cwd=REPO_DIR,
-                capture_output=True,
-                text=True,
-                env=env
-            )
+            reset_result = subprocess.run(reset_cmd, cwd=REPO_DIR, capture_output=True, text=True, env=env)
             if reset_result.returncode != 0:
                 logger.error(f"Git reset failed: {reset_result.stderr}")
                 return jsonify({'error': 'Git reset failed', 'details': reset_result.stderr}), 500
-            logger.info(f"Git reset succeeded: {reset_result.stdout}")
 
+            logger.info(f"Git reset succeeded: {reset_result.stdout}")
         except Exception as e:
             logger.exception("Git operation exception")
             return jsonify({'error': str(e)}), 500
 
-        # Restart the app in a background thread
         def restart():
-            time.sleep(1)  # give response time to send
+            time.sleep(1)
             logger.info("Restarting Flask app...")
             os.execv(sys.executable, [sys.executable] + sys.argv)
 
         threading.Thread(target=restart, daemon=True).start()
-
         return jsonify({'status': 'updated, restarting...'}), 200
 
     # ---------- Global error handler ----------
@@ -115,16 +100,13 @@ def create_app():
     # ---------- Task endpoints ----------
     @app.route('/get_tasks', methods=['GET'])
     def get_tasks():
-        """Return only tasks that are NOT finished (terminal statuses)."""
         active = []
-        # All statuses that should NOT appear in the Active Tasks pane
         terminal_statuses = {'done', 'error', 'cancelled', 'search_done', 'scan_done'}
         try:
             for tid in get_all_task_ids():
                 try:
                     task = load_task(tid)
                     if task and task.get('status') not in terminal_statuses:
-                        # Remove sensitive fields
                         safe_task = {k: v for k, v in task.items() if k not in ['process_pid']}
                         active.append(safe_task)
                 except Exception as e:
@@ -140,7 +122,6 @@ def create_app():
             task = load_task(task_id)
             if not task:
                 return jsonify({'error': 'Task not found'}), 404
-            # Normalize progress values
             if 'download_progress' in task:
                 task['download_progress'] = int(task['download_progress'])
             if 'upload_progress' in task:
@@ -184,7 +165,7 @@ def create_app():
     def index():
         return render_template('index.html')
 
-    # ---------- Favicon: return 204 to avoid 404 errors ----------
+    # Favicon: return 204 to avoid 404 errors
     @app.route('/favicon.ico')
     def favicon():
         return '', 204
@@ -192,7 +173,6 @@ def create_app():
     return app
 
 if __name__ == '__main__':
-    # Clean up stale tasks
     for tid in get_all_task_ids():
         if not load_task(tid):
             try:
