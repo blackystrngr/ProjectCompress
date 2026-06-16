@@ -13,35 +13,59 @@ from config import UPLOAD_FOLDER
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------
-# Detect Tesseract location
+# Tesseract detection – robust and debuggable
 # ------------------------------------------------------------
 TESSERACT_AVAILABLE = False
 TESSERACT_PATH = None
 
-# Try to find tesseract binary
-possible_paths = [
-    shutil.which('tesseract'),
-    '/usr/bin/tesseract',
-    '/usr/local/bin/tesseract',
-    '/opt/homebrew/bin/tesseract',  # macOS
-]
+def find_tesseract():
+    """Locate the tesseract binary using multiple strategies."""
+    # 1. Check environment variable
+    env_path = os.environ.get('TESSERACT_PATH')
+    if env_path and os.path.exists(env_path):
+        return env_path
 
-for path in possible_paths:
-    if path and os.path.exists(path):
-        try:
-            # Test if it runs
-            subprocess.run([path, '--version'], capture_output=True, check=True)
-            TESSERACT_PATH = path
-            TESSERACT_AVAILABLE = True
-            logger.info(f"Tesseract found at: {path}")
-            break
-        except:
-            continue
+    # 2. Use shutil.which (looks in PATH)
+    path = shutil.which('tesseract')
+    if path:
+        return path
 
-if not TESSERACT_AVAILABLE:
-    logger.warning("Tesseract not found. OCR will not work. Install tesseract-ocr and ensure it's in PATH.")
+    # 3. Check common installation directories
+    common_paths = [
+        '/usr/bin/tesseract',
+        '/usr/local/bin/tesseract',
+        '/opt/homebrew/bin/tesseract',
+        '/opt/local/bin/tesseract',
+    ]
+    for p in common_paths:
+        if os.path.exists(p):
+            return p
 
-# Set the path for pytesseract if found
+    # 4. Try using 'which tesseract' via subprocess (shell)
+    try:
+        result = subprocess.run(['which', 'tesseract'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except:
+        pass
+
+    return None
+
+# Try to find tesseract
+found_path = find_tesseract()
+if found_path:
+    # Test if it runs
+    try:
+        subprocess.run([found_path, '--version'], capture_output=True, check=True)
+        TESSERACT_PATH = found_path
+        TESSERACT_AVAILABLE = True
+        logger.info(f"Tesseract found at: {found_path}")
+    except Exception as e:
+        logger.warning(f"Tesseract found at {found_path} but failed to run: {e}")
+else:
+    logger.warning("Tesseract not found in any common location. OCR will not work.")
+
+# If found, import pytesseract and set the path
 if TESSERACT_AVAILABLE:
     try:
         import pytesseract
@@ -51,18 +75,29 @@ if TESSERACT_AVAILABLE:
     except ImportError as e:
         logger.error(f"Failed to import pytesseract or PIL: {e}")
         TESSERACT_AVAILABLE = False
+else:
+    # Even if we didn't find the binary, we still import for error handling
+    try:
+        import pytesseract
+        from PIL import Image
+        # The path will be set only if found; otherwise we'll get an error later
+    except ImportError as e:
+        logger.error(f"Required OCR libraries not installed: {e}")
 
 # Check for poppler-utils (for PDFs)
 POPPLER_AVAILABLE = False
 try:
-    subprocess.run(['pdftoppm', '-v'], capture_output=True, check=True)
-    from pdf2image import convert_from_path
-    POPPLER_AVAILABLE = True
-    logger.info("poppler-utils found, PDF support enabled")
+    # Try to find pdftoppm
+    if shutil.which('pdftoppm') or os.path.exists('/usr/bin/pdftoppm'):
+        from pdf2image import convert_from_path
+        POPPLER_AVAILABLE = True
+        logger.info("poppler-utils found, PDF support enabled")
+    else:
+        logger.warning("poppler-utils not found. PDF processing will not work.")
 except:
-    logger.warning("poppler-utils not found. PDF processing will not work.")
+    logger.warning("pdf2image not installed. PDF support disabled.")
 
-# Supported languages (ISO 639-2 codes)
+# Supported languages
 LANGUAGES = {
     'eng': 'English',
     'spa': 'Spanish',
@@ -89,9 +124,8 @@ LANGUAGES = {
 ALLOWED_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.pdf'}
 
 def extract_text_from_image(image_path, lang='eng'):
-    """Extract text from a single image using Tesseract."""
     if not TESSERACT_AVAILABLE:
-        raise Exception("Tesseract is not installed or not found in PATH. Please install tesseract-ocr (sudo apt install tesseract-ocr) and restart the server.")
+        raise Exception("Tesseract is not available. Please install it: sudo apt install tesseract-ocr tesseract-ocr-eng (and ensure it's in PATH). Then restart the Flask server.")
     try:
         from PIL import Image
         import pytesseract
@@ -105,11 +139,11 @@ def extract_text_from_image(image_path, lang='eng'):
         raise Exception(f"OCR failed: {str(e)}")
 
 def extract_text_from_pdf(pdf_path, lang='eng'):
-    """Extract text from a PDF by converting each page to an image and OCR'ing."""
     if not POPPLER_AVAILABLE:
-        raise Exception("poppler-utils not installed. Cannot process PDFs. Install poppler-utils (sudo apt install poppler-utils).")
+        raise Exception("poppler-utils not installed. Cannot process PDFs. Install: sudo apt install poppler-utils")
     try:
         from pdf2image import convert_from_path
+        import pytesseract
         images = convert_from_path(pdf_path, dpi=300)
         all_text = []
         for i, img in enumerate(images, 1):
@@ -193,7 +227,9 @@ def register_routes(app):
             return jsonify({'error': f'Unsupported language: {lang}'}), 400
 
         if not TESSERACT_AVAILABLE:
-            return jsonify({'error': 'Tesseract is not installed. Please install tesseract-ocr (sudo apt install tesseract-ocr) and restart the server.'}), 500
+            return jsonify({
+                'error': 'Tesseract is not installed. Please run: sudo apt install tesseract-ocr tesseract-ocr-eng && pip install pytesseract pillow pdf2image, then restart the server.'
+            }), 500
 
         filename = secure_filename(file.filename)
         temp_path = os.path.join(UPLOAD_FOLDER, f"temp_{uuid.uuid4().hex}_{filename}")
