@@ -35,12 +35,11 @@ async function fetchTasks() {
         }
 
         // **Client‑side filter** – ignore any task that is done, error, or cancelled
+        const terminalStatuses = ['done', 'error', 'cancelled', 'search_done', 'scan_done'];
         const activeTasks = data.filter(t =>
-            t && t.task_id &&
-            t.status !== 'done' &&
-            t.status !== 'error' &&
-            t.status !== 'cancelled'
-        );
+        t && t.task_id &&
+        !terminalStatuses.includes(t.status)
+    );
 
         if (activeTasks.length === 0) {
             container.innerHTML = '<div class="empty-state">No active tasks.</div>';
