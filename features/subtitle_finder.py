@@ -10,7 +10,7 @@ from tasks import save_task, load_task
 from config import UPLOAD_FOLDER
 
 logger = logging.getLogger(__name__)
-OPENSUBTITLES_API_KEY = os.environ.get('OPENSUBTITLES_API_KEY', '')
+OPENSUBTITLES_API_KEY = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJwZmhtNzI3ZUw0V2I5VVpuQVRkV1hHMmUwZWhUR0VWWiIsImV4cCI6MTc4MTcxMTc2NH0.Jkf196jENOkSLrW2vEdzKJlvZjYuXPjLmugq-h7YODY"
 OPENSUBTITLES_API_URL = "https://api.opensubtitles.com/api/v1"
 
 LANGUAGES = {
