@@ -113,16 +113,18 @@ def create_app():
         return jsonify({'error': 'Internal server error'}), 500
 
     # ---------- Task endpoints ----------
-   @app.route('/get_tasks', methods=['GET'])
+    @app.route('/get_tasks', methods=['GET'])
     def get_tasks():
+        """Return only tasks that are NOT finished (terminal statuses)."""
         active = []
-        # Define all statuses that are considered "finished" (should not appear)
+        # All statuses that should NOT appear in the Active Tasks pane
         terminal_statuses = {'done', 'error', 'cancelled', 'search_done', 'scan_done'}
         try:
             for tid in get_all_task_ids():
                 try:
                     task = load_task(tid)
                     if task and task.get('status') not in terminal_statuses:
+                        # Remove sensitive fields
                         safe_task = {k: v for k, v in task.items() if k not in ['process_pid']}
                         active.append(safe_task)
                 except Exception as e:
@@ -131,13 +133,14 @@ def create_app():
         except Exception as e:
             logger.error(f"Failed to list tasks: {e}")
         return jsonify(active)
-    
+
     @app.route('/progress/<task_id>', methods=['GET'])
     def progress(task_id):
         try:
             task = load_task(task_id)
             if not task:
                 return jsonify({'error': 'Task not found'}), 404
+            # Normalize progress values
             if 'download_progress' in task:
                 task['download_progress'] = int(task['download_progress'])
             if 'upload_progress' in task:
