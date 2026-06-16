@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-
 import os
 import sys
 import logging
@@ -22,6 +21,7 @@ WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'your-super-secret-webhook-key
 
 # Path to your SSH deploy key
 GITHUB_DEPLOY_KEY = os.path.expanduser('~/.ssh/github_deploy')
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,10 +39,10 @@ def create_app():
     # Register all feature routes
     register_all_features(app)
 
-    # ---------- Webhook endpoint with SSH fix ----------
+    # ---------- Webhook endpoint – fetches and hard resets ----------
     @app.route('/webhook', methods=['POST'])
     def webhook():
-        """GitHub webhook – pulls latest code and restarts using SSH key."""
+        """GitHub webhook – fetches, resets to origin/main, and restarts."""
         # Verify signature (optional)
         signature = request.headers.get('X-Hub-Signature-256')
         if signature and WEBHOOK_SECRET:
@@ -57,26 +57,43 @@ def create_app():
         if event != 'push':
             return jsonify({'message': 'Ignored event'}), 200
 
-        logger.info("Received push event – pulling latest code...")
+        logger.info("Received push event – fetching latest code...")
 
         # Set environment to use the deploy key
         env = os.environ.copy()
         env['GIT_SSH_COMMAND'] = f'ssh -i {GITHUB_DEPLOY_KEY} -o StrictHostKeyChecking=no'
 
         try:
-            result = subprocess.run(
-                ['git', 'pull', 'origin', 'main'],
-                cwd=os.path.dirname(os.path.abspath(__file__)),
+            # 1. Fetch the latest changes
+            fetch_cmd = ['git', 'fetch', 'origin', 'main']
+            fetch_result = subprocess.run(
+                fetch_cmd,
+                cwd=REPO_DIR,
                 capture_output=True,
                 text=True,
                 env=env
             )
-            if result.returncode != 0:
-                logger.error(f"Git pull failed: {result.stderr}")
-                return jsonify({'error': 'Git pull failed', 'details': result.stderr}), 500
-            logger.info(f"Git pull succeeded: {result.stdout}")
+            if fetch_result.returncode != 0:
+                logger.error(f"Git fetch failed: {fetch_result.stderr}")
+                return jsonify({'error': 'Git fetch failed', 'details': fetch_result.stderr}), 500
+            logger.info(f"Git fetch succeeded: {fetch_result.stdout}")
+
+            # 2. Reset the working directory to origin/main (discard local changes)
+            reset_cmd = ['git', 'reset', '--hard', 'origin/main']
+            reset_result = subprocess.run(
+                reset_cmd,
+                cwd=REPO_DIR,
+                capture_output=True,
+                text=True,
+                env=env
+            )
+            if reset_result.returncode != 0:
+                logger.error(f"Git reset failed: {reset_result.stderr}")
+                return jsonify({'error': 'Git reset failed', 'details': reset_result.stderr}), 500
+            logger.info(f"Git reset succeeded: {reset_result.stdout}")
+
         except Exception as e:
-            logger.exception("Git pull exception")
+            logger.exception("Git operation exception")
             return jsonify({'error': str(e)}), 500
 
         # Restart the app in a background thread
