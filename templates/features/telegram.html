@@ -1,0 +1,96 @@
+<div class="card">
+    <h2><i class="fab fa-telegram"></i> Telegram Chat Scanner</h2>
+    <div class="input-group">
+        <input type="text" id="tgChatLink" placeholder="https://t.me/... or invite link">
+        <input type="number" id="tgMsgLimit" placeholder="Messages to scan" value="100" style="width: 120px;">
+        <button id="scanTgBtn" class="primary"><i class="fas fa-search"></i> Scan Chat</button>
+    </div>
+    <div id="tgResults" class="empty-state">No scan results yet.</div>
+    <div id="tgDownloadBtnContainer" style="margin-top: 1rem; display: none; text-align: right;">
+        <button id="downloadSelectedTgBtn" class="primary"><i class="fas fa-download"></i> Download Selected</button>
+    </div>
+</div>
+
+<script>
+let currentScanTaskId = null;
+let selectedTelegramIds = new Set();
+const savedTelegramLink = localStorage.getItem('telegram_last_chat_link');
+if (savedTelegramLink) document.getElementById('tgChatLink').value = savedTelegramLink;
+
+document.getElementById('scanTgBtn').onclick = async () => {
+    const link = document.getElementById('tgChatLink').value.trim();
+    const limit = document.getElementById('tgMsgLimit').value || 100;
+    if (!link) { showToast('Enter chat link', true); return; }
+    localStorage.setItem('telegram_last_chat_link', link);
+    try {
+        const resp = await fetch('/telegram/scan_chat', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: `chat_link=${encodeURIComponent(link)}&limit=${limit}`
+        });
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+        currentScanTaskId = data.task_id;
+        document.getElementById('tgResults').innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-pulse"></i> Scanning...</div>';
+        document.getElementById('tgDownloadBtnContainer').style.display = 'none';
+        pollScanTask();
+    } catch (err) { showToast(err.message, true); }
+};
+
+async function pollScanTask() {
+    const interval = setInterval(async () => {
+        if (!currentScanTaskId) return clearInterval(interval);
+        const resp = await fetch(`/progress/${currentScanTaskId}`);
+        const task = await resp.json();
+        if (task.status === 'scan_done') {
+            clearInterval(interval);
+            displayTelegramVideos(task.videos);
+            document.getElementById('tgDownloadBtnContainer').style.display = 'block';
+        } else if (task.status === 'error') {
+            clearInterval(interval);
+            document.getElementById('tgResults').innerHTML = `<div class="empty-state" style="color:#ff8a8a;">Error: ${task.error_msg}</div>`;
+        }
+    }, 1500);
+}
+
+function displayTelegramVideos(videos) {
+    if (!videos.length) {
+        document.getElementById('tgResults').innerHTML = '<div class="empty-state">No videos found.</div>';
+        return;
+    }
+    let html = '<div style="margin-bottom:1rem;"><strong>Select videos to download:</strong></div>';
+    videos.forEach(v => {
+        html += `<div style="display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid #2a3248;">
+                    <input type="checkbox" data-id="${v.id}" class="tg-video-checkbox">
+                    <i class="fas fa-file-video"></i>
+                    <div><strong>${escapeHtml(v.file_name)}</strong><br><span style="font-size:0.7rem;">${v.size_mb} MB</span></div>
+                </div>`;
+    });
+    document.getElementById('tgResults').innerHTML = html;
+    selectedTelegramIds.clear();
+    document.querySelectorAll('.tg-video-checkbox').forEach(cb => {
+        cb.onchange = () => {
+            const id = cb.getAttribute('data-id');
+            if (cb.checked) selectedTelegramIds.add(id);
+            else selectedTelegramIds.delete(id);
+        };
+    });
+}
+
+document.getElementById('downloadSelectedTgBtn').onclick = async () => {
+    if (!currentScanTaskId || selectedTelegramIds.size === 0) { showToast('No videos selected', true); return; }
+    const ids = Array.from(selectedTelegramIds);
+    try {
+        const resp = await fetch('/telegram/download_selected', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: `scan_task_id=${currentScanTaskId}&selected_ids=${ids.join('&selected_ids=')}`
+        });
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+        showToast(`Download started: ${data.download_task_id}`);
+        fetchTasks();
+    } catch (err) { showToast(err.message, true); }
+};
+</script>
+

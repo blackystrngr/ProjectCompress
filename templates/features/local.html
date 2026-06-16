@@ -1,0 +1,230 @@
+<div class="card">
+    <h2><i class="fas fa-folder-open"></i> Local Files – Downloads Folder</h2>
+    <div style="margin-bottom: 1rem; display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
+        <button id="selectAllBtn" class="primary" style="padding: 0.4rem 1rem;">Select All</button>
+        <button id="deselectAllBtn" style="padding: 0.4rem 1rem;">Deselect All</button>
+        <div id="actionBar" class="action-bar" style="display: none; margin: 0; padding: 0.2rem 1rem;">
+            <span id="selectedCount">0</span> selected
+            <button id="downloadSelectedBtn"><i class="fas fa-download"></i> Download</button>
+            <button id="deleteSelectedBtn" class="danger"><i class="fas fa-trash-alt"></i> Delete</button>
+            <button id="telegramSelectedBtn"><i class="fab fa-telegram"></i> Send to Telegram</button>
+            <button id="colabSelectedBtn"><i class="fas fa-cloud-upload-alt"></i> Send to Colab</button>
+            <button id="deselectAllBtn">Deselect</button>
+        </div>
+    </div>
+    <div id="breadcrumbs" style="margin-bottom: 1rem; font-size: 0.8rem; word-break: break-all;">
+        <span>📁 root</span>
+    </div>
+    <div id="fileList" class="file-grid empty-state">Loading...</div>
+</div>
+
+<!-- Modal for video preview -->
+<div id="previewModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 2000; align-items: center; justify-content: center;">
+    <div style="position: relative; width: 90%; max-width: 1200px; background: #000; border-radius: 1rem; overflow: hidden;">
+        <button id="closeModalBtn" style="position: absolute; top: 10px; right: 20px; background: #ff4444; border: none; color: white; font-size: 24px; cursor: pointer; z-index: 2001; border-radius: 50%; width: 40px; height: 40px;">&times;</button>
+        <video id="previewVideo" controls style="width: 100%; max-height: 80vh; background: black;"></video>
+        <div style="padding: 10px; background: rgba(0,0,0,0.7);">
+            <div id="previewInfo" style="color: white; font-size: 14px;"></div>
+        </div>
+    </div>
+</div>
+
+<script>
+// Helper functions (in case app.js not loaded)
+function escapeHtml(str) { if (!str) return ''; return str.replace(/[&<>]/g, function(m) { if (m === '&') return '&amp;'; if (m === '<') return '&lt;'; if (m === '>') return '&gt;'; return m; }); }
+function showToast(msg, isErr) { const toast = document.createElement('div'); toast.className = 'toast'; toast.innerHTML = `<i class="fas ${isErr ? 'fa-exclamation-triangle' : 'fa-check-circle'}"></i> ${msg}`; document.body.appendChild(toast); setTimeout(() => toast.remove(), 3000); }
+
+let currentPath = "", currentItems = [], selectedPaths = new Set();
+const previewModal = document.getElementById('previewModal'), previewVideo = document.getElementById('previewVideo'), previewInfo = document.getElementById('previewInfo'), closeModal = document.getElementById('closeModalBtn');
+
+async function loadDirectory(path = "") {
+    try {
+        const resp = await fetch(`/browse?path=${encodeURIComponent(path)}`);
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+        currentPath = data.current_path;
+        currentItems = data.items;
+        renderBreadcrumbs(data.breadcrumbs);
+        renderFileList(currentItems);
+    } catch (err) { document.getElementById('fileList').innerHTML = `<div class="empty-state">Error: ${err.message}</div>`; }
+}
+
+function renderBreadcrumbs(bc) {
+    let html = '<span>📁 </span>';
+    if (bc.length === 0) html += '<strong>root</strong>';
+    else {
+        html += '<a href="#" onclick="loadDirectory(\'\'); return false;">root</a>';
+        for (let i=0; i<bc.length; i++) {
+            const c = bc[i];
+            html += ` / `;
+            if (c.is_last) html += `<strong>${escapeHtml(c.name)}</strong>`;
+            else html += `<a href="#" onclick="loadDirectory('${escapeHtml(c.path)}'); return false;">${escapeHtml(c.name)}</a>`;
+        }
+    }
+    document.getElementById('breadcrumbs').innerHTML = html;
+}
+
+function renderFileList(items) {
+    if (!items.length) { document.getElementById('fileList').innerHTML = '<div class="empty-state">Empty folder.</div>'; updateActionBar(); return; }
+    let html = '';
+    items.forEach(item => {
+        const isSel = selectedPaths.has(item.path);
+        html += `<div class="file-card ${isSel ? 'selected' : ''}" data-path="${escapeHtml(item.path)}" data-type="${item.type}">
+                    <input type="checkbox" class="file-checkbox" data-path="${escapeHtml(item.path)}" ${isSel ? 'checked' : ''}>
+                    <div class="file-name"><i class="${item.icon}"></i> ${escapeHtml(item.name)}</div>
+                    ${item.type === 'file' ? `<div class="file-size">${item.size_str}</div>` : '<div class="file-size">Folder</div>'}
+                    <div class="file-actions">
+                        ${item.type === 'directory' ?
+                            `<button onclick="loadDirectory('${escapeHtml(item.path)}')"><i class="fas fa-folder-open"></i> Open</button>
+                             <button class="delete-folder" data-path="${escapeHtml(item.path)}"><i class="fas fa-trash-alt"></i> Delete Folder</button>` :
+                            `<button class="preview-file" data-path="${escapeHtml(item.path)}" data-name="${escapeHtml(item.name)}"><i class="fas fa-play"></i> Preview</button>
+                             <a href="/download_file?path=${encodeURIComponent(item.path)}"><i class="fas fa-download"></i> Download</a>
+                             <button class="delete-single" data-path="${escapeHtml(item.path)}"><i class="fas fa-trash-alt"></i> Delete</button>
+                             <button class="telegram-single" data-path="${escapeHtml(item.path)}"><i class="fab fa-telegram"></i> Telegram</button>
+                             <button class="colab-single" data-path="${escapeHtml(item.path)}"><i class="fas fa-cloud-upload-alt"></i> Colab</button>`
+                        }
+                    </div>
+                </div>`;
+    });
+    document.getElementById('fileList').innerHTML = html;
+    attachEvents();
+    updateActionBar();
+}
+
+function attachEvents() {
+    document.querySelectorAll('.file-checkbox').forEach(cb => {
+        cb.onchange = () => {
+            const p = cb.dataset.path;
+            if (cb.checked) selectedPaths.add(p);
+            else selectedPaths.delete(p);
+            updateActionBar();
+            updateCardSelection();
+        };
+    });
+    document.querySelectorAll('.preview-file').forEach(btn => {
+        btn.onclick = () => {
+            const p = btn.dataset.path, name = btn.dataset.name;
+            const ext = p.split('.').pop().toLowerCase();
+            if (['mp4','mkv','avi','mov','webm','flv','m4v'].includes(ext)) openPreview(p,name);
+            else showToast('Preview only for video files', true);
+        };
+    });
+    document.querySelectorAll('.delete-single').forEach(btn => {
+        btn.onclick = async () => {
+            const p = btn.dataset.path;
+            if (confirm(`Delete "${p}"?`)) {
+                const resp = await fetch(`/delete_file?path=${encodeURIComponent(p)}`,{method:'DELETE'});
+                if (resp.ok) { showToast('Deleted'); loadDirectory(currentPath); selectedPaths.delete(p); }
+                else { const err = await resp.json(); showToast(err.error||'Delete failed',true); }
+            }
+        };
+    });
+    document.querySelectorAll('.delete-folder').forEach(btn => {
+        btn.onclick = async () => {
+            const p = btn.dataset.path;
+            if (confirm(`Delete entire folder "${p}" and its contents?`)) {
+                const resp = await fetch(`/delete_folder?path=${encodeURIComponent(p)}`,{method:'DELETE'});
+                if (resp.ok) { showToast('Folder deleted'); loadDirectory(currentPath); selectedPaths.delete(p); }
+                else { const err = await resp.json(); showToast(err.error||'Delete failed',true); }
+            }
+        };
+    });
+    document.querySelectorAll('.telegram-single').forEach(btn => {
+        btn.onclick = async () => {
+            const p = btn.dataset.path;
+            let chat = localStorage.getItem('telegram_last_chat_link');
+            if (!chat) chat = prompt('Telegram chat link (e.g., https://t.me/username):');
+            if (!chat) return;
+            localStorage.setItem('telegram_last_chat_link', chat);
+            const resp = await fetch('/telegram/send_file', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: `file_path=${encodeURIComponent(p)}&chat_link=${encodeURIComponent(chat)}`
+            });
+            const data = await resp.json();
+            if (data.error) showToast(data.error, true);
+            else showToast(`Send task: ${data.task_id}`);
+            fetchTasks();
+        };
+    });
+    document.querySelectorAll('.colab-single').forEach(btn => {
+        btn.onclick = async () => {
+            const p = btn.dataset.path;
+            const resp = await fetch('/colab_process', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: `file_path=${encodeURIComponent(p)}`
+            });
+            const data = await resp.json();
+            if (data.error) showToast(data.error, true);
+            else showToast(`Task started: ${data.task_id}`);
+            fetchTasks();
+        };
+    });
+}
+
+function updateActionBar() {
+    const count = selectedPaths.size;
+    const bar = document.getElementById('actionBar');
+    if (count > 0) { bar.style.display = 'flex'; document.getElementById('selectedCount').innerText = count; }
+    else { bar.style.display = 'none'; }
+}
+function updateCardSelection() {
+    document.querySelectorAll('.file-card').forEach(card => {
+        const p = card.dataset.path;
+        if (selectedPaths.has(p)) card.classList.add('selected');
+        else card.classList.remove('selected');
+    });
+}
+
+document.getElementById('selectAllBtn').onclick = () => { currentItems.forEach(i => selectedPaths.add(i.path)); renderFileList(currentItems); };
+document.getElementById('deselectAllBtn').onclick = () => { selectedPaths.clear(); renderFileList(currentItems); };
+document.getElementById('downloadSelectedBtn').onclick = () => { for (let p of selectedPaths) window.open(`/download_file?path=${encodeURIComponent(p)}`, '_blank'); showToast(`Download started for ${selectedPaths.size} file(s)`); };
+document.getElementById('deleteSelectedBtn').onclick = async () => {
+    if (!confirm(`Delete ${selectedPaths.size} selected item(s)?`)) return;
+    for (let p of selectedPaths) {
+        const item = currentItems.find(i => i.path === p);
+        if (item && item.type === 'directory') await fetch(`/delete_folder?path=${encodeURIComponent(p)}`,{method:'DELETE'});
+        else await fetch(`/delete_file?path=${encodeURIComponent(p)}`,{method:'DELETE'});
+    }
+    showToast('Deleted selected items');
+    selectedPaths.clear();
+    loadDirectory(currentPath);
+};
+document.getElementById('telegramSelectedBtn').onclick = async () => {
+    if (selectedPaths.size === 0) { showToast('No files selected', true); return; }
+    let chat = localStorage.getItem('telegram_last_chat_link');
+    if (!chat) chat = prompt('Telegram chat link:');
+    if (!chat) return;
+    localStorage.setItem('telegram_last_chat_link', chat);
+    for (let p of selectedPaths) {
+        await fetch('/telegram/send_file', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:`file_path=${encodeURIComponent(p)}&chat_link=${encodeURIComponent(chat)}` });
+    }
+    showToast(`Sent ${selectedPaths.size} file(s) to Telegram`);
+    fetchTasks();
+};
+document.getElementById('colabSelectedBtn').onclick = async () => {
+    if (selectedPaths.size === 0) { showToast('No files selected', true); return; }
+    for (let p of selectedPaths) {
+        await fetch('/colab_process', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:`file_path=${encodeURIComponent(p)}` });
+    }
+    showToast(`Colab tasks started for ${selectedPaths.size} file(s)`);
+    fetchTasks();
+};
+
+function openPreview(path, name) {
+    previewVideo.src = `/stream_file?path=${encodeURIComponent(path)}`;
+    previewVideo.load();
+    previewInfo.innerText = `Now playing: ${name}`;
+    previewModal.style.display = 'flex';
+    previewVideo.play().catch(e => console.log('Autoplay prevented'));
+}
+closeModal.onclick = () => { previewVideo.pause(); previewVideo.src = ''; previewModal.style.display = 'none'; };
+previewModal.onclick = (e) => { if (e.target === previewModal) closeModal.click(); };
+loadDirectory();
+</script>
+
+<style>
+.file-card.selected { border-color: #5f8fe0; background: rgba(45,65,100,0.6); }
+#actionBar { display: inline-flex; gap: 0.5rem; background: rgba(20,25,40,0.95); border-radius: 2rem; padding: 0.2rem 1rem; margin-left: 1rem; }
+</style>

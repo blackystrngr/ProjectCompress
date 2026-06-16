@@ -1,0 +1,8 @@
+{
+  "task_id": "5674c677-d059-490c-9e24-d5a1cd39047d",
+  "status": "error",
+  "download_progress": 33,
+  "created_at": 1781415155.2526164,
+  "cancelled": false,
+  "error_msg": "('Connection broken: IncompleteRead(291503488 bytes read, 590024520 more expected)', IncompleteRead(291503488 bytes read, 590024520 more expected))"
+}

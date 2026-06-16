@@ -1,0 +1,3 @@
+mkdir -p /root/ProjectCompress/tasks
+chmod 755 /root/ProjectCompress/tasks
+

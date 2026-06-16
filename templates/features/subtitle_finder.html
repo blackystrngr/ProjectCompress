@@ -1,0 +1,106 @@
+<div class="card">
+    <h2><i class="fas fa-closed-captioning"></i> Subtitle Finder</h2>
+    <p>Search for subtitles by movie name and language. Downloads directly to your computer.</p>
+    <div class="input-group">
+        <input type="text" id="subtitleQuery" placeholder="Movie name (e.g., Inception)" autocomplete="off">
+        <select id="subtitleLanguage">
+            <option value="eng">English</option>
+            <option value="spa">Spanish</option>
+            <option value="fra">French</option>
+            <option value="deu">German</option>
+            <option value="ita">Italian</option>
+            <option value="por">Portuguese</option>
+            <option value="rus">Russian</option>
+            <option value="jpn">Japanese</option>
+            <option value="kor">Korean</option>
+            <option value="zho">Chinese</option>
+            <option value="ara">Arabic</option>
+            <option value="hin">Hindi</option>
+            <option value="tur">Turkish</option>
+            <option value="nld">Dutch</option>
+            <option value="pol">Polish</option>
+            <option value="swe">Swedish</option>
+            <option value="nor">Norwegian</option>
+            <option value="dan">Danish</option>
+            <option value="fin">Finnish</option>
+            <option value="heb">Hebrew</option>
+        </select>
+        <button id="searchSubtitlesBtn" class="primary"><i class="fas fa-search"></i> Search</button>
+    </div>
+    <div id="subtitleStatus" class="help-text"></div>
+    <div id="subtitleResults" class="file-grid empty-state">No results yet.</div>
+</div>
+
+<script>
+let currentSearchTaskId = null, searchPollInterval = null;
+const searchBtn = document.getElementById('searchSubtitlesBtn'), queryInput = document.getElementById('subtitleQuery'), langSelect = document.getElementById('subtitleLanguage');
+const statusDiv = document.getElementById('subtitleStatus'), resultsDiv = document.getElementById('subtitleResults');
+
+searchBtn.onclick = async () => {
+    const query = queryInput.value.trim();
+    if (!query) { showToast('Enter a movie name', true); return; }
+    const lang = langSelect.value;
+    try {
+        const resp = await fetch('/subtitle/search', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: `query=${encodeURIComponent(query)}&language=${lang}`
+        });
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+        currentSearchTaskId = data.task_id;
+        statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Searching...';
+        resultsDiv.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-pulse"></i> Please wait...</div>';
+        if (searchPollInterval) clearInterval(searchPollInterval);
+        searchPollInterval = setInterval(pollSearch, 1500);
+    } catch (err) { showToast(err.message, true); }
+};
+
+async function pollSearch() {
+    if (!currentSearchTaskId) return;
+    try {
+        const resp = await fetch(`/progress/${currentSearchTaskId}`);
+        const task = await resp.json();
+        if (task.error) {
+            clearInterval(searchPollInterval);
+            statusDiv.innerHTML = `<span style="color:#ff8a8a;">Error: ${task.error}</span>`;
+            resultsDiv.innerHTML = '<div class="empty-state">Search failed.</div>';
+            return;
+        }
+        if (task.status === 'search_done') {
+            clearInterval(searchPollInterval);
+            displaySubtitles(task.subtitles || []);
+            statusDiv.innerHTML = `✅ Found ${task.subtitles?.length || 0} subtitles.`;
+        } else if (task.status === 'error') {
+            clearInterval(searchPollInterval);
+            statusDiv.innerHTML = `❌ Error: ${task.error_msg}`;
+            resultsDiv.innerHTML = '<div class="empty-state">Search failed.</div>';
+        } else {
+            statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Searching...`;
+        }
+    } catch (err) { console.error(err); }
+}
+
+function displaySubtitles(subtitles) {
+    if (!subtitles.length) { resultsDiv.innerHTML = '<div class="empty-state">No subtitles found.</div>'; return; }
+    let html = '';
+    subtitles.forEach(sub => {
+        html += `<div class="file-card">
+                    <div class="file-name"><i class="fas fa-file-alt"></i> ${escapeHtml(sub.file_name)}</div>
+                    <div class="file-size">Language: ${escapeHtml(sub.language)} | Downloads: ${sub.download_count} | ${sub.size_mb} MB</div>
+                    <div class="file-actions">
+                        <button class="download-subtitle" data-url="${escapeHtml(sub.url)}" data-name="${escapeHtml(sub.file_name)}"><i class="fas fa-download"></i> Download to PC</button>
+                    </div>
+                </div>`;
+    });
+    resultsDiv.innerHTML = html;
+    document.querySelectorAll('.download-subtitle').forEach(btn => {
+        btn.onclick = () => {
+            const url = btn.dataset.url, name = btn.dataset.name;
+            if (!url) { showToast('Download URL not available', true); return; }
+            window.open(`/subtitle/download_direct?url=${encodeURIComponent(url)}&filename=${encodeURIComponent(name)}`, '_blank');
+            showToast(`Downloading: ${name}`);
+        };
+    });
+}
+</script>

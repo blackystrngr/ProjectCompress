@@ -1,0 +1,296 @@
+<div class="card">
+    <h2><i class="fas fa-download"></i> Download from URL / Magnet / Torrent</h2>
+    <div class="input-group">
+        <input type="text" id="directUrl" placeholder="https://example.com/video.mp4 or magnet:?xt=... or https://.../file.torrent" autocomplete="off">
+        <button id="downloadUrlBtn" class="primary"><i class="fas fa-cloud-download-alt"></i> Download</button>
+    </div>
+    <div class="help-text"><i class="fas fa-shield-alt"></i> Supports: direct video URL, magnet link, or HTTP link to .torrent file.</div>
+
+    <div style="margin-top: 1rem;">
+        <h3>Upload a .torrent file:</h3>
+        <div class="input-group">
+            <input type="file" id="torrentFileUpload" accept=".torrent">
+            <button id="uploadTorrentBtn" class="primary"><i class="fas fa-upload"></i> Upload & Download</button>
+        </div>
+    </div>
+
+    <hr style="margin: 1.5rem 0; border-color: #2a3248;">
+
+    <h2><i class="fas fa-magnifying-glass"></i> Extract Video Links from Webpage</h2>
+    <div class="input-group">
+        <input type="text" id="extractorUrl" placeholder="https://example.com/video-page" autocomplete="off">
+        <label style="display: flex; align-items: center; gap: 0.5rem;">
+            <input type="checkbox" id="useYtdlpCheckbox" checked> <i class="fab fa-youtube"></i> Advanced (yt-dlp)
+        </label>
+        <button id="extractBtn" class="primary"><i class="fas fa-search"></i> Extract</button>
+    </div>
+    <div id="extractStatus" class="help-text" style="margin-bottom: 1rem;"></div>
+    <div id="extractResults" class="file-grid empty-state">Enter a webpage URL and click Extract.</div>
+
+    <hr style="margin: 1.5rem 0; border-color: #2a3248;">
+
+    <h2><i class="fas fa-search"></i> Torrent Searcher</h2>
+    <div class="input-group">
+        <input type="text" id="torrentQuery" placeholder="e.g., The Matrix 1080p" autocomplete="off">
+        <button id="searchTorrentsBtn" class="primary"><i class="fas fa-search"></i> Search</button>
+    </div>
+    <div id="torrentSearchStatus" class="help-text"></div>
+    <div id="torrentSearchResults" class="empty-state">Enter a search query and click Search.</div>
+</div>
+
+<script>
+// ========== Direct Download / Magnet / Torrent ==========
+let currentTaskId = null, pollInterval = null;
+const downloadBtn = document.getElementById('downloadUrlBtn');
+const urlInput = document.getElementById('directUrl');
+const uploadBtn = document.getElementById('uploadTorrentBtn');
+const torrentFileInput = document.getElementById('torrentFileUpload');
+let statusDiv = document.getElementById('urlStatus');
+if (!statusDiv) {
+    statusDiv = document.createElement('div');
+    statusDiv.id = 'urlStatus';
+    statusDiv.className = 'help-text';
+    document.querySelector('.card').appendChild(statusDiv);
+}
+
+async function startDownload(url, body) {
+    try {
+        const resp = await fetch(url, { method: 'POST', body: body });
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+        currentTaskId = data.task_id;
+        statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Download started...';
+        if (pollInterval) clearInterval(pollInterval);
+        pollInterval = setInterval(pollTask, 2000);
+    } catch (err) { showToast(err.message, true); }
+}
+
+downloadBtn.onclick = () => {
+    let url = urlInput.value.trim();
+    if (!url) { showToast('Enter a URL, magnet link, or torrent file URL', true); return; }
+    const formData = new URLSearchParams();
+    formData.append('url', url);
+    startDownload('/start', formData);
+};
+
+uploadBtn.onclick = () => {
+    const file = torrentFileInput.files[0];
+    if (!file) { showToast('Select a .torrent file', true); return; }
+    const formData = new FormData();
+    formData.append('torrent_file', file);
+    fetch('/start_upload_torrent', { method: 'POST', body: formData })
+        .then(resp => resp.json())
+        .then(data => {
+            if (data.error) throw new Error(data.error);
+            currentTaskId = data.task_id;
+            statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Torrent download started...';
+            if (pollInterval) clearInterval(pollInterval);
+            pollInterval = setInterval(pollTask, 2000);
+        })
+        .catch(err => showToast(err.message, true));
+};
+
+async function pollTask() {
+    if (!currentTaskId) return;
+    try {
+        const resp = await fetch(`/progress/${currentTaskId}`);
+        const task = await resp.json();
+        if (task.error) {
+            clearInterval(pollInterval);
+            statusDiv.innerHTML = `<span style="color:#ff8a8a;">Error: ${task.error}</span>`;
+            return;
+        }
+        let progress = task.download_progress || task.progress || 0;
+        let speed = task.download_speed ? ` (${task.download_speed} kB/s)` : '';
+        if (task.status === 'downloading') {
+            statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Downloading... ${progress}%${speed}`;
+        } else if (task.status === 'done') {
+            clearInterval(pollInterval);
+            statusDiv.innerHTML = `✅ Done! <a href="/download/${task.output_file}" target="_blank">Download file</a>`;
+        } else if (task.status === 'error') {
+            clearInterval(pollInterval);
+            statusDiv.innerHTML = `<span style="color:#ff8a8a;">❌ Error: ${task.error_msg}</span>`;
+        } else {
+            statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${task.status}...`;
+        }
+    } catch (err) { console.error(err); }
+}
+
+// ========== Extract Video Links ==========
+let currentExtractTaskId = null, extractPollInterval = null;
+const extractBtn = document.getElementById('extractBtn');
+const extractorUrlInput = document.getElementById('extractorUrl');
+const ytdlpCheckbox = document.getElementById('useYtdlpCheckbox');
+const extractStatusDiv = document.getElementById('extractStatus');
+const extractResultsDiv = document.getElementById('extractResults');
+
+extractBtn.onclick = async () => {
+    let url = extractorUrlInput.value.trim();
+    if (!url) { showToast('Enter a webpage URL', true); return; }
+    if (!url.startsWith('http')) url = 'https://' + url;
+    const useYtdlp = ytdlpCheckbox.checked;
+    try {
+        const resp = await fetch('/extract/fetch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: `url=${encodeURIComponent(url)}&use_ytdlp=${useYtdlp}`
+        });
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+        currentExtractTaskId = data.task_id;
+        extractStatusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Extracting... (${useYtdlp ? 'advanced' : 'standard'})`;
+        extractResultsDiv.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-pulse"></i> Please wait...</div>';
+        if (extractPollInterval) clearInterval(extractPollInterval);
+        extractPollInterval = setInterval(pollExtractTask, 1500);
+    } catch (err) { showToast(err.message, true); }
+};
+
+async function pollExtractTask() {
+    if (!currentExtractTaskId) return;
+    try {
+        const resp = await fetch(`/extract/results/${currentExtractTaskId}`);
+        const data = await resp.json();
+        if (data.error) {
+            clearInterval(extractPollInterval);
+            extractStatusDiv.innerHTML = `<span style="color:#ff8a8a;">Error: ${data.error}</span>`;
+            extractResultsDiv.innerHTML = '<div class="empty-state">Extraction failed.</div>';
+            return;
+        }
+        if (data.status === 'done') {
+            clearInterval(extractPollInterval);
+            displayExtractedUrls(data.video_urls, data.combined_url);
+            extractStatusDiv.innerHTML = `✅ Found ${data.count} URL(s).`;
+        } else if (data.status === 'error') {
+            clearInterval(extractPollInterval);
+            extractStatusDiv.innerHTML = `<span style="color:#ff8a8a;">❌ Error: ${data.error_msg}</span>`;
+            extractResultsDiv.innerHTML = '<div class="empty-state">Extraction failed.</div>';
+        } else {
+            let msg = data.status === 'ytdlp_extract' ? 'Running yt-dlp...' : 'Processing...';
+            extractStatusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${msg}`;
+        }
+    } catch (err) { console.error(err); }
+}
+
+function displayExtractedUrls(urls, combinedUrl) {
+    if (!urls || !urls.length) {
+        extractResultsDiv.innerHTML = '<div class="empty-state">No direct video URLs found. Try enabling Advanced (yt-dlp).</div>';
+        return;
+    }
+    let html = '';
+    if (combinedUrl) {
+        html += `<div class="file-card" style="border-color: #4caf50; background: rgba(76,175,80,0.1);">
+                    <div class="file-name"><i class="fas fa-check-circle" style="color:#4caf50;"></i> Combined Video (Single File)</div>
+                    <div class="file-size" style="word-break: break-all;">${escapeHtml(combinedUrl)}</div>
+                    <div class="file-actions">
+                        <button class="copy-url" data-url="${escapeHtml(combinedUrl)}"><i class="fas fa-copy"></i> Copy URL</button>
+                        <button class="download-extracted" data-url="${escapeHtml(combinedUrl)}"><i class="fas fa-download"></i> Download</button>
+                    </div>
+                </div>`;
+    }
+    urls.forEach((url, idx) => {
+        if (combinedUrl && url === combinedUrl) return;
+        const fileName = url.split('/').pop().split('?')[0] || `video_${idx+1}.mp4`;
+        html += `<div class="file-card">
+                    <div class="file-name"><i class="fas fa-link"></i> ${escapeHtml(fileName)}</div>
+                    <div class="file-size" style="word-break: break-all;">${escapeHtml(url)}</div>
+                    <div class="file-actions">
+                        <button class="copy-url" data-url="${escapeHtml(url)}"><i class="fas fa-copy"></i> Copy URL</button>
+                        <button class="download-extracted" data-url="${escapeHtml(url)}"><i class="fas fa-download"></i> Download</button>
+                    </div>
+                </div>`;
+    });
+    extractResultsDiv.innerHTML = html;
+    document.querySelectorAll('#extractResults .copy-url').forEach(btn => {
+        btn.onclick = () => { navigator.clipboard.writeText(btn.dataset.url); showToast('URL copied'); };
+    });
+    document.querySelectorAll('#extractResults .download-extracted').forEach(btn => {
+        btn.onclick = async () => {
+            const url = btn.dataset.url;
+            const formData = new URLSearchParams();
+            formData.append('url', url);
+            const resp = await fetch('/start', { method: 'POST', body: formData });
+            const data = await resp.json();
+            if (data.error) showToast(data.error, true);
+            else showToast(`Download started: ${data.task_id}`);
+            fetchTasks();
+        };
+    });
+}
+
+// ========== Torrent Searcher ==========
+let searchTaskId = null, searchPollInterval = null;
+const searchBtn = document.getElementById('searchTorrentsBtn');
+const queryInput = document.getElementById('torrentQuery');
+const searchStatusDiv = document.getElementById('torrentSearchStatus');
+const searchResultsDiv = document.getElementById('torrentSearchResults');
+
+searchBtn.onclick = async () => {
+    const query = queryInput.value.trim();
+    if (!query) { showToast('Enter search query', true); return; }
+    try {
+        const resp = await fetch('/torrent_search', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: `query=${encodeURIComponent(query)}`
+        });
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+        searchTaskId = data.task_id;
+        searchStatusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Searching torrents...';
+        searchResultsDiv.innerHTML = '<div class="empty-state">Searching...</div>';
+        if (searchPollInterval) clearInterval(searchPollInterval);
+        searchPollInterval = setInterval(pollTorrentSearch, 2000);
+    } catch (err) { showToast(err.message, true); }
+};
+
+async function pollTorrentSearch() {
+    if (!searchTaskId) return;
+    const resp = await fetch(`/progress/${searchTaskId}`);
+    const task = await resp.json();
+    if (task.error) {
+        clearInterval(searchPollInterval);
+        searchStatusDiv.innerHTML = `<span style="color:#ff8a8a;">Error: ${task.error}</span>`;
+        searchResultsDiv.innerHTML = '<div class="empty-state">Search failed.</div>';
+        return;
+    }
+    if (task.status === 'search_done') {
+        clearInterval(searchPollInterval);
+        displayTorrentResults(task.results || []);
+        searchStatusDiv.innerHTML = `✅ Found ${task.results?.length || 0} results.`;
+    } else if (task.status === 'error') {
+        clearInterval(searchPollInterval);
+        searchStatusDiv.innerHTML = `<span style="color:#ff8a8a;">❌ Error: ${task.error_msg}</span>`;
+        searchResultsDiv.innerHTML = '<div class="empty-state">Search failed.</div>';
+    } else {
+        searchStatusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${task.status}...`;
+    }
+}
+
+function displayTorrentResults(results) {
+    if (!results.length) { searchResultsDiv.innerHTML = '<div class="empty-state">No results found.</div>'; return; }
+    let html = '<table style="width:100%; border-collapse: collapse; background: #1e2438; border-radius: 1rem;"><thead><tr><th>Title</th><th>Size</th><th>Seeds</th><th>Leech</th><th>Action</th></tr></thead><tbody>';
+    results.forEach(r => {
+        html += `<tr>
+                    <td>${escapeHtml(r.title)}</td>
+                    <td>${escapeHtml(r.size)}</td>
+                    <td style="color:#90ff90;">${escapeHtml(r.seeders)}</td>
+                    <td style="color:#ff9090;">${escapeHtml(r.leechers)}</td>
+                    <td><button class="download-magnet" data-magnet="${escapeHtml(r.magnet)}">Download</button></td>
+                 </tr>`;
+    });
+    html += '</tbody></table>';
+    searchResultsDiv.innerHTML = html;
+    document.querySelectorAll('.download-magnet').forEach(btn => {
+        btn.onclick = async () => {
+            const magnet = btn.dataset.magnet;
+            const formData = new URLSearchParams();
+            formData.append('url', magnet);
+            const resp = await fetch('/start', { method: 'POST', body: formData });
+            const data = await resp.json();
+            if (data.error) showToast(data.error, true);
+            else showToast(`Download started: ${data.task_id}`);
+            fetchTasks();
+        };
+    });
+}
+</script>

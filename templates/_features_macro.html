@@ -1,0 +1,35 @@
+{% macro render_tabs() %}
+<button class="tab-btn active" data-tab="url"><i class="fas fa-globe"></i> URL Download</button>
+<button class="tab-btn" data-tab="telegram"><i class="fab fa-telegram"></i> Telegram Chat</button>
+<button class="tab-btn" data-tab="drive"><i class="fab fa-google-drive"></i> Drive Files</button>
+<button class="tab-btn" data-tab="local"><i class="fas fa-folder-open"></i> My Files</button>
+<button class="tab-btn" data-tab="clipper"><i class="fas fa-cut"></i> Video Clipper</button>
+{# Add new tab buttons here #}
+<button class="tab-btn" data-tab="proxy"><i class="fas fa-network-wired"></i> Proxy Fetcher</button>
+<button class="tab-btn" data-tab="subtitle"><i class="fas fa-closed-captioning"></i> Subtitles</button>
+{% endmacro %}
+
+{% macro render_panes() %}
+<div id="url-tab" class="tab-pane active">
+    {% include 'features/url.html' %}
+</div>
+<div id="telegram-tab" class="tab-pane">
+    {% include 'features/telegram.html' %}
+</div>
+<div id="drive-tab" class="tab-pane">
+    {% include 'features/drive.html' %}
+</div>
+<div id="local-tab" class="tab-pane">
+    {% include 'features/local.html' %}
+</div>
+<div id="clipper-tab" class="tab-pane">
+    {% include 'features/video_clipper.html' %}
+</div>
+{# Add new panes here #}
+<div id="proxy-tab" class="tab-pane">
+    {% include 'features/proxy_fetcher.html' %}
+</div>
+<div id="subtitle-tab" class="tab-pane">
+    {% include 'features/subtitle_finder.html' %}
+</div>
+{% endmacro %}
