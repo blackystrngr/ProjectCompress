@@ -1,0 +1,28 @@
+# Core Flask & Web Server
+flask>=2.2.0
+waitress>=2.1.0
+
+# HTTP & Web Scraping
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+yt-dlp>=2023.0.0
+
+# Google Drive & Colab Integration
+google-api-python-client>=2.100.0
+google-auth-oauthlib>=1.0.0
+google-auth-httplib2>=0.1.0
+
+# Telegram
+telethon>=1.34.0
+
+# System & Utilities
+psutil>=5.9.0
+python-dotenv>=1.0.0   # optional, but useful for config
+
+# Image Processing (for face swap thumbnails, etc.)
+Pillow>=10.0.0
+
+# Optional, but recommended for better performance
+# (If you use torrent features, you need libtorrent – see note below)
+# python-libtorrent is not a pip package; install via system:
+#   sudo apt install python3-libtorrent
