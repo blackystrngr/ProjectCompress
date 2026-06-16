@@ -54,7 +54,6 @@ def find_tesseract():
 # Try to find tesseract
 found_path = find_tesseract()
 if found_path:
-    # Test if it runs
     try:
         subprocess.run([found_path, '--version'], capture_output=True, check=True)
         TESSERACT_PATH = found_path
@@ -62,8 +61,6 @@ if found_path:
         logger.info(f"Tesseract found at: {found_path}")
     except Exception as e:
         logger.warning(f"Tesseract found at {found_path} but failed to run: {e}")
-else:
-    logger.warning("Tesseract not found in any common location. OCR will not work.")
 
 # If found, import pytesseract and set the path
 if TESSERACT_AVAILABLE:
@@ -75,19 +72,10 @@ if TESSERACT_AVAILABLE:
     except ImportError as e:
         logger.error(f"Failed to import pytesseract or PIL: {e}")
         TESSERACT_AVAILABLE = False
-else:
-    # Even if we didn't find the binary, we still import for error handling
-    try:
-        import pytesseract
-        from PIL import Image
-        # The path will be set only if found; otherwise we'll get an error later
-    except ImportError as e:
-        logger.error(f"Required OCR libraries not installed: {e}")
 
 # Check for poppler-utils (for PDFs)
 POPPLER_AVAILABLE = False
 try:
-    # Try to find pdftoppm
     if shutil.which('pdftoppm') or os.path.exists('/usr/bin/pdftoppm'):
         from pdf2image import convert_from_path
         POPPLER_AVAILABLE = True
@@ -191,6 +179,10 @@ def process_ocr_task(task_id, input_path, original_filename, lang):
             f.write(text)
 
         os.remove(input_path)
+
+        # Verify the file was created
+        if not os.path.exists(output_path):
+            raise Exception("Output file was not created")
 
         task = load_task(task_id)
         task['status'] = 'done'
