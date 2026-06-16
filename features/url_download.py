@@ -9,6 +9,7 @@ from flask import request, jsonify
 from tasks import save_task, load_task
 from config import UPLOAD_FOLDER, PROXY_DICT
 
+
 logger = logging.getLogger(__name__)
 TORRENT_AVAILABLE = False
 try:
