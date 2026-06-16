@@ -22,6 +22,10 @@ python-dotenv>=1.0.0   # optional, but useful for config
 # Image Processing (for face swap thumbnails, etc.)
 Pillow>=10.0.0
 
+#ocr
+pytesseract
+pillow
+pdf2image
 # Optional, but recommended for better performance
 # (If you use torrent features, you need libtorrent – see note below)
 # python-libtorrent is not a pip package; install via system:
