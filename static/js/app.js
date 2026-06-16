@@ -34,8 +34,14 @@ async function fetchTasks() {
             return;
         }
 
-        // Filter out tasks without task_id and already finished tasks
-        const activeTasks = data.filter(t => t && t.task_id && !['done', 'error', 'cancelled'].includes(t.status));
+        // **Client‑side filter** – ignore any task that is done, error, or cancelled
+        const activeTasks = data.filter(t =>
+            t && t.task_id &&
+            t.status !== 'done' &&
+            t.status !== 'error' &&
+            t.status !== 'cancelled'
+        );
+
         if (activeTasks.length === 0) {
             container.innerHTML = '<div class="empty-state">No active tasks.</div>';
             return;
@@ -67,9 +73,9 @@ async function fetchTasks() {
                         </div>
                         <div class="progress-bar"><div class="progress-fill" style="width: ${progress}%"></div></div>
                         <div style="display: flex; justify-content: flex-end; gap: 0.5rem;">
-                            ${(task.status !== 'done' && task.status !== 'error' && task.status !== 'cancelled') ? 
+                            ${(task.status !== 'done' && task.status !== 'error' && task.status !== 'cancelled') ?
                                 `<button class="cancel-task-btn" data-task-id="${task.task_id}" style="background:#3a2e2e; padding:0.2rem 0.8rem;"><i class="fas fa-ban"></i> Cancel</button>` : ''}
-                            ${task.status === 'done' && task.output_file ? 
+                            ${task.status === 'done' && task.output_file ?
                                 `<a href="/download/${task.output_file}" style="background:#2b8c5e; padding:0.2rem 0.8rem; text-decoration:none; color:white; border-radius:2rem;"><i class="fas fa-download"></i> Result</a>` : ''}
                         </div>
                         ${task.error_msg ? `<div style="font-size:0.7rem; color:#ff8a8a; margin-top:0.3rem;">${escapeHtml(task.error_msg)}</div>` : ''}
