@@ -15,26 +15,33 @@ from config import UPLOAD_FOLDER, DRIVE_FOLDER_ID, TOKEN_FILE
 logger = logging.getLogger(__name__)
 
 def get_drive_service():
-    creds = None
-    if os.path.exists(TOKEN_FILE):
-        try:
-            creds = Credentials.from_authorized_user_file(TOKEN_FILE, ['https://www.googleapis.com/auth/drive'])
-        except Exception as e:
-            logger.error(f"Failed to load token.json: {e}")
-            raise
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
+    """Authenticate and return Drive service with graceful token error handling."""
+    try:
+        creds = None
+        if os.path.exists(TOKEN_FILE):
             try:
-                creds.refresh(Request())
-                with open(TOKEN_FILE, 'w') as token:
-                    token.write(creds.to_json())
-                logger.info("Token refreshed")
+                creds = Credentials.from_authorized_user_file(TOKEN_FILE, ['https://www.googleapis.com/auth/drive'])
             except Exception as e:
-                logger.error(f"Token refresh failed: {e}")
-                raise
-        else:
-            raise Exception("token.json missing or invalid. Please re-authorize.")
-    return build('drive', 'v3', credentials=creds)
+                logger.error(f"Failed to read token.json: {e}")
+                raise Exception("Google Drive token file is corrupt. Please delete token.json and re-authorize.")
+
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                try:
+                    creds.refresh(Request())
+                    with open(TOKEN_FILE, 'w') as token:
+                        token.write(creds.to_json())
+                    logger.info("Google Drive token refreshed")
+                except Exception as e:
+                    logger.error(f"Token refresh failed: {e}")
+                    raise Exception("Google Drive token expired. Please re-authorize (delete token.json and restart).")
+            else:
+                raise Exception("token.json missing or invalid. Please re-authorize.")
+
+        return build('drive', 'v3', credentials=creds)
+    except Exception as e:
+        logger.error(f"Drive service error: {e}")
+        raise  # re-raise so callers can handle it
 
 def process_colab(task_id, input_path, original_filename):
     logger.info(f"Colab task {task_id}: input={input_path}")
@@ -148,8 +155,10 @@ def register_routes(app):
         if not file_id or not file_name:
             return jsonify({'error': 'Missing file_id or file_name'}), 400
         task_id = str(uuid.uuid4())
-        task_data = {'task_id': task_id, 'status': 'queued', 'download_progress': 0,
-                     'created_at': time.time(), 'cancelled': False}
+        task_data = {
+            'task_id': task_id, 'status': 'queued', 'download_progress': 0,
+            'created_at': time.time(), 'cancelled': False
+        }
         save_task(task_id, task_data)
         def run():
             task = load_task(task_id)
@@ -220,8 +229,10 @@ def register_routes(app):
                 return jsonify({'error': 'Cannot process a directory'}), 400
 
             task_id = str(uuid.uuid4())
-            task_data = {'task_id': task_id, 'status': 'queued', 'upload_progress': 0,
-                         'download_progress': 0, 'created_at': time.time(), 'cancelled': False}
+            task_data = {
+                'task_id': task_id, 'status': 'queued', 'upload_progress': 0,
+                'download_progress': 0, 'created_at': time.time(), 'cancelled': False
+            }
             save_task(task_id, task_data)
             threading.Thread(target=process_colab, args=(task_id, full_path, original_filename), daemon=True).start()
             return jsonify({'task_id': task_id})
