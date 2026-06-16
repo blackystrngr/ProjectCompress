@@ -17,7 +17,7 @@ from tasks import get_all_task_ids, load_task, save_task
 from features import register_all_features
 
 # Webhook secret – set environment variable or use config
-WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'your-super-secret-webhook-key')
+WEBHOOK_SECRET = "atomisfake"
 
 # Path to your SSH deploy key
 GITHUB_DEPLOY_KEY = os.path.expanduser('~/.ssh/github_deploy')
