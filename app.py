@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-
 import os
 import sys
 import logging
@@ -17,7 +16,11 @@ from config import SECRET_KEY, MAX_CONTENT_LENGTH, UPLOAD_FOLDER, TASKS_DIR
 from tasks import get_all_task_ids, load_task, save_task
 from features import register_all_features
 
+# Webhook secret – set environment variable or use config
 WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'your-super-secret-webhook-key')
+
+# Path to your SSH deploy key
+GITHUB_DEPLOY_KEY = os.path.expanduser('~/.ssh/github_deploy')
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,11 +35,14 @@ def create_app():
     app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
     app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 
+    # Register all feature routes
     register_all_features(app)
 
-    # ---------- Webhook endpoint ----------
+    # ---------- Webhook endpoint with SSH fix ----------
     @app.route('/webhook', methods=['POST'])
     def webhook():
+        """GitHub webhook – pulls latest code and restarts using SSH key."""
+        # Verify signature (optional)
         signature = request.headers.get('X-Hub-Signature-256')
         if signature and WEBHOOK_SECRET:
             payload = request.get_data()
@@ -45,17 +51,24 @@ def create_app():
                 logger.warning("Invalid webhook signature")
                 return jsonify({'error': 'Invalid signature'}), 401
 
+        # Only react to 'push' events
         event = request.headers.get('X-GitHub-Event')
         if event != 'push':
             return jsonify({'message': 'Ignored event'}), 200
 
         logger.info("Received push event – pulling latest code...")
+
+        # Set environment to use the deploy key
+        env = os.environ.copy()
+        env['GIT_SSH_COMMAND'] = f'ssh -i {GITHUB_DEPLOY_KEY} -o StrictHostKeyChecking=no'
+
         try:
             result = subprocess.run(
                 ['git', 'pull', 'origin', 'main'],
                 cwd=os.path.dirname(os.path.abspath(__file__)),
                 capture_output=True,
-                text=True
+                text=True,
+                env=env
             )
             if result.returncode != 0:
                 logger.error(f"Git pull failed: {result.stderr}")
@@ -65,15 +78,17 @@ def create_app():
             logger.exception("Git pull exception")
             return jsonify({'error': str(e)}), 500
 
+        # Restart the app in a background thread
         def restart():
-            time.sleep(1)
+            time.sleep(1)  # give response time to send
             logger.info("Restarting Flask app...")
             os.execv(sys.executable, [sys.executable] + sys.argv)
 
         threading.Thread(target=restart, daemon=True).start()
+
         return jsonify({'status': 'updated, restarting...'}), 200
 
-    # ---------- Error handler ----------
+    # ---------- Global error handler ----------
     @app.errorhandler(Exception)
     def handle_exception(e):
         logger.exception("Unhandled exception")
@@ -154,12 +169,14 @@ def create_app():
     return app
 
 if __name__ == '__main__':
+    # Clean up stale tasks
     for tid in get_all_task_ids():
         if not load_task(tid):
             try:
                 os.remove(os.path.join(TASKS_DIR, f"{tid}.json"))
             except:
                 pass
+
     app = create_app()
     logger.info("Starting server on 0.0.0.0:5000")
     serve(app, host='0.0.0.0', port=5000, threads=6)
