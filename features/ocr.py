@@ -4,6 +4,7 @@ import threading
 import time
 import logging
 import subprocess
+import shutil
 from flask import request, jsonify
 from werkzeug.utils import secure_filename
 from tasks import save_task, load_task
@@ -11,28 +12,55 @@ from config import UPLOAD_FOLDER
 
 logger = logging.getLogger(__name__)
 
-# Check for required external tools
+# ------------------------------------------------------------
+# Detect Tesseract location
+# ------------------------------------------------------------
 TESSERACT_AVAILABLE = False
+TESSERACT_PATH = None
+
+# Try to find tesseract binary
+possible_paths = [
+    shutil.which('tesseract'),
+    '/usr/bin/tesseract',
+    '/usr/local/bin/tesseract',
+    '/opt/homebrew/bin/tesseract',  # macOS
+]
+
+for path in possible_paths:
+    if path and os.path.exists(path):
+        try:
+            # Test if it runs
+            subprocess.run([path, '--version'], capture_output=True, check=True)
+            TESSERACT_PATH = path
+            TESSERACT_AVAILABLE = True
+            logger.info(f"Tesseract found at: {path}")
+            break
+        except:
+            continue
+
+if not TESSERACT_AVAILABLE:
+    logger.warning("Tesseract not found. OCR will not work. Install tesseract-ocr and ensure it's in PATH.")
+
+# Set the path for pytesseract if found
+if TESSERACT_AVAILABLE:
+    try:
+        import pytesseract
+        from PIL import Image
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+        logger.info("Tesseract path set in pytesseract")
+    except ImportError as e:
+        logger.error(f"Failed to import pytesseract or PIL: {e}")
+        TESSERACT_AVAILABLE = False
+
+# Check for poppler-utils (for PDFs)
 POPPLER_AVAILABLE = False
-
 try:
-    # Try to import pytesseract and check if tesseract is installed
-    import pytesseract
-    from PIL import Image
-    # Run a simple version check
-    subprocess.run(['tesseract', '--version'], capture_output=True, check=True)
-    TESSERACT_AVAILABLE = True
-except:
-    logger.warning("Tesseract not found. OCR will not work. Install tesseract-ocr and python3-pytesseract.")
-
-try:
-    # Check for pdf2image and poppler-utils
-    from pdf2image import convert_from_path
-    # Try to run pdftoppm (part of poppler)
     subprocess.run(['pdftoppm', '-v'], capture_output=True, check=True)
+    from pdf2image import convert_from_path
     POPPLER_AVAILABLE = True
+    logger.info("poppler-utils found, PDF support enabled")
 except:
-    logger.warning("pdf2image or poppler-utils not found. PDF conversion will not work.")
+    logger.warning("poppler-utils not found. PDF processing will not work.")
 
 # Supported languages (ISO 639-2 codes)
 LANGUAGES = {
@@ -63,13 +91,13 @@ ALLOWED_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.pdf'}
 def extract_text_from_image(image_path, lang='eng'):
     """Extract text from a single image using Tesseract."""
     if not TESSERACT_AVAILABLE:
-        raise Exception("Tesseract is not installed. Please install tesseract-ocr.")
+        raise Exception("Tesseract is not installed or not found in PATH. Please install tesseract-ocr (sudo apt install tesseract-ocr) and restart the server.")
     try:
+        from PIL import Image
+        import pytesseract
         img = Image.open(image_path)
-        # Convert to RGB if needed (e.g., for RGBA)
         if img.mode in ('RGBA', 'LA', 'P'):
             img = img.convert('RGB')
-        # Run OCR
         text = pytesseract.image_to_string(img, lang=lang)
         return text.strip()
     except Exception as e:
@@ -79,15 +107,14 @@ def extract_text_from_image(image_path, lang='eng'):
 def extract_text_from_pdf(pdf_path, lang='eng'):
     """Extract text from a PDF by converting each page to an image and OCR'ing."""
     if not POPPLER_AVAILABLE:
-        raise Exception("poppler-utils not installed. Cannot process PDFs. Install poppler-utils.")
+        raise Exception("poppler-utils not installed. Cannot process PDFs. Install poppler-utils (sudo apt install poppler-utils).")
     try:
+        from pdf2image import convert_from_path
         images = convert_from_path(pdf_path, dpi=300)
         all_text = []
         for i, img in enumerate(images, 1):
-            # Convert image to RGB if needed
             if img.mode != 'RGB':
                 img = img.convert('RGB')
-            # OCR each page
             text = pytesseract.image_to_string(img, lang=lang)
             all_text.append(f"--- Page {i} ---\n{text}\n")
         return '\n'.join(all_text)
@@ -96,7 +123,6 @@ def extract_text_from_pdf(pdf_path, lang='eng'):
         raise Exception(f"PDF OCR failed: {str(e)}")
 
 def process_ocr_task(task_id, input_path, original_filename, lang):
-    """Background task: perform OCR and save result."""
     task = load_task(task_id)
     if not task:
         return
@@ -105,7 +131,6 @@ def process_ocr_task(task_id, input_path, original_filename, lang):
     save_task(task_id, task)
 
     try:
-        # Determine file type
         ext = os.path.splitext(original_filename)[1].lower()
         if ext == '.pdf':
             task['progress'] = 10
@@ -119,11 +144,9 @@ def process_ocr_task(task_id, input_path, original_filename, lang):
         task['progress'] = 80
         save_task(task_id, task)
 
-        # Save text to file
         base, _ = os.path.splitext(original_filename)
         output_filename = f"{base}_ocr.txt"
         output_path = os.path.join(UPLOAD_FOLDER, output_filename)
-        # Ensure unique name
         counter = 1
         while os.path.exists(output_path):
             output_filename = f"{base}_ocr_{counter}.txt"
@@ -133,7 +156,6 @@ def process_ocr_task(task_id, input_path, original_filename, lang):
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(text)
 
-        # Clean up input file
         os.remove(input_path)
 
         task = load_task(task_id)
@@ -150,40 +172,33 @@ def process_ocr_task(task_id, input_path, original_filename, lang):
             task['status'] = 'error'
             task['error_msg'] = str(e)
             save_task(task_id, task)
-        # Clean up input file if exists
         if os.path.exists(input_path):
             os.remove(input_path)
 
 def register_routes(app):
     @app.route('/ocr/upload', methods=['POST'])
     def ocr_upload():
-        # Validate file
         if 'file' not in request.files:
             return jsonify({'error': 'No file uploaded'}), 400
         file = request.files['file']
         if file.filename == '':
             return jsonify({'error': 'Empty filename'}), 400
 
-        # Check extension
         ext = os.path.splitext(file.filename)[1].lower()
         if ext not in ALLOWED_EXTENSIONS:
             return jsonify({'error': f'Unsupported file type. Allowed: {", ".join(ALLOWED_EXTENSIONS)}'}), 400
 
-        # Validate language
         lang = request.form.get('language', 'eng')
         if lang not in LANGUAGES:
             return jsonify({'error': f'Unsupported language: {lang}'}), 400
 
-        # Check if OCR is available
         if not TESSERACT_AVAILABLE:
-            return jsonify({'error': 'Tesseract is not installed on the server. Please contact administrator.'}), 500
+            return jsonify({'error': 'Tesseract is not installed. Please install tesseract-ocr (sudo apt install tesseract-ocr) and restart the server.'}), 500
 
-        # Save uploaded file temporarily
         filename = secure_filename(file.filename)
         temp_path = os.path.join(UPLOAD_FOLDER, f"temp_{uuid.uuid4().hex}_{filename}")
         file.save(temp_path)
 
-        # Create task
         task_id = str(uuid.uuid4())
         task_data = {
             'task_id': task_id,
@@ -195,7 +210,6 @@ def register_routes(app):
         }
         save_task(task_id, task_data)
 
-        # Start background thread
         threading.Thread(target=process_ocr_task, args=(task_id, temp_path, filename, lang), daemon=True).start()
 
         return jsonify({'task_id': task_id})
