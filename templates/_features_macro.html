@@ -7,6 +7,7 @@
 {# Add new tab buttons here #}
 <button class="tab-btn" data-tab="proxy"><i class="fas fa-network-wired"></i> Proxy Fetcher</button>
 <button class="tab-btn" data-tab="subtitle"><i class="fas fa-closed-captioning"></i> Subtitles</button>
+<button class="tab-btn" data-tab="ocr"><i class="fas fa-file-alt"></i> OCR</button>
 {% endmacro %}
 
 {% macro render_panes() %}
@@ -31,5 +32,8 @@
 </div>
 <div id="subtitle-tab" class="tab-pane">
     {% include 'features/subtitle_finder.html' %}
+</div>
+<div id="ocr-tab" class="tab-pane">
+    {% include 'features/ocr.html' %}
 </div>
 {% endmacro %}
