@@ -1,4 +1,3 @@
-
 import os
 import uuid
 import threading
@@ -19,121 +18,105 @@ except ImportError:
     logger.warning("libtorrent not installed. Torrent downloads disabled.")
 
 def download_with_requests(url, output_path, task_id):
-    """
-    Download a file using requests with robust error handling and progress.
-    Returns True on success, raises exception on failure.
-    """
+    """Download with detailed progress: speed, downloaded size, total size."""
     session = requests.Session()
     if PROXY_DICT:
         session.proxies = PROXY_DICT
-    # Increase timeouts – connection 30s, read 60s, overall 300s (5 min)
     session.timeout = (30, 60)
     session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'User-Agent': 'Mozilla/5.0',
         'Accept': 'video/*,*/*;q=0.9',
-        'Connection': 'keep-alive',   # keep connection alive
+        'Connection': 'keep-alive',
     })
-    # Retry on connection errors (up to 3 times with backoff)
+
+    # Get total size (if possible)
+    total = 0
+    try:
+        head_resp = session.head(url, allow_redirects=True, timeout=30)
+        total = int(head_resp.headers.get('content-length', 0))
+        logger.info(f"Content-Length: {total} bytes")
+    except:
+        logger.warning("Could not get content-length.")
+
+    # Initialize task stats
+    task = load_task(task_id)
+    if task:
+        task['status'] = 'downloading'
+        task['download_progress'] = 0
+        task['total_size'] = total
+        task['downloaded_size'] = 0
+        task['download_speed'] = 0
+        task['elapsed_time'] = 0
+        save_task(task_id, task)
+
     retries = 3
     for attempt in range(1, retries + 1):
         try:
-            # HEAD request to get size (if possible)
-            try:
-                head_resp = session.head(url, allow_redirects=True, timeout=30)
-                total = int(head_resp.headers.get('content-length', 0))
-                logger.info(f"Content-Length: {total} bytes")
-            except:
-                total = 0
-                logger.warning("Could not get content-length. Progress will be time-based.")
-
-            # GET request with stream
             resp = session.get(url, stream=True, timeout=60)
             resp.raise_for_status()
-
-            # Update task status
-            task = load_task(task_id)
-            if task:
-                task['status'] = 'downloading'
-                task['download_progress'] = 0
-                save_task(task_id, task)
-
             downloaded = 0
             start_time = time.time()
             last_update = time.time()
-
             with open(output_path, 'wb') as f:
                 for chunk in resp.iter_content(chunk_size=8192):
-                    # Check cancellation
                     if load_task(task_id).get('cancelled', False):
-                        raise Exception("Cancelled by user")
-
+                        raise Exception("Cancelled")
                     if chunk:
                         f.write(chunk)
                         downloaded += len(chunk)
-
-                        # Update progress every second or every 1%
                         now = time.time()
-                        if total > 0:
-                            pct = int(100 * downloaded / total)
-                            if pct != load_task(task_id).get('download_progress', -1):
-                                task = load_task(task_id)
-                                if task:
-                                    task['download_progress'] = pct
-                                    save_task(task_id, task)
-                        else:
-                            # No content-length – update every 2 seconds to show activity
-                            if now - last_update > 2:
-                                task = load_task(task_id)
-                                if task:
-                                    # Show downloaded MB so far
-                                    downloaded_mb = downloaded / (1024*1024)
-                                    task['download_progress'] = int(downloaded_mb)  # rough indicator
-                                    save_task(task_id, task)
-                                last_update = now
-
-            # Download succeeded
+                        # Update every second or every 1% change
+                        if now - last_update >= 1:
+                            elapsed = now - start_time
+                            speed = (downloaded / elapsed) / 1024  # kB/s
+                            pct = int(100 * downloaded / total) if total > 0 else 0
+                            task = load_task(task_id)
+                            if task:
+                                task['download_progress'] = pct
+                                task['downloaded_size'] = downloaded
+                                task['download_speed'] = int(speed)
+                                task['elapsed_time'] = int(elapsed)
+                                save_task(task_id, task)
+                            last_update = now
+            # Download complete
+            task = load_task(task_id)
+            if task:
+                task['download_progress'] = 100
+                task['downloaded_size'] = downloaded
+                task['download_speed'] = 0
+                task['elapsed_time'] = int(time.time() - start_time)
+                save_task(task_id, task)
             return True
 
         except requests.exceptions.Timeout as e:
-            logger.warning(f"Timeout on attempt {attempt}: {e}")
+            logger.warning(f"Timeout attempt {attempt}: {e}")
             if attempt == retries:
                 raise Exception(f"Download timed out after {retries} attempts")
-            time.sleep(2 ** attempt)  # exponential backoff
-
+            time.sleep(2 ** attempt)
         except requests.exceptions.ConnectionError as e:
-            logger.warning(f"Connection error on attempt {attempt}: {e}")
+            logger.warning(f"Connection error attempt {attempt}: {e}")
             if attempt == retries:
                 raise Exception(f"Connection error: {e}")
             time.sleep(2 ** attempt)
-
         except Exception as e:
-            logger.exception(f"Download failed on attempt {attempt}")
-            raise  # re-raise other exceptions
-
-    return False  # should never reach here
+            logger.exception(f"Download failed attempt {attempt}")
+            raise
 
 def process_url_download(task_id, url):
-    """Background task for direct HTTP/HTTPS download."""
-    logger.info(f"process_url_download started for {task_id} with URL {url}")
+    logger.info(f"process_url_download started for {task_id}")
     task = load_task(task_id)
     if not task:
-        logger.error(f"Task {task_id} not found at start")
+        logger.error(f"Task {task_id} not found")
         return
-    task['status'] = 'downloading'
-    task['download_progress'] = 0
-    save_task(task_id, task)
 
     temp = os.path.join(UPLOAD_FOLDER, f"{task_id}_raw.mp4")
     try:
         download_with_requests(url, temp, task_id)
-
-        # Check cancellation again
         if load_task(task_id).get('cancelled', False):
             if os.path.exists(temp):
                 os.remove(temp)
             return
 
-        # Generate unique final name
         final_name = _get_unique_filename("downloaded_video.mp4")
         final_path = os.path.join(UPLOAD_FOLDER, final_name)
         os.rename(temp, final_path)
@@ -143,6 +126,7 @@ def process_url_download(task_id, url):
             task['status'] = 'done'
             task['output_file'] = final_name
             task['download_progress'] = 100
+            task['download_speed'] = 0
             save_task(task_id, task)
         logger.info(f"Download completed: {final_name}")
 
@@ -171,26 +155,40 @@ def download_torrent(torrent_input, task_id, save_path):
     task = load_task(task_id)
     task['status'] = 'downloading'
     save_task(task_id, task)
+
     while not handle.has_metadata():
         time.sleep(1)
     torrent_name = handle.name()
     files = handle.get_torrent_info().files()
+    total_size = sum(f.size for f in files)
+    task = load_task(task_id)
+    if task:
+        task['total_size'] = total_size
+        save_task(task_id, task)
+
     if files.num_files() == 1:
         output_filename = files.file_path(0)
     else:
         output_filename = torrent_name + '.mp4'
     full_output_path = os.path.join(save_path, output_filename)
+
     while not handle.is_seed():
         if load_task(task_id).get('cancelled', False):
             ses.remove_torrent(handle)
             raise Exception("Cancelled")
         status = handle.status()
         progress = int(status.progress * 100)
+        downloaded = status.total_download
+        speed = int(status.download_rate / 1024)  # kB/s
         task = load_task(task_id)
-        task['progress'] = progress
-        task['download_speed'] = int(status.download_rate / 1000)
-        save_task(task_id, task)
+        if task:
+            task['progress'] = progress
+            task['downloaded_size'] = downloaded
+            task['download_speed'] = speed
+            task['download_progress'] = progress  # keep consistent
+            save_task(task_id, task)
         time.sleep(1)
+
     ses.remove_torrent(handle)
     if not os.path.exists(full_output_path):
         for root, _, files in os.walk(save_path):
@@ -205,6 +203,8 @@ def download_torrent(torrent_input, task_id, save_path):
     task = load_task(task_id)
     task['status'] = 'done'
     task['output_file'] = final_name
+    task['download_progress'] = 100
+    task['download_speed'] = 0
     save_task(task_id, task)
 
 def process_torrent_download(task_id, torrent_input):
@@ -241,7 +241,6 @@ def register_routes(app):
         }
         save_task(task_id, task_data)
 
-        # Check if it's a torrent or direct URL
         if url.startswith('magnet:') or (url.endswith('.torrent') and url.startswith(('http://', 'https://'))):
             if not TORRENT_AVAILABLE:
                 task_data['status'] = 'error'
@@ -268,11 +267,9 @@ def register_routes(app):
                             save_task(task_id, task)
             threading.Thread(target=fetch_torrent, daemon=True).start()
         else:
-            # Direct HTTP/HTTPS download
             def run():
                 process_url_download(task_id, url)
             threading.Thread(target=run, daemon=True).start()
-
         return jsonify({'task_id': task_id})
 
     @app.route('/start_upload_torrent', methods=['POST'])
