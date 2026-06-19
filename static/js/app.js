@@ -17,6 +17,23 @@ function escapeHtml(str) {
     });
 }
 
+// Helper: format bytes to human-readable
+function formatBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    const val = (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0);
+    return val + ' ' + units[i];
+}
+
+function formatSpeed(bytesPerSec) {
+    if (bytesPerSec === 0) return '0 B/s';
+    const units = ['B/s', 'KB/s', 'MB/s'];
+    const i = Math.floor(Math.log(bytesPerSec) / Math.log(1024));
+    const val = (bytesPerSec / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0);
+    return val + ' ' + units[i];
+}
+
 // ==================== Task Management ====================
 async function fetchTasks() {
     const container = document.getElementById('tasksContainer');
@@ -27,19 +44,17 @@ async function fetchTasks() {
         const data = await resp.json();
         console.log('fetchTasks received:', data);
 
-        // Ensure data is an array
         if (!Array.isArray(data)) {
             console.error('Invalid response: not an array', data);
             container.innerHTML = '<div class="empty-state" style="color:#ff8a8a;">⚠️ Invalid response from server.</div>';
             return;
         }
 
-        // **Client‑side filter** – ignore any task that is done, error, or cancelled
         const terminalStatuses = ['done', 'error', 'cancelled', 'search_done', 'scan_done'];
         const activeTasks = data.filter(t =>
-        t && t.task_id &&
-        !terminalStatuses.includes(t.status)
-    );
+            t && t.task_id &&
+            !terminalStatuses.includes(t.status)
+        );
 
         if (activeTasks.length === 0) {
             container.innerHTML = '<div class="empty-state">No active tasks.</div>';
@@ -48,12 +63,20 @@ async function fetchTasks() {
 
         let html = '';
         activeTasks.forEach(task => {
-            let progress = task.download_progress || task.upload_progress || task.progress || 0;
+            let progress = task.download_progress || task.progress || 0;
             let statusText = task.status;
+            let speed = task.download_speed || 0;
+            let total = task.total_size || 0;
+            let downloaded = task.downloaded_size || 0;
+            let elapsed = task.elapsed_time || 0;
+
             if (task.status === 'uploading') statusText = `📤 Uploading (${progress}%)`;
             else if (task.status === 'waiting_colab') statusText = `⏳ Waiting for Colab`;
-            else if (task.status === 'downloading') statusText = `📥 Downloading (${progress}%)`;
-            else if (task.status === 'done') statusText = `✅ Done`;
+            else if (task.status === 'downloading') {
+                let speedDisplay = speed > 0 ? ` (${formatSpeed(speed * 1024)})` : '';
+                let sizeDisplay = total > 0 ? ` ${formatBytes(downloaded)} / ${formatBytes(total)}` : ` ${formatBytes(downloaded)}`;
+                statusText = `📥 Downloading${sizeDisplay}${speedDisplay}`;
+            } else if (task.status === 'done') statusText = `✅ Done`;
             else if (task.status === 'error') statusText = `❌ Error`;
             else if (task.status === 'cancelled') statusText = `⛔ Cancelled`;
             else if (task.status === 'detecting_scenes') statusText = `🎬 Detecting scenes (${progress}%)`;
@@ -63,13 +86,17 @@ async function fetchTasks() {
             else if (task.status === 'fetching') statusText = `🌐 Fetching (${progress}%)`;
             else if (task.status === 'searching') statusText = `🔎 Searching (${progress}%)`;
             else if (task.status === 'testing') statusText = `🧪 Testing (${progress}%)`;
+            else statusText = task.status;
 
             const taskIdShort = task.task_id.substring(0, 8);
+            const fileName = task.output_file || 'downloading...';
+
             html += `<div class="task-card" data-task-id="${task.task_id}">
                         <div class="task-header">
                             <span class="task-id">${taskIdShort}</span>
                             <span class="task-status">${statusText}</span>
                         </div>
+                        <div style="font-size:0.8rem; margin-bottom:0.2rem;">${escapeHtml(fileName)}</div>
                         <div class="progress-bar"><div class="progress-fill" style="width: ${progress}%"></div></div>
                         <div style="display: flex; justify-content: flex-end; gap: 0.5rem;">
                             ${(task.status !== 'done' && task.status !== 'error' && task.status !== 'cancelled') ?
@@ -82,7 +109,6 @@ async function fetchTasks() {
         });
         container.innerHTML = html;
 
-        // Attach cancel button listeners
         document.querySelectorAll('.cancel-task-btn').forEach(btn => {
             btn.addEventListener('click', (e) => {
                 const taskId = btn.getAttribute('data-task-id');
@@ -102,7 +128,7 @@ async function cancelTask(taskId) {
         const data = await resp.json();
         if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
         showToast(`Cancelling task ${taskId.substring(0,8)}`);
-        fetchTasks(); // refresh immediately
+        fetchTasks();
     } catch (err) {
         showToast(err.message, true);
     }
@@ -120,7 +146,6 @@ function initTabs() {
         if (activeBtn) activeBtn.classList.add('active');
         const activePane = document.getElementById(`${tabId}-tab`);
         if (activePane) activePane.classList.add('active');
-        // Optional refresh for tabs that need it
         if (tabId === 'local' && typeof loadDirectory === 'function') loadDirectory();
         if (tabId === 'drive' && typeof loadDriveFiles === 'function') loadDriveFiles();
     }
@@ -142,5 +167,4 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(fetchTasks, 2000);
 });
 
-// Expose globally so features can manually refresh
 window.fetchTasks = fetchTasks;
