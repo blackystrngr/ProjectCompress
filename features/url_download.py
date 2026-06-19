@@ -18,7 +18,7 @@ except ImportError:
     logger.warning("libtorrent not installed. Torrent downloads disabled.")
 
 def download_with_requests(url, output_path, task_id):
-    """Download with detailed progress: speed, downloaded size, total size."""
+    """Download with detailed progress and safe task access."""
     session = requests.Session()
     if PROXY_DICT:
         session.proxies = PROXY_DICT
@@ -29,7 +29,7 @@ def download_with_requests(url, output_path, task_id):
         'Connection': 'keep-alive',
     })
 
-    # Get total size (if possible)
+    # Get total size
     total = 0
     try:
         head_resp = session.head(url, allow_redirects=True, timeout=30)
@@ -48,6 +48,9 @@ def download_with_requests(url, output_path, task_id):
         task['download_speed'] = 0
         task['elapsed_time'] = 0
         save_task(task_id, task)
+    else:
+        logger.error(f"Task {task_id} not found at start")
+        return False
 
     retries = 3
     for attempt in range(1, retries + 1):
@@ -59,13 +62,14 @@ def download_with_requests(url, output_path, task_id):
             last_update = time.time()
             with open(output_path, 'wb') as f:
                 for chunk in resp.iter_content(chunk_size=8192):
-                    if load_task(task_id).get('cancelled', False):
-                        raise Exception("Cancelled")
+                    # Safe cancellation check – load task and verify
+                    task = load_task(task_id)
+                    if task and task.get('cancelled', False):
+                        raise Exception("Cancelled by user")
                     if chunk:
                         f.write(chunk)
                         downloaded += len(chunk)
                         now = time.time()
-                        # Update every second or every 1% change
                         if now - last_update >= 1:
                             elapsed = now - start_time
                             speed = (downloaded / elapsed) / 1024  # kB/s
@@ -101,6 +105,8 @@ def download_with_requests(url, output_path, task_id):
         except Exception as e:
             logger.exception(f"Download failed attempt {attempt}")
             raise
+
+    return False
 
 def process_url_download(task_id, url):
     logger.info(f"process_url_download started for {task_id}")
@@ -153,8 +159,9 @@ def download_torrent(torrent_input, task_id, save_path):
         atp.ti = lt.torrent_info(torrent_input)
     handle = ses.add_torrent(atp)
     task = load_task(task_id)
-    task['status'] = 'downloading'
-    save_task(task_id, task)
+    if task:
+        task['status'] = 'downloading'
+        save_task(task_id, task)
 
     while not handle.has_metadata():
         time.sleep(1)
@@ -185,7 +192,7 @@ def download_torrent(torrent_input, task_id, save_path):
             task['progress'] = progress
             task['downloaded_size'] = downloaded
             task['download_speed'] = speed
-            task['download_progress'] = progress  # keep consistent
+            task['download_progress'] = progress
             save_task(task_id, task)
         time.sleep(1)
 
@@ -201,20 +208,22 @@ def download_torrent(torrent_input, task_id, save_path):
     if full_output_path != final_path:
         os.rename(full_output_path, final_path)
     task = load_task(task_id)
-    task['status'] = 'done'
-    task['output_file'] = final_name
-    task['download_progress'] = 100
-    task['download_speed'] = 0
-    save_task(task_id, task)
+    if task:
+        task['status'] = 'done'
+        task['output_file'] = final_name
+        task['download_progress'] = 100
+        task['download_speed'] = 0
+        save_task(task_id, task)
 
 def process_torrent_download(task_id, torrent_input):
     try:
         download_torrent(torrent_input, task_id, UPLOAD_FOLDER)
     except Exception as e:
         task = load_task(task_id)
-        task['status'] = 'error'
-        task['error_msg'] = str(e)
-        save_task(task_id, task)
+        if task:
+            task['status'] = 'error'
+            task['error_msg'] = str(e)
+            save_task(task_id, task)
 
 def _get_unique_filename(filename):
     base, ext = os.path.splitext(filename)
