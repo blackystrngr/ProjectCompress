@@ -7,20 +7,20 @@ from config import TASKS_DIR
 logger = logging.getLogger(__name__)
 
 def save_task(task_id, task_data):
-    """Write task JSON directly (atomic enough with lock)."""
+    """Atomically save task JSON using a temporary file."""
     with threading.Lock():
         os.makedirs(TASKS_DIR, exist_ok=True)
         path = os.path.join(TASKS_DIR, f"{task_id}.json")
+        tmp = path + '.tmp'
         try:
-            with open(path, 'w') as f:
+            with open(tmp, 'w') as f:
                 json.dump(task_data, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
+            os.replace(tmp, path)  # atomic on Unix
             logger.debug(f"Task {task_id} saved")
         except Exception as e:
             logger.error(f"Save error for {task_id}: {e}")
-            # Do not re-raise to avoid breaking the request
-            # The task will be missing, but at least the app continues
+            # If replace fails, the temp file is left; we ignore.
+            # Next save will overwrite.
 
 def load_task(task_id):
     path = os.path.join(TASKS_DIR, f"{task_id}.json")
@@ -48,4 +48,3 @@ def get_all_task_ids():
         return [f[:-5] for f in os.listdir(TASKS_DIR) if f.endswith('.json')]
     except Exception:
         return []
-
