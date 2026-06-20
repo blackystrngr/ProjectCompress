@@ -1,6 +1,6 @@
 <div class="card">
-    <h2><i class="fas fa-spider"></i> Recursive Domain Crawler</h2>
-    <p>Starting from a URL, recursively fetch every page, CSS, JS, and other resources on the same domain (including subdomains) until all URLs are discovered. Extracts domains from all found URLs.</p>
+    <h2><i class="fas fa-spider"></i> Recursive Domain & IP Crawler</h2>
+    <p>Starting from a URL, recursively fetch every page, CSS, JS, and other resources on the same domain (including subdomains) until all URLs are discovered. Extracts domains and IPs from all found URLs.</p>
     <form id="crawlerForm">
         <div class="input-group">
             <input type="text" id="startUrl" placeholder="https://example.com" required>
@@ -12,39 +12,51 @@
     </form>
 
     <div id="crawlerResults">
+        <!-- Stats -->
         <div style="display:flex; gap:1rem; flex-wrap:wrap; margin-bottom:1rem;">
             <span><strong>Current:</strong> <span id="currentUrl" style="color:#80b3ff;">-</span></span>
             <span><strong>Pages visited:</strong> <span id="pagesVisited">0</span></span>
             <span><strong>Unique URLs:</strong> <span id="urlCount">0</span></span>
-            <span><strong>Unique domains:</strong> <span id="domainCount">0</span></span>
+            <span><strong>Domains:</strong> <span id="domainCount">0</span></span>
+            <span><strong>IPs:</strong> <span id="ipCount">0</span></span>
         </div>
+
+        <!-- Action buttons -->
         <div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-bottom:1rem;">
             <button id="copyDomainsBtn" class="primary" style="display:none;"><i class="fas fa-copy"></i> Copy Domains</button>
             <button id="downloadDomainsBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download Domains</button>
+            <button id="downloadIpsBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download IPs</button>
             <button id="downloadUrlsBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download URLs</button>
             <button id="showSavedBtn" class="primary"><i class="fas fa-folder-open"></i> Show Saved Files</button>
         </div>
 
+        <!-- Three columns: URLs, Domains, IPs -->
         <div style="display:flex; gap:2rem; flex-wrap:wrap;">
-            <div style="flex:1; min-width:300px;">
+            <div style="flex:1; min-width:250px;">
                 <h4>Discovered URLs</h4>
-                <div id="urlList" style="max-height:400px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem;">
+                <div id="urlList" style="max-height:300px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem;">
                     <div class="empty-state">No URLs yet.</div>
                 </div>
             </div>
             <div style="flex:1; min-width:200px;">
                 <h4>Domains</h4>
-                <div id="domainList" style="max-height:400px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem;">
+                <div id="domainList" style="max-height:300px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem;">
                     <div class="empty-state">No domains yet.</div>
+                </div>
+            </div>
+            <div style="flex:1; min-width:150px;">
+                <h4>IPs</h4>
+                <div id="ipList" style="max-height:300px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem;">
+                    <div class="empty-state">No IPs yet.</div>
                 </div>
             </div>
         </div>
 
-        <!-- Saved domain files section -->
+        <!-- Saved files section -->
         <div id="savedFilesSection" style="margin-top:1rem; display:none;">
-            <h4>Saved Domain Files</h4>
+            <h4>Saved Files</h4>
             <div id="savedFilesList" style="max-height:200px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem;">
-                <div class="empty-state">No saved domain files.</div>
+                <div class="empty-state">No saved files.</div>
             </div>
         </div>
     </div>
@@ -61,10 +73,13 @@
     const pagesVisitedSpan = document.getElementById('pagesVisited');
     const urlCountSpan = document.getElementById('urlCount');
     const domainCountSpan = document.getElementById('domainCount');
+    const ipCountSpan = document.getElementById('ipCount');
     const urlListDiv = document.getElementById('urlList');
     const domainListDiv = document.getElementById('domainList');
+    const ipListDiv = document.getElementById('ipList');
     const copyDomainsBtn = document.getElementById('copyDomainsBtn');
     const downloadDomainsBtn = document.getElementById('downloadDomainsBtn');
+    const downloadIpsBtn = document.getElementById('downloadIpsBtn');
     const downloadUrlsBtn = document.getElementById('downloadUrlsBtn');
     const showSavedBtn = document.getElementById('showSavedBtn');
     const savedFilesSection = document.getElementById('savedFilesSection');
@@ -77,6 +92,7 @@
         e.preventDefault();
         const startUrl = startUrlInput.value.trim();
         if (!startUrl) { showToast('Enter a start URL', true); return; }
+        if (!startUrl.startsWith('http')) startUrl = 'https://' + startUrl;
         const maxPages = parseInt(maxPagesInput.value) || 0;
         const maxDepth = parseInt(maxDepthInput.value) || 3;
 
@@ -92,12 +108,15 @@
             statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Crawling started...';
             urlListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
             domainListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
+            ipListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
             pagesVisitedSpan.textContent = '0';
             urlCountSpan.textContent = '0';
             domainCountSpan.textContent = '0';
+            ipCountSpan.textContent = '0';
             currentUrlSpan.textContent = '-';
             copyDomainsBtn.style.display = 'none';
             downloadDomainsBtn.style.display = 'none';
+            downloadIpsBtn.style.display = 'none';
             downloadUrlsBtn.style.display = 'none';
             if (pollInterval) clearInterval(pollInterval);
             pollInterval = setInterval(pollCrawler, 2000);
@@ -121,12 +140,14 @@
             const totalPages = data.total_pages || 0;
             const urls = data.discovered_urls || [];
             const domains = data.domains || [];
+            const ips = data.ips || [];
             const currentUrl = data.current_url || '-';
 
             currentUrlSpan.textContent = currentUrl;
             pagesVisitedSpan.textContent = totalPages;
             urlCountSpan.textContent = urls.length;
             domainCountSpan.textContent = domains.length;
+            ipCountSpan.textContent = ips.length;
 
             if (urls.length > 0) {
                 let html = '';
@@ -149,17 +170,31 @@
                 domainListDiv.innerHTML = '<div class="empty-state">No domains yet.</div>';
             }
 
+            if (ips.length > 0) {
+                let html = '';
+                ips.forEach(ip => {
+                    html += `<div style="font-size:0.8rem; padding:2px 0; border-bottom:1px solid #2a3248;">${escapeHtml(ip)}</div>`;
+                });
+                ipListDiv.innerHTML = html;
+            } else {
+                ipListDiv.innerHTML = '<div class="empty-state">No IPs yet.</div>';
+            }
+
             if (status === 'done') {
                 clearInterval(pollInterval);
-                statusDiv.innerHTML = `✅ Crawling completed. Found ${urls.length} unique URLs across ${domains.length} domains.`;
+                statusDiv.innerHTML = `✅ Crawling completed. Found ${urls.length} URLs, ${domains.length} domains, ${ips.length} IPs.`;
                 copyDomainsBtn.style.display = 'inline-flex';
                 downloadDomainsBtn.style.display = 'inline-flex';
+                downloadIpsBtn.style.display = 'inline-flex';
                 downloadUrlsBtn.style.display = 'inline-flex';
                 downloadUrlsBtn.onclick = () => {
                     window.open(`/crawler/download_urls/${currentTaskId}`, '_blank');
                 };
                 downloadDomainsBtn.onclick = () => {
                     window.open(`/crawler/download_domains/${currentTaskId}`, '_blank');
+                };
+                downloadIpsBtn.onclick = () => {
+                    window.open(`/crawler/download_ips/${currentTaskId}`, '_blank');
                 };
                 copyDomainsBtn.onclick = () => {
                     const text = domains.join('\n');
@@ -186,13 +221,13 @@
         }
     }
 
-    // Show saved domain files
+    // Show saved files
     showSavedBtn.addEventListener('click', async function() {
         try {
-            const resp = await fetch('/crawler/list_domain_files');
+            const resp = await fetch('/crawler/list_files');
             const files = await resp.json();
             if (files.length === 0) {
-                savedFilesList.innerHTML = '<div class="empty-state">No saved domain files found.</div>';
+                savedFilesList.innerHTML = '<div class="empty-state">No saved files found.</div>';
             } else {
                 let html = '';
                 files.forEach(f => {
