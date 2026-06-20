@@ -15,10 +15,10 @@ logger = logging.getLogger(__name__)
 
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 
-# Regex to extract URLs from CSS url(...)
-CSS_URL_RE = re.compile(r'url\([\'"]?([^\'"\)]+)[\'"]?\)', re.IGNORECASE)
-# Regex to extract URLs from JS strings (simple)
-JS_URL_RE = re.compile(r'[\'"](https?://[^\'"]+)[\'"]', re.IGNORECASE)
+# Asset extensions to skip
+SKIP_EXTENSIONS = ('.css', '.js', '.jpg', '.jpeg', '.png', '.gif', '.svg',
+                   '.ico', '.webp', '.woff', '.woff2', '.ttf', '.eot', '.pdf',
+                   '.mp4', '.webm', '.mp3', '.zip', '.tar', '.gz')
 
 def get_domain_from_url(url):
     try:
@@ -39,6 +39,20 @@ def is_same_domain(url, target_domain):
         domain = domain[4:]
     return domain == target_domain
 
+def is_html_page(url):
+    """Return True if URL looks like an HTML page (not an asset)."""
+    if not url:
+        return False
+    # Skip known asset paths
+    if '/_nuxt/' in url or '/_ipx/' in url or '_Incapsula_Resource' in url:
+        return False
+    # Skip by extension
+    path = urlparse(url).path
+    if any(path.endswith(ext) for ext in SKIP_EXTENSIONS):
+        return False
+    # Keep URLs that look like pages
+    return True
+
 def normalize_url(url, base):
     try:
         return urljoin(base, url)
@@ -46,7 +60,7 @@ def normalize_url(url, base):
         return None
 
 def extract_urls_from_html(html, base_url):
-    """Extract all URLs from HTML: href, src, srcset, data-* attributes, etc."""
+    """Extract all URLs from HTML: href, src, srcset, etc."""
     soup = BeautifulSoup(html, 'html.parser')
     urls = set()
     # Tags with href
@@ -57,7 +71,7 @@ def extract_urls_from_html(html, base_url):
             if abs_url:
                 urls.add(abs_url)
     # Tags with src
-    for tag in soup.find_all(['script', 'img', 'iframe', 'source', 'audio', 'video', 'track']):
+    for tag in soup.find_all(['script', 'img', 'iframe', 'source']):
         src = tag.get('src')
         if src:
             abs_url = normalize_url(src, base_url)
@@ -73,7 +87,7 @@ def extract_urls_from_html(html, base_url):
                     abs_url = normalize_url(part, base_url)
                     if abs_url:
                         urls.add(abs_url)
-    # data-* attributes that might contain URLs (common in lazy loading)
+    # data-* attributes with URLs
     for tag in soup.find_all():
         for attr in tag.attrs:
             if attr.startswith('data-') and 'src' in attr:
@@ -84,43 +98,8 @@ def extract_urls_from_html(html, base_url):
                         urls.add(abs_url)
     return urls
 
-def extract_urls_from_css(css_text, base_url):
-    """Extract URLs from CSS url(...) and also from @import."""
-    urls = set()
-    # url(...)
-    for match in CSS_URL_RE.finditer(css_text):
-        url = match.group(1).strip()
-        if url and not url.startswith('data:') and not url.startswith('#'):
-            abs_url = normalize_url(url, base_url)
-            if abs_url:
-                urls.add(abs_url)
-    # @import url(...)
-    import_re = re.compile(r'@import\s+[\'"]([^\'"]+)[\'"]', re.IGNORECASE)
-    for match in import_re.finditer(css_text):
-        url = match.group(1).strip()
-        abs_url = normalize_url(url, base_url)
-        if abs_url:
-            urls.add(abs_url)
-    return urls
-
-def extract_urls_from_js(js_text, base_url):
-    """Extract URLs from JS strings that look like URLs."""
-    urls = set()
-    for match in JS_URL_RE.finditer(js_text):
-        url = match.group(1).strip()
-        if url:
-            abs_url = normalize_url(url, base_url)
-            if abs_url:
-                urls.add(abs_url)
-    return urls
-
-def get_content_type(resp):
-    """Extract content type from headers."""
-    ct = resp.headers.get('content-type', '')
-    return ct.split(';')[0].strip().lower()
-
-def run_crawler(task_id, start_url, max_pages, max_depth, follow_all=False):
-    """Crawler that extracts URLs from HTML, CSS, JS."""
+def run_crawler(task_id, start_url, max_pages, max_depth):
+    """Crawler that ONLY follows HTML pages, not assets."""
     logger.info(f"Crawler {task_id} started: {start_url}")
 
     task = load_task(task_id)
@@ -154,13 +133,12 @@ def run_crawler(task_id, start_url, max_pages, max_depth, follow_all=False):
     session.timeout = (10, 30)
 
     try:
-        while queue and pages_visited < max_pages:
+        while queue and (pages_visited < max_pages or max_pages == 0):
             url, depth = queue.pop(0)
             current_url = url
             if depth > max_depth:
                 continue
 
-            # Update progress
             task = load_task(task_id)
             if task:
                 task['current_url'] = current_url
@@ -170,40 +148,29 @@ def run_crawler(task_id, start_url, max_pages, max_depth, follow_all=False):
                 resp = session.get(url, allow_redirects=True, timeout=20)
                 if resp.status_code != 200:
                     continue
-                content_type = get_content_type(resp)
-                if 'text/html' in content_type:
-                    # Extract URLs from HTML
-                    urls = extract_urls_from_html(resp.text, url)
-                    # Also parse inline CSS? Not needed; we'll fetch CSS separately.
-                elif 'text/css' in content_type:
-                    urls = extract_urls_from_css(resp.text, url)
-                elif 'application/javascript' in content_type or 'text/javascript' in content_type:
-                    urls = extract_urls_from_js(resp.text, url)
-                else:
-                    # Skip other types (images, fonts, etc.) – we don't need to parse them
+                content_type = resp.headers.get('content-type', '')
+                if 'text/html' not in content_type:
                     continue
+                html = resp.text
             except Exception as e:
                 logger.warning(f"Failed to fetch {url}: {e}")
                 continue
 
+            urls = extract_urls_from_html(html, url)
             pages_visited += 1
 
-            # Process extracted URLs
             for extracted_url in urls:
                 if extracted_url not in visited:
                     visited.add(extracted_url)
-                    # Always add to internal_urls if same domain, even if it's an asset
                     if is_same_domain(extracted_url, target_domain):
                         internal_urls.add(extracted_url)
-                        # Queue if it's HTML or CSS/JS (to extract more domains) and depth allows
-                        if depth + 1 <= max_depth:
+                        # ONLY follow if it's an HTML page
+                        if is_html_page(extracted_url) and depth + 1 <= max_depth:
                             queue.append((extracted_url, depth + 1))
-                    # Extract domain from all URLs (including external)
                     dom = get_domain_from_url(extracted_url)
                     if dom:
                         domains.add(dom)
 
-            # Update every few pages
             if pages_visited % 5 == 0:
                 task = load_task(task_id)
                 if not task:
@@ -231,19 +198,29 @@ def run_crawler(task_id, start_url, max_pages, max_depth, follow_all=False):
             task['current_url'] = None
             save_task(task_id, task)
 
+            # Build directory structure from internal URLs
+            dirs = set()
+            for u in internal_urls:
+                path = urlparse(u).path
+                if path:
+                    dirs.add(path)
+
             # Save domain file
             domain_filename = f"{target_domain}_domains.txt"
-            domain_filepath = os.path.join(UPLOAD_FOLDER, domain_filename)
-            with open(domain_filepath, 'w') as f:
+            with open(os.path.join(UPLOAD_FOLDER, domain_filename), 'w') as f:
                 f.write('\n'.join(sorted(domains)))
 
             # Save URLs file
             urls_filename = f"{target_domain}_urls.txt"
-            urls_filepath = os.path.join(UPLOAD_FOLDER, urls_filename)
-            with open(urls_filepath, 'w') as f:
+            with open(os.path.join(UPLOAD_FOLDER, urls_filename), 'w') as f:
                 f.write('\n'.join(sorted(internal_urls)))
 
-            logger.info(f"Crawler {task_id} finished: {len(internal_urls)} URLs, {len(domains)} domains")
+            # Save directory structure file
+            dirs_filename = f"{target_domain}_directories.txt"
+            with open(os.path.join(UPLOAD_FOLDER, dirs_filename), 'w') as f:
+                f.write('\n'.join(sorted(dirs)))
+
+            logger.info(f"Crawler {task_id} finished: {len(internal_urls)} URLs, {len(domains)} domains, {len(dirs)} directories")
 
     except Exception as e:
         logger.exception(f"Crawler {task_id} failed")
@@ -264,13 +241,7 @@ def register_routes(app):
             start_url = 'https://' + start_url
 
         max_pages = int(request.form.get('max_pages', 0))
-        if max_pages == 0:
-            max_pages = 999999  # effectively unlimited
-        else:
-            max_pages = max(1, min(max_pages, 10000))
-
-        max_depth = int(request.form.get('max_depth', 3))
-        max_depth = max(1, min(max_depth, 10))
+        max_depth = int(request.form.get('max_depth', 5))
 
         task_id = str(uuid.uuid4())
         task_data = {
@@ -343,11 +314,33 @@ def register_routes(app):
                 f.write('\n'.join(sorted(domains)))
         return send_file(filepath, as_attachment=True, download_name=filename)
 
+    @app.route('/crawler/download_directories/<task_id>')
+    def crawler_download_directories(task_id):
+        task = load_task(task_id)
+        if not task:
+            return jsonify({'error': 'Task not found'}), 404
+        urls = task.get('internal_urls', [])
+        if not urls:
+            return jsonify({'error': 'No URLs discovered'}), 404
+        dirs = set()
+        for u in urls:
+            path = urlparse(u).path
+            if path:
+                dirs.add(path)
+        if not dirs:
+            return jsonify({'error': 'No directories found'}), 404
+        domain = task.get('target_domain', 'unknown')
+        filename = f"{domain}_directories.txt"
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        with open(filepath, 'w') as f:
+            f.write('\n'.join(sorted(dirs)))
+        return send_file(filepath, as_attachment=True, download_name=filename)
+
     @app.route('/crawler/list_files')
     def crawler_list_files():
         files = []
         for f in os.listdir(UPLOAD_FOLDER):
-            if f.endswith('_urls.txt') or f.endswith('_domains.txt'):
+            if f.endswith('_urls.txt') or f.endswith('_domains.txt') or f.endswith('_directories.txt'):
                 files.append({
                     'name': f,
                     'path': f,
