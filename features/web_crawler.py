@@ -158,12 +158,6 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=20):
     all_urls = set()
     domains = set()
     ip_addresses = set()
-    queue = [(start_url, 0)]
-    visited.add(start_url)
-    all_urls.add(start_url)
-    dom = extract_domain(start_url)
-    if dom:
-        domains.add(dom)
     pages_visited = 0
     current_url = start_url
 
@@ -181,21 +175,20 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=20):
     session.headers.update({'User-Agent': USER_AGENT})
     session.timeout = (10, 20)
 
-    # Helper to fetch and extract
     def fetch_url(url, depth):
+        """Fetch a URL and extract URLs and IPs."""
         nonlocal pages_visited
         if url in processed:
-            return None
+            return None, None, depth
         processed.add(url)
         try:
             resp = session.get(url, allow_redirects=True, timeout=15)
             if resp.status_code != 200:
-                return None
+                return None, None, depth
             content_type = resp.headers.get('content-type', '').lower()
             text = resp.text
             # Extract IPs from text
             ips = extract_ips_from_text(text)
-            ip_addresses.update(ips)
             # Extract URLs based on content type
             extracted_urls = set()
             if 'text/html' in content_type:
@@ -205,94 +198,30 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=20):
             elif 'application/javascript' in content_type or 'text/javascript' in content_type:
                 extracted_urls = extract_urls_from_js(text, url)
             else:
-                return None
+                return None, None, depth
             # Add IPs from the URL itself
-            ip_in_url = extract_ips_from_text(url)
-            ip_addresses.update(ip_in_url)
-            return extracted_urls, ips
+            ips.update(extract_ips_from_text(url))
+            return extracted_urls, ips, depth
         except Exception as e:
             logger.warning(f"Failed to fetch {url}: {e}")
-            return None
+            return None, None, depth
 
     try:
-        with ThreadPoolExecutor(max_workers=threads) as executor:
-            futures = {}
-            # Initial queue
-            while queue and (pages_visited < max_pages or max_pages == 0):
-                url, depth = queue.pop(0)
-                if url in visited:
-                    continue
-                visited.add(url)
-                current_url = url
-                task = load_task(task_id)
-                if task:
-                    task['current_url'] = current_url
-                    save_task(task_id, task)
-
-                # Submit fetch
-                future = executor.submit(fetch_url, url, depth)
-                futures[future] = (url, depth)
-
-                # Process completed futures as they finish
-                # We'll loop through completed futures and add new ones
-                # Use as_completed to handle each result as it arrives
-                # But we need to add new URLs as we discover them.
-                # We'll process futures in a separate loop after submission? That would block.
-                # Better: we'll use a while loop to check for completed futures and add new ones.
-                # We'll implement: after submitting, we'll immediately check for any completed futures.
-                # But we still need to manage the queue.
-                # We'll use a simple approach: after each submission, we process any already completed futures.
-                # Let's restructure: we'll use as_completed in a separate thread? No.
-                # Simpler: we'll submit all queued items, then process futures as they complete.
-                # However, new URLs are discovered during processing, which can't be added after as_completed.
-                # The correct pattern: keep a while loop that submits from the queue and also checks for completion.
-                # We'll implement that now.
-
-            # We need to continue processing the queue while futures are running.
-            # We'll start with the initial queue, and then in a loop we'll:
-            # - Submit new tasks from queue (if any).
-            # - Check for completed futures and process their results (which may add to queue).
-            # - Continue until queue is empty and all futures are done.
-
-            # For simplicity, we'll use a while loop that handles both submission and completion.
-            # But we already have the queue initialization above. We'll refactor to a cleaner method.
-            # Actually, the code above is incomplete. Let's rewrite the whole loop.
-
-        # ---- Refactored loop ----
-        # We'll use a queue and a set of futures.
-        # The while loop will:
-        # 1. Submit new tasks from the queue until max workers reached.
-        # 2. Check for completed futures and process them.
-        # 3. Continue until queue is empty and all futures are done.
-
-        # We'll restart the loop here.
-        # For simplicity, we'll use a simpler approach: submit all tasks from the queue initially,
-        # then process futures, but new URLs discovered during processing won't be added to the queue
-        # because the queue is already empty. So we need to handle it differently.
-
-        # The correct implementation:
-        # Use a queue (collections.deque) and a ThreadPoolExecutor.
-        # While queue has items or there are running futures:
-        # - Submit up to max_workers items from queue.
-        # - Check for completed futures and process results, adding new items to queue.
-        # This is a classic producer-consumer pattern.
-
-        # I'll implement it with a while loop.
-
         from collections import deque
         queue = deque([(start_url, 0)])
-        visited = set()
         visited.add(start_url)
+        all_urls.add(start_url)
+        dom = extract_domain(start_url)
+        if dom:
+            domains.add(dom)
 
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = set()
-            # We'll maintain a set of futures.
 
             def submit_task(url, depth):
                 if url in visited:
                     return
                 visited.add(url)
-                # Update current URL
                 task = load_task(task_id)
                 if task:
                     task['current_url'] = url
@@ -300,51 +229,54 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=20):
                 future = executor.submit(fetch_url, url, depth)
                 futures.add(future)
 
-            # Submit initial task
+            # Start with the initial URL
             submit_task(start_url, 0)
 
+            # Main loop: process completed futures and submit new tasks from queue
             while queue or futures:
-                # Process completed futures
+                # Check for completed futures
                 to_remove = set()
                 for future in list(futures):
                     if future.done():
                         result = future.result()
                         futures.remove(future)
                         if result is not None:
-                            extracted_urls, ips = result
+                            extracted_urls, ips, depth = result
                             if ips:
                                 ip_addresses.update(ips)
-                            for extracted_url in extracted_urls:
-                                if extracted_url not in visited:
-                                    visited.add(extracted_url)
-                                    all_urls.add(extracted_url)
-                                    dom = extract_domain(extracted_url)
-                                    if dom:
-                                        domains.add(dom)
-                                    # Add to queue if same domain and depth allows
-                                    if is_same_domain(extracted_url, target_domain):
-                                        # We need to know the depth of the current URL; we can store depth in a dict.
-                                        # We'll need to pass depth from the result. We'll modify fetch_url to return depth.
-                                        # Actually, we need to track depth per URL. We'll use a dict depth_map.
-                                        # For simplicity, I'll refactor fetch_url to accept depth and return it.
-                                        # I'll rewrite fetch_url later.
+                            if extracted_urls:
+                                for extracted_url in extracted_urls:
+                                    if extracted_url not in visited:
+                                        visited.add(extracted_url)
+                                        all_urls.add(extracted_url)
+                                        dom = extract_domain(extracted_url)
+                                        if dom:
+                                            domains.add(dom)
+                                        # Add to queue if same domain and within depth limit
+                                        if is_same_domain(extracted_url, target_domain):
+                                            if depth + 1 <= max_depth:
+                                                queue.append((extracted_url, depth + 1))
+                                pages_visited += 1
 
-                # Submit new tasks from queue (up to max_workers - len(futures))
+                # Submit new tasks from queue (up to max_workers)
                 while queue and len(futures) < threads:
                     url, depth = queue.popleft()
-                    # Check if already visited (might have been added in the meantime)
                     if url in visited:
                         continue
-                    visited.add(url)
-                    # Update current URL
+                    submit_task(url, depth)
+
+                # Update task progress periodically
+                if len(visited) % 10 == 0:
                     task = load_task(task_id)
                     if task:
-                        task['current_url'] = url
+                        task['total_pages'] = len(visited)
+                        task['progress'] = int(100 * len(visited) / max_pages) if max_pages > 0 else 0
+                        task['discovered_urls'] = list(all_urls)
+                        task['domains'] = list(domains | ip_addresses)
+                        task['current_url'] = current_url
                         save_task(task_id, task)
-                    future = executor.submit(fetch_url, url, depth)
-                    futures.add(future)
 
-                # Small sleep to prevent busy loop
+                # Small sleep to avoid busy loop
                 time.sleep(0.1)
 
             # Done
