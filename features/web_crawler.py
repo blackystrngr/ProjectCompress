@@ -6,6 +6,7 @@ import time
 import logging
 import requests
 from urllib.parse import urljoin, urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import request, jsonify, send_file
 from bs4 import BeautifulSoup
 from tasks import save_task, load_task
@@ -15,6 +16,31 @@ logger = logging.getLogger(__name__)
 
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 
+# Default wordlist for bruteforce
+DEFAULT_WORDLIST = [
+    'admin', 'backup', 'config', 'wp-admin', 'wp-content', 'wp-includes',
+    'uploads', 'images', 'css', 'js', 'assets', 'static', 'media',
+    'data', 'logs', 'tmp', 'temp', 'cache', 'sessions', 'cgi-bin',
+    'includes', 'lib', 'modules', 'plugins', 'themes', 'vendor',
+    'robots.txt', 'sitemap.xml', 'sitemap_index.xml', 'sitemap.xml.gz',
+    'humans.txt', 'crossdomain.xml', 'phpinfo.php', 'phpmyadmin',
+    'mysql', 'database', 'sql', 'dump', 'backup.sql', 'config.php',
+    'config.inc.php', 'settings.php', 'wp-config.php', '.env',
+    '.htaccess', '.htpasswd', 'server-status', 'server-info',
+    'phpinfo', 'test', 'example', 'demo', 'sample',
+    'index.php', 'index.html', 'default.php', 'default.html',
+    'home', 'main', 'public', 'private', 'restricted', 'secure',
+    'user', 'users', 'profile', 'account', 'login', 'register',
+    'contact', 'about', 'help', 'faq', 'support', 'terms', 'privacy',
+    'dashboard', 'control', 'panel', 'manage', 'adminer',
+]
+
+# Common extensions for bruteforce
+DEFAULT_EXTENSIONS = ['.php', '.html', '.txt', '.log', '.bak', '.old', '.zip', '.tar.gz', '.sql', '.env', '.ini', '.xml', '.json', '.yml', '.yaml', '.conf', '.config', '.htaccess', '.htpasswd', '.inc', '.class', '.js', '.css', '.jpg', '.png', '.gif', '.ico', '.svg', '.webp', '.woff', '.woff2', '.ttf', '.eot']
+
+# --------------------------------
+# Crawling helpers
+# --------------------------------
 def get_domain_from_url(url):
     try:
         parsed = urlparse(url)
@@ -74,33 +100,26 @@ def extract_urls_from_html(html, base_url):
                         urls.add(abs_url)
     return urls
 
-def build_directory_tree(urls):
-    tree = {}
-    for url in urls:
-        parsed = urlparse(url)
-        path = parsed.path or '/'
-        if not path.startswith('/'):
-            path = '/' + path
-        parts = path.strip('/').split('/') if path != '/' else ['']
-        current = tree
-        for part in parts:
-            if part == '':
-                continue
-            if part not in current:
-                current[part] = {}
-            current = current[part]
-    return tree
+# --------------------------------
+# Bruteforce helpers
+# --------------------------------
+def normalize_base_url(base):
+    if not base.endswith('/'):
+        base += '/'
+    return base
 
-def render_tree(tree, indent=0):
-    lines = []
-    for key, value in sorted(tree.items()):
-        lines.append('  ' * indent + '📁 ' + key)
-        if value:
-            lines.extend(render_tree(value, indent + 1))
-    return lines
+def get_status_code(url, session):
+    try:
+        resp = session.head(url, allow_redirects=True, timeout=5)
+        return resp.status_code, url
+    except:
+        return None, url
 
-def run_crawler(task_id, start_url, max_pages, max_depth):
-    logger.info(f"Crawler {task_id} started: {start_url}")
+# --------------------------------
+# Main crawler + bruteforce task
+# --------------------------------
+def run_combined(task_id, start_url, max_pages, max_depth, enable_bruteforce, wordlist, extensions, threads):
+    logger.info(f"Combined task {task_id} started: {start_url}")
 
     task = load_task(task_id)
     if not task:
@@ -109,7 +128,7 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
 
     target_domain = get_domain_from_url(start_url)
     visited = set()
-    internal_urls = set()   # all internal URLs (including assets)
+    internal_urls = set()      # all discovered internal URLs
     domains = set()
     queue = [(start_url, 0)]
     visited.add(start_url)
@@ -117,7 +136,13 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
     pages_visited = 0
     current_url = start_url
 
-    task['status'] = 'running'
+    # Bruteforce state
+    bf_discovered = []
+    bf_checked = 0
+    bf_total = 0
+    bf_done = False
+
+    task['status'] = 'crawling'
     task['progress'] = 0
     task['total_pages'] = 0
     task['max_pages'] = max_pages
@@ -126,12 +151,18 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
     task['domains'] = list(domains)
     task['current_url'] = current_url
     task['target_domain'] = target_domain
+    task['enable_bruteforce'] = enable_bruteforce
+    task['bf_discovered'] = []
+    task['bf_checked'] = 0
+    task['bf_total'] = 0
+    task['bf_done'] = False
     save_task(task_id, task)
 
     session = requests.Session()
     session.headers.update({'User-Agent': USER_AGENT})
     session.timeout = (10, 30)
 
+    # ---------- PHASE 1: Crawl ----------
     try:
         while queue and (pages_visited < max_pages or max_pages == 0):
             url, depth = queue.pop(0)
@@ -164,9 +195,8 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
                     visited.add(extracted_url)
                     if is_same_domain(extracted_url, target_domain):
                         internal_urls.add(extracted_url)
-                        # Always queue even if it's an asset, but we'll still process it
+                        # Queue for further crawling
                         if depth + 1 <= max_depth:
-                            # But we only fetch HTML pages, so we check content-type later
                             queue.append((extracted_url, depth + 1))
                     dom = get_domain_from_url(extracted_url)
                     if dom:
@@ -185,52 +215,138 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
 
             task = load_task(task_id)
             if task and task.get('cancelled', False):
-                logger.info(f"Crawler {task_id} cancelled")
+                logger.info(f"Task {task_id} cancelled during crawl")
                 break
 
-        # Done
+        # Crawl done – save intermediate results
         task = load_task(task_id)
         if task:
-            task['status'] = 'done'
-            task['progress'] = 100
-            task['total_pages'] = pages_visited
+            task['status'] = 'crawling_done'
+            task['progress'] = 50
             task['internal_urls'] = list(internal_urls)
             task['domains'] = list(domains)
-            task['current_url'] = None
             save_task(task_id, task)
 
-            # Build directory tree
-            tree = build_directory_tree(internal_urls)
-            tree_lines = render_tree(tree)
-
-            # Save domain file
-            domain_filename = f"{target_domain}_domains.txt"
-            with open(os.path.join(UPLOAD_FOLDER, domain_filename), 'w') as f:
-                f.write('\n'.join(sorted(domains)))
-
-            # Save URLs file
-            urls_filename = f"{target_domain}_urls.txt"
-            with open(os.path.join(UPLOAD_FOLDER, urls_filename), 'w') as f:
-                f.write('\n'.join(sorted(internal_urls)))
-
-            # Save directory tree file
-            tree_filename = f"{target_domain}_directories.txt"
-            with open(os.path.join(UPLOAD_FOLDER, tree_filename), 'w') as f:
-                f.write(f"Directory tree for {target_domain}\n")
-                f.write(f"Total files/URLs: {len(internal_urls)}\n\n")
-                f.write('\n'.join(tree_lines))
-
-            logger.info(f"Crawler {task_id} finished: {len(internal_urls)} URLs, {len(domains)} domains")
-
     except Exception as e:
-        logger.exception(f"Crawler {task_id} failed")
+        logger.exception(f"Crawl failed for {task_id}")
         task = load_task(task_id)
         if task:
             task['status'] = 'error'
-            task['error_msg'] = str(e)
-            task['current_url'] = None
+            task['error_msg'] = f"Crawl error: {str(e)}"
+            save_task(task_id, task)
+        return
+
+    # ---------- PHASE 2: Bruteforce (if enabled) ----------
+    if enable_bruteforce and not task.get('cancelled', False):
+        logger.info(f"Starting bruteforce for {task_id} on {start_url}")
+        task = load_task(task_id)
+        if task:
+            task['status'] = 'bruteforcing'
+            task['bf_discovered'] = []
+            task['bf_checked'] = 0
+            task['bf_total'] = 0
             save_task(task_id, task)
 
+        base = normalize_base_url(start_url)
+        bf_session = requests.Session()
+        bf_session.headers.update({'User-Agent': USER_AGENT})
+        bf_session.timeout = (5, 10)
+
+        # Build path list
+        paths = []
+        for word in wordlist:
+            paths.append(word + '/')
+            for ext in extensions:
+                paths.append(word + ext)
+        bf_total = len(paths)
+        bf_checked = 0
+        bf_discovered = []
+
+        task = load_task(task_id)
+        if task:
+            task['bf_total'] = bf_total
+            save_task(task_id, task)
+
+        def process_path(path):
+            url = normalize_base_url(base) + path
+            try:
+                resp = bf_session.head(url, allow_redirects=True, timeout=5)
+                if resp.status_code in (200, 301, 302, 403, 401):
+                    return url, resp.status_code
+            except:
+                pass
+            return None, None
+
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            futures = {executor.submit(process_path, p): p for p in paths}
+            for future in as_completed(futures):
+                if load_task(task_id).get('cancelled', False):
+                    executor.shutdown(wait=False)
+                    break
+                url, status = future.result()
+                bf_checked += 1
+                if url:
+                    bf_discovered.append({'url': url, 'status': status})
+                if bf_checked % 50 == 0:
+                    task = load_task(task_id)
+                    if task:
+                        task['bf_discovered'] = bf_discovered
+                        task['bf_checked'] = bf_checked
+                        task['bf_total'] = bf_total
+                        progress_bf = int(100 * bf_checked / bf_total) if bf_total > 0 else 0
+                        task['progress'] = 50 + int(50 * progress_bf / 100)  # total progress 50-100%
+                        save_task(task_id, task)
+
+        # Bruteforce done
+        task = load_task(task_id)
+        if task and not task.get('cancelled', False):
+            task['status'] = 'done'
+            task['progress'] = 100
+            task['bf_discovered'] = bf_discovered
+            task['bf_checked'] = bf_checked
+            task['bf_total'] = bf_total
+            task['bf_done'] = True
+            save_task(task_id, task)
+
+            # Save combined results to files
+            # URLs (crawled + bruteforced)
+            all_urls = list(internal_urls) + [item['url'] for item in bf_discovered]
+            all_urls = sorted(set(all_urls))
+            domain = target_domain
+            urls_filename = f"{domain}_urls.txt"
+            with open(os.path.join(UPLOAD_FOLDER, urls_filename), 'w') as f:
+                f.write('\n'.join(all_urls))
+
+            # Directories (from crawled URLs + bruteforced paths)
+            dirs = set()
+            for u in all_urls:
+                path = urlparse(u).path
+                if path:
+                    dirs.add(path)
+            dirs_filename = f"{domain}_directories.txt"
+            with open(os.path.join(UPLOAD_FOLDER, dirs_filename), 'w') as f:
+                f.write('\n'.join(sorted(dirs)))
+
+            # Bruteforce results only
+            if bf_discovered:
+                bf_filename = f"{domain}_bruteforce.txt"
+                with open(os.path.join(UPLOAD_FOLDER, bf_filename), 'w') as f:
+                    for item in bf_discovered:
+                        f.write(f"{item['status']} {item['url']}\n")
+
+            logger.info(f"Combined task {task_id} finished: {len(all_urls)} total URLs, {len(bf_discovered)} bruteforced")
+
+    else:
+        # Bruteforce disabled or cancelled
+        task = load_task(task_id)
+        if task and not task.get('cancelled', False):
+            task['status'] = 'done'
+            task['progress'] = 100
+            save_task(task_id, task)
+
+# --------------------------------
+# Routes
+# --------------------------------
 def register_routes(app):
     @app.route('/crawler/start', methods=['POST'])
     def crawler_start():
@@ -242,6 +358,15 @@ def register_routes(app):
 
         max_pages = int(request.form.get('max_pages', 0))
         max_depth = int(request.form.get('max_depth', 3))
+        enable_bruteforce = request.form.get('enable_bruteforce', 'false').lower() == 'true'
+        wordlist_raw = request.form.get('wordlist', '').strip()
+        wordlist = [w.strip() for w in wordlist_raw.split(',') if w.strip()] if wordlist_raw else DEFAULT_WORDLIST
+        extensions_raw = request.form.get('extensions', '').strip()
+        if extensions_raw:
+            extensions = [e.strip() for e in extensions_raw.split(',') if e.strip()]
+        else:
+            extensions = DEFAULT_EXTENSIONS
+        threads = int(request.form.get('threads', 20))
 
         task_id = str(uuid.uuid4())
         task_data = {
@@ -253,15 +378,24 @@ def register_routes(app):
             'start_url': start_url,
             'max_pages': max_pages,
             'max_depth': max_depth,
+            'enable_bruteforce': enable_bruteforce,
+            'wordlist': wordlist,
+            'extensions': extensions,
+            'threads': threads,
             'total_pages': 0,
             'internal_urls': [],
             'domains': [],
             'current_url': None,
+            'target_domain': None,
+            'bf_discovered': [],
+            'bf_checked': 0,
+            'bf_total': 0,
+            'bf_done': False,
             'error_msg': None,
         }
         save_task(task_id, task_data)
 
-        threading.Thread(target=run_crawler, args=(task_id, start_url, max_pages, max_depth), daemon=True).start()
+        threading.Thread(target=run_combined, args=(task_id, start_url, max_pages, max_depth, enable_bruteforce, wordlist, extensions, threads), daemon=True).start()
         return jsonify({'task_id': task_id})
 
     @app.route('/crawler/status/<task_id>')
@@ -279,6 +413,11 @@ def register_routes(app):
             'domains': task.get('domains', []),
             'current_url': task.get('current_url'),
             'target_domain': task.get('target_domain'),
+            'enable_bruteforce': task.get('enable_bruteforce', False),
+            'bf_discovered': task.get('bf_discovered', []),
+            'bf_checked': task.get('bf_checked', 0),
+            'bf_total': task.get('bf_total', 0),
+            'bf_done': task.get('bf_done', False),
             'error_msg': task.get('error_msg'),
         })
 
@@ -287,15 +426,15 @@ def register_routes(app):
         task = load_task(task_id)
         if not task:
             return jsonify({'error': 'Task not found'}), 404
-        urls = task.get('internal_urls', [])
-        if not urls:
-            return jsonify({'error': 'No URLs discovered'}), 404
         domain = task.get('target_domain', 'unknown')
         filename = f"{domain}_urls.txt"
         filepath = os.path.join(UPLOAD_FOLDER, filename)
         if not os.path.exists(filepath):
+            # Rebuild if missing
+            all_urls = list(task.get('internal_urls', [])) + [item['url'] for item in task.get('bf_discovered', [])]
+            all_urls = sorted(set(all_urls))
             with open(filepath, 'w') as f:
-                f.write('\n'.join(sorted(urls)))
+                f.write('\n'.join(all_urls))
         return send_file(filepath, as_attachment=True, download_name=filename)
 
     @app.route('/crawler/download_domains/<task_id>')
@@ -319,25 +458,45 @@ def register_routes(app):
         task = load_task(task_id)
         if not task:
             return jsonify({'error': 'Task not found'}), 404
-        urls = task.get('internal_urls', [])
+        urls = task.get('internal_urls', []) + [item['url'] for item in task.get('bf_discovered', [])]
         if not urls:
             return jsonify({'error': 'No URLs discovered'}), 404
-        tree = build_directory_tree(urls)
-        tree_lines = render_tree(tree)
+        dirs = set()
+        for u in urls:
+            path = urlparse(u).path
+            if path:
+                dirs.add(path)
+        if not dirs:
+            return jsonify({'error': 'No directories found'}), 404
         domain = task.get('target_domain', 'unknown')
         filename = f"{domain}_directories.txt"
         filepath = os.path.join(UPLOAD_FOLDER, filename)
         with open(filepath, 'w') as f:
-            f.write(f"Directory tree for {domain}\n")
-            f.write(f"Total files/URLs: {len(urls)}\n\n")
-            f.write('\n'.join(tree_lines))
+            f.write('\n'.join(sorted(dirs)))
+        return send_file(filepath, as_attachment=True, download_name=filename)
+
+    @app.route('/crawler/download_bruteforce/<task_id>')
+    def crawler_download_bruteforce(task_id):
+        task = load_task(task_id)
+        if not task:
+            return jsonify({'error': 'Task not found'}), 404
+        bf = task.get('bf_discovered', [])
+        if not bf:
+            return jsonify({'error': 'No bruteforce results'}), 404
+        domain = task.get('target_domain', 'unknown')
+        filename = f"{domain}_bruteforce.txt"
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        if not os.path.exists(filepath):
+            with open(filepath, 'w') as f:
+                for item in bf:
+                    f.write(f"{item['status']} {item['url']}\n")
         return send_file(filepath, as_attachment=True, download_name=filename)
 
     @app.route('/crawler/list_files')
     def crawler_list_files():
         files = []
         for f in os.listdir(UPLOAD_FOLDER):
-            if f.endswith('_urls.txt') or f.endswith('_domains.txt') or f.endswith('_directories.txt'):
+            if any(f.endswith(ext) for ext in ['_urls.txt', '_domains.txt', '_directories.txt', '_bruteforce.txt']):
                 files.append({
                     'name': f,
                     'path': f,
