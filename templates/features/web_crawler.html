@@ -1,0 +1,146 @@
+<div class="card">
+    <h2><i class="fas fa-spider"></i> Web Crawler / Link Extractor</h2>
+    <p>Starting from a URL, recursively crawl pages and extract all unique links and domains.</p>
+    <form id="crawlerForm">
+        <div class="input-group">
+            <input type="text" id="startUrl" placeholder="https://example.com" required>
+            <input type="number" id="maxPages" placeholder="Max pages" value="100" min="1" max="5000" style="width:120px;">
+            <input type="number" id="maxDepth" placeholder="Max depth" value="2" min="1" max="5" style="width:120px;">
+            <button type="submit" class="primary"><i class="fas fa-play"></i> Start Crawl</button>
+        </div>
+        <div id="crawlerStatus" class="help-text"></div>
+    </form>
+    <div id="crawlerResults">
+        <div style="display:flex; gap:1rem; flex-wrap:wrap; margin-bottom:1rem;">
+            <span><strong>Pages visited:</strong> <span id="pagesVisited">0</span></span>
+            <span><strong>Unique URLs:</strong> <span id="urlCount">0</span></span>
+            <span><strong>Unique domains:</strong> <span id="domainCount">0</span></span>
+            <button id="downloadBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download URLs</button>
+        </div>
+        <div style="display:flex; gap:2rem; flex-wrap:wrap;">
+            <div style="flex:1; min-width:300px;">
+                <h4>Discovered URLs</h4>
+                <div id="urlList" style="max-height:400px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem;">
+                    <div class="empty-state">No URLs yet.</div>
+                </div>
+            </div>
+            <div style="flex:1; min-width:200px;">
+                <h4>Domains</h4>
+                <div id="domainList" style="max-height:400px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem;">
+                    <div class="empty-state">No domains yet.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+(function() {
+    const form = document.getElementById('crawlerForm');
+    const startUrlInput = document.getElementById('startUrl');
+    const maxPagesInput = document.getElementById('maxPages');
+    const maxDepthInput = document.getElementById('maxDepth');
+    const statusDiv = document.getElementById('crawlerStatus');
+    const pagesVisitedSpan = document.getElementById('pagesVisited');
+    const urlCountSpan = document.getElementById('urlCount');
+    const domainCountSpan = document.getElementById('domainCount');
+    const urlListDiv = document.getElementById('urlList');
+    const domainListDiv = document.getElementById('domainList');
+    const downloadBtn = document.getElementById('downloadBtn');
+
+    let currentTaskId = null;
+    let pollInterval = null;
+
+    form.addEventListener('submit', async function(e) {
+        e.preventDefault();
+        const startUrl = startUrlInput.value.trim();
+        if (!startUrl) { showToast('Enter a start URL', true); return; }
+        const maxPages = parseInt(maxPagesInput.value) || 100;
+        const maxDepth = parseInt(maxDepthInput.value) || 2;
+
+        try {
+            const resp = await fetch('/crawler/start', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: `start_url=${encodeURIComponent(startUrl)}&max_pages=${maxPages}&max_depth=${maxDepth}`
+            });
+            const data = await resp.json();
+            if (data.error) throw new Error(data.error);
+            currentTaskId = data.task_id;
+            statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Crawling started...';
+            // Clear previous results
+            urlListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
+            domainListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
+            pagesVisitedSpan.textContent = '0';
+            urlCountSpan.textContent = '0';
+            domainCountSpan.textContent = '0';
+            downloadBtn.style.display = 'none';
+            if (pollInterval) clearInterval(pollInterval);
+            pollInterval = setInterval(pollCrawler, 2000);
+        } catch (err) {
+            showToast(err.message, true);
+        }
+    });
+
+    async function pollCrawler() {
+        if (!currentTaskId) return;
+        try {
+            const resp = await fetch(`/crawler/status/${currentTaskId}`);
+            const data = await resp.json();
+            if (data.error) {
+                clearInterval(pollInterval);
+                statusDiv.innerHTML = `<span style="color:#ff8a8a;">Error: ${data.error}</span>`;
+                return;
+            }
+            const progress = data.progress || 0;
+            const status = data.status;
+            const totalPages = data.total_pages || 0;
+            const urls = data.discovered_urls || [];
+            const domains = data.domains || [];
+
+            pagesVisitedSpan.textContent = totalPages;
+            urlCountSpan.textContent = urls.length;
+            domainCountSpan.textContent = domains.length;
+
+            // Update URL list
+            if (urls.length > 0) {
+                let html = '';
+                urls.slice(0, 200).forEach(u => {
+                    html += `<div style="font-size:0.8rem; padding:2px 0; border-bottom:1px solid #2a3248; word-break:break-all;">${escapeHtml(u)}</div>`;
+                });
+                if (urls.length > 200) html += `<div style="color:#aaa; font-size:0.8rem;">... and ${urls.length - 200} more</div>`;
+                urlListDiv.innerHTML = html;
+            } else {
+                urlListDiv.innerHTML = '<div class="empty-state">No URLs yet.</div>';
+            }
+
+            // Update domain list
+            if (domains.length > 0) {
+                let html = '';
+                domains.forEach(d => {
+                    html += `<div style="font-size:0.8rem; padding:2px 0; border-bottom:1px solid #2a3248;">${escapeHtml(d)}</div>`;
+                });
+                domainListDiv.innerHTML = html;
+            } else {
+                domainListDiv.innerHTML = '<div class="empty-state">No domains yet.</div>';
+            }
+
+            if (status === 'done') {
+                clearInterval(pollInterval);
+                statusDiv.innerHTML = `✅ Crawling completed. Found ${urls.length} unique URLs across ${domains.length} domains.`;
+                downloadBtn.style.display = 'inline-flex';
+                downloadBtn.onclick = () => {
+                    window.open(`/crawler/download/${currentTaskId}`, '_blank');
+                };
+            } else if (status === 'error') {
+                clearInterval(pollInterval);
+                statusDiv.innerHTML = `<span style="color:#ff8a8a;">❌ Error: ${data.error_msg}</span>`;
+            } else {
+                statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Crawling... (${progress}%, ${totalPages} pages visited)`;
+            }
+        } catch (err) {
+            console.error(err);
+        }
+    }
+})();
+</script>
