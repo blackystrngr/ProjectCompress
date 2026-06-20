@@ -8,6 +8,7 @@
 <button class="tab-btn" data-tab="proxy"><i class="fas fa-network-wired"></i> Proxy Fetcher</button>
 <button class="tab-btn" data-tab="subtitle"><i class="fas fa-closed-captioning"></i> Subtitles</button>
 <button class="tab-btn" data-tab="ocr"><i class="fas fa-file-alt"></i> OCR</button>
+<button class="tab-btn" data-tab="crawler"><i class="fas fa-spider"></i> Web Crawler</button>
 {% endmacro %}
 
 {% macro render_panes() %}
@@ -35,5 +36,8 @@
 </div>
 <div id="ocr-tab" class="tab-pane">
     {% include 'features/ocr.html' %}
+</div>
+<div id="crawler-tab" class="tab-pane">
+    {% include 'features/web_crawler.html' %}
 </div>
 {% endmacro %}
