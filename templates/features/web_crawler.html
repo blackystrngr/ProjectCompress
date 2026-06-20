@@ -1,53 +1,43 @@
 <div class="card">
-    <h2><i class="fas fa-spider"></i> Recursive Domain & IP Crawler</h2>
-    <p>Starting from a URL, recursively fetch every page, CSS, JS, and other resources on the same domain (including subdomains) until all URLs are discovered. Extracts domains and IPs from all found URLs.</p>
+    <h2><i class="fas fa-spider"></i> Recursive Domain Crawler (Multi‑threaded)</h2>
+    <p>Starting from a URL, recursively fetch every page, CSS, JS, and other resources on the same domain (including subdomains) until exhausted. Extracts domains and IP addresses.</p>
     <form id="crawlerForm">
         <div class="input-group">
             <input type="text" id="startUrl" placeholder="https://example.com" required>
             <input type="number" id="maxPages" placeholder="Max pages (0 = unlimited)" value="0" min="0" style="width:140px;">
             <input type="number" id="maxDepth" placeholder="Max depth" value="3" min="1" max="10" style="width:120px;">
+            <input type="number" id="threads" placeholder="Threads" value="20" min="1" max="50" style="width:80px;">
             <button type="submit" class="primary"><i class="fas fa-play"></i> Start Crawl</button>
+            <button type="button" id="cancelBtn" class="danger" style="display:none;"><i class="fas fa-stop"></i> Cancel</button>
         </div>
         <div id="crawlerStatus" class="help-text"></div>
     </form>
 
     <div id="crawlerResults">
-        <!-- Stats -->
         <div style="display:flex; gap:1rem; flex-wrap:wrap; margin-bottom:1rem;">
             <span><strong>Current:</strong> <span id="currentUrl" style="color:#80b3ff;">-</span></span>
             <span><strong>Pages visited:</strong> <span id="pagesVisited">0</span></span>
             <span><strong>Unique URLs:</strong> <span id="urlCount">0</span></span>
-            <span><strong>Domains:</strong> <span id="domainCount">0</span></span>
-            <span><strong>IPs:</strong> <span id="ipCount">0</span></span>
+            <span><strong>Domains / IPs:</strong> <span id="domainCount">0</span></span>
         </div>
-
-        <!-- Action buttons -->
         <div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-bottom:1rem;">
-            <button id="copyDomainsBtn" class="primary" style="display:none;"><i class="fas fa-copy"></i> Copy Domains</button>
-            <button id="downloadDomainsBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download Domains</button>
-            <button id="downloadIpsBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download IPs</button>
+            <button id="copyDomainsBtn" class="primary" style="display:none;"><i class="fas fa-copy"></i> Copy Domains / IPs</button>
+            <button id="downloadDomainsBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download Domains / IPs</button>
             <button id="downloadUrlsBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download URLs</button>
             <button id="showSavedBtn" class="primary"><i class="fas fa-folder-open"></i> Show Saved Files</button>
         </div>
 
-        <!-- Three columns: URLs, Domains, IPs -->
         <div style="display:flex; gap:2rem; flex-wrap:wrap;">
-            <div style="flex:1; min-width:250px;">
+            <div style="flex:1; min-width:300px;">
                 <h4>Discovered URLs</h4>
-                <div id="urlList" style="max-height:300px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem;">
+                <div id="urlList" style="max-height:400px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem; font-family:monospace; font-size:0.8rem; white-space:pre-wrap; word-break:break-all;">
                     <div class="empty-state">No URLs yet.</div>
                 </div>
             </div>
             <div style="flex:1; min-width:200px;">
-                <h4>Domains</h4>
-                <div id="domainList" style="max-height:300px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem;">
-                    <div class="empty-state">No domains yet.</div>
-                </div>
-            </div>
-            <div style="flex:1; min-width:150px;">
-                <h4>IPs</h4>
-                <div id="ipList" style="max-height:300px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem;">
-                    <div class="empty-state">No IPs yet.</div>
+                <h4>Domains & IPs</h4>
+                <div id="domainList" style="max-height:400px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem; font-family:monospace; font-size:0.8rem; white-space:pre-wrap; word-break:break-all;">
+                    <div class="empty-state">No domains/IPs yet.</div>
                 </div>
             </div>
         </div>
@@ -68,18 +58,17 @@
     const startUrlInput = document.getElementById('startUrl');
     const maxPagesInput = document.getElementById('maxPages');
     const maxDepthInput = document.getElementById('maxDepth');
+    const threadsInput = document.getElementById('threads');
+    const cancelBtn = document.getElementById('cancelBtn');
     const statusDiv = document.getElementById('crawlerStatus');
     const currentUrlSpan = document.getElementById('currentUrl');
     const pagesVisitedSpan = document.getElementById('pagesVisited');
     const urlCountSpan = document.getElementById('urlCount');
     const domainCountSpan = document.getElementById('domainCount');
-    const ipCountSpan = document.getElementById('ipCount');
     const urlListDiv = document.getElementById('urlList');
     const domainListDiv = document.getElementById('domainList');
-    const ipListDiv = document.getElementById('ipList');
     const copyDomainsBtn = document.getElementById('copyDomainsBtn');
     const downloadDomainsBtn = document.getElementById('downloadDomainsBtn');
-    const downloadIpsBtn = document.getElementById('downloadIpsBtn');
     const downloadUrlsBtn = document.getElementById('downloadUrlsBtn');
     const showSavedBtn = document.getElementById('showSavedBtn');
     const savedFilesSection = document.getElementById('savedFilesSection');
@@ -88,19 +77,34 @@
     let currentTaskId = null;
     let pollInterval = null;
 
+    cancelBtn.addEventListener('click', async function() {
+        if (currentTaskId) {
+            try {
+                const resp = await fetch(`/cancel/${currentTaskId}`, { method: 'POST' });
+                const data = await resp.json();
+                if (data.error) throw new Error(data.error);
+                showToast('Cancelling crawl...');
+                cancelBtn.style.display = 'none';
+            } catch (err) {
+                showToast(err.message, true);
+            }
+        }
+    });
+
     form.addEventListener('submit', async function(e) {
         e.preventDefault();
-        const startUrl = startUrlInput.value.trim();
+        let startUrl = startUrlInput.value.trim();
         if (!startUrl) { showToast('Enter a start URL', true); return; }
         if (!startUrl.startsWith('http')) startUrl = 'https://' + startUrl;
         const maxPages = parseInt(maxPagesInput.value) || 0;
         const maxDepth = parseInt(maxDepthInput.value) || 3;
+        const threads = parseInt(threadsInput.value) || 20;
 
         try {
             const resp = await fetch('/crawler/start', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                body: `start_url=${encodeURIComponent(startUrl)}&max_pages=${maxPages}&max_depth=${maxDepth}`
+                body: `start_url=${encodeURIComponent(startUrl)}&max_pages=${maxPages}&max_depth=${maxDepth}&threads=${threads}`
             });
             const data = await resp.json();
             if (data.error) throw new Error(data.error);
@@ -108,16 +112,14 @@
             statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Crawling started...';
             urlListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
             domainListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
-            ipListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
             pagesVisitedSpan.textContent = '0';
             urlCountSpan.textContent = '0';
             domainCountSpan.textContent = '0';
-            ipCountSpan.textContent = '0';
             currentUrlSpan.textContent = '-';
             copyDomainsBtn.style.display = 'none';
             downloadDomainsBtn.style.display = 'none';
-            downloadIpsBtn.style.display = 'none';
             downloadUrlsBtn.style.display = 'none';
+            cancelBtn.style.display = 'inline-flex';
             if (pollInterval) clearInterval(pollInterval);
             pollInterval = setInterval(pollCrawler, 2000);
         } catch (err) {
@@ -133,6 +135,7 @@
             if (data.error) {
                 clearInterval(pollInterval);
                 statusDiv.innerHTML = `<span style="color:#ff8a8a;">Error: ${data.error}</span>`;
+                cancelBtn.style.display = 'none';
                 return;
             }
             const progress = data.progress || 0;
@@ -140,14 +143,12 @@
             const totalPages = data.total_pages || 0;
             const urls = data.discovered_urls || [];
             const domains = data.domains || [];
-            const ips = data.ips || [];
             const currentUrl = data.current_url || '-';
 
             currentUrlSpan.textContent = currentUrl;
             pagesVisitedSpan.textContent = totalPages;
             urlCountSpan.textContent = urls.length;
             domainCountSpan.textContent = domains.length;
-            ipCountSpan.textContent = ips.length;
 
             if (urls.length > 0) {
                 let html = '';
@@ -167,25 +168,15 @@
                 });
                 domainListDiv.innerHTML = html;
             } else {
-                domainListDiv.innerHTML = '<div class="empty-state">No domains yet.</div>';
-            }
-
-            if (ips.length > 0) {
-                let html = '';
-                ips.forEach(ip => {
-                    html += `<div style="font-size:0.8rem; padding:2px 0; border-bottom:1px solid #2a3248;">${escapeHtml(ip)}</div>`;
-                });
-                ipListDiv.innerHTML = html;
-            } else {
-                ipListDiv.innerHTML = '<div class="empty-state">No IPs yet.</div>';
+                domainListDiv.innerHTML = '<div class="empty-state">No domains/IPs yet.</div>';
             }
 
             if (status === 'done') {
                 clearInterval(pollInterval);
-                statusDiv.innerHTML = `✅ Crawling completed. Found ${urls.length} URLs, ${domains.length} domains, ${ips.length} IPs.`;
+                statusDiv.innerHTML = `✅ Crawling completed. Found ${urls.length} unique URLs and ${domains.length} domains/IPs.`;
+                cancelBtn.style.display = 'none';
                 copyDomainsBtn.style.display = 'inline-flex';
                 downloadDomainsBtn.style.display = 'inline-flex';
-                downloadIpsBtn.style.display = 'inline-flex';
                 downloadUrlsBtn.style.display = 'inline-flex';
                 downloadUrlsBtn.onclick = () => {
                     window.open(`/crawler/download_urls/${currentTaskId}`, '_blank');
@@ -193,13 +184,10 @@
                 downloadDomainsBtn.onclick = () => {
                     window.open(`/crawler/download_domains/${currentTaskId}`, '_blank');
                 };
-                downloadIpsBtn.onclick = () => {
-                    window.open(`/crawler/download_ips/${currentTaskId}`, '_blank');
-                };
                 copyDomainsBtn.onclick = () => {
                     const text = domains.join('\n');
                     navigator.clipboard.writeText(text).then(() => {
-                        showToast(`Copied ${domains.length} domains`);
+                        showToast(`Copied ${domains.length} domains/IPs`);
                     }).catch(() => {
                         const textarea = document.createElement('textarea');
                         textarea.value = text;
@@ -207,14 +195,19 @@
                         textarea.select();
                         document.execCommand('copy');
                         document.body.removeChild(textarea);
-                        showToast('Domains copied (fallback)');
+                        showToast('Domains/IPs copied (fallback)');
                     });
                 };
             } else if (status === 'error') {
                 clearInterval(pollInterval);
                 statusDiv.innerHTML = `<span style="color:#ff8a8a;">❌ Error: ${data.error_msg}</span>`;
+                cancelBtn.style.display = 'none';
+            } else if (status === 'cancelled') {
+                clearInterval(pollInterval);
+                statusDiv.innerHTML = '⛔ Crawl cancelled.';
+                cancelBtn.style.display = 'none';
             } else {
-                statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Crawling... (${progress}%, ${totalPages} pages visited)`;
+                statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Crawling... (${progress}%)`;
             }
         } catch (err) {
             console.error(err);
