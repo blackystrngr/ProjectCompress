@@ -1,6 +1,6 @@
 <div class="card">
-    <h2><i class="fas fa-globe"></i> Domain Crawler – Extract All URLs</h2>
-    <p>Recursively crawl a domain and collect every internal URL.</p>
+    <h2><i class="fas fa-globe"></i> Domain Crawler</h2>
+    <p>Recursively crawl a domain and extract all internal URLs and all external domains found in HTML, CSS, and JS.</p>
     <form id="crawlerForm">
         <div class="input-group">
             <input type="text" id="startUrl" placeholder="https://sltmobitel.lk" required>
@@ -17,36 +17,37 @@
             <span><strong>Domain:</strong> <span id="targetDomain">-</span></span>
             <span><strong>Current URL:</strong> <span id="currentUrl" style="color:#80b3ff; max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">-</span></span>
             <span><strong>Pages crawled:</strong> <span id="pagesVisited">0</span></span>
-            <span><strong>Unique URLs found:</strong> <span id="urlCount">0</span></span>
-            <span><strong>Unique domains:</strong> <span id="domainCount">0</span></span>
+            <span><strong>Internal URLs:</strong> <span id="urlCount">0</span></span>
+            <span><strong>External domains:</strong> <span id="domainCount">0</span></span>
         </div>
 
         <!-- Action buttons -->
         <div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-bottom:1rem;">
             <button id="copyUrlsBtn" class="primary" style="display:none;"><i class="fas fa-copy"></i> Copy All URLs</button>
+            <button id="copyDomainsBtn" class="primary" style="display:none;"><i class="fas fa-copy"></i> Copy All Domains</button>
             <button id="downloadUrlsBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download URLs</button>
             <button id="downloadDomainsBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download Domains</button>
             <button id="showFilesBtn" class="primary"><i class="fas fa-folder-open"></i> Show Saved Files</button>
         </div>
 
-        <!-- URL list -->
-        <div style="margin-bottom:1rem;">
-            <h4>All Discovered URLs</h4>
-            <div id="urlList" style="max-height:500px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem; font-family:monospace; font-size:0.8rem; white-space:pre-wrap; word-break:break-all;">
-                <div class="empty-state">No URLs yet.</div>
+        <!-- Two‑column layout -->
+        <div style="display:flex; gap:2rem; flex-wrap:wrap;">
+            <div style="flex:1; min-width:300px;">
+                <h4>Internal URLs</h4>
+                <div id="urlList" style="max-height:500px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem; font-family:monospace; font-size:0.8rem; white-space:pre-wrap; word-break:break-all;">
+                    <div class="empty-state">No URLs yet.</div>
+                </div>
             </div>
-        </div>
-
-        <!-- Domains list -->
-        <div style="margin-bottom:1rem;">
-            <h4>Unique Domains Found</h4>
-            <div id="domainList" style="max-height:200px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem; font-family:monospace; font-size:0.8rem;">
-                <div class="empty-state">No domains yet.</div>
+            <div style="flex:1; min-width:200px;">
+                <h4>External Domains (from CSS, JS, etc.)</h4>
+                <div id="domainList" style="max-height:500px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem; font-family:monospace; font-size:0.8rem; white-space:pre-wrap;">
+                    <div class="empty-state">No domains yet.</div>
+                </div>
             </div>
         </div>
 
         <!-- Saved files section -->
-        <div id="savedFilesSection" style="display:none;">
+        <div id="savedFilesSection" style="display:none; margin-top:1rem;">
             <h4>Saved Files</h4>
             <div id="savedFilesList" style="max-height:200px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem;">
                 <div class="empty-state">No saved files.</div>
@@ -70,6 +71,7 @@
     const urlListDiv = document.getElementById('urlList');
     const domainListDiv = document.getElementById('domainList');
     const copyUrlsBtn = document.getElementById('copyUrlsBtn');
+    const copyDomainsBtn = document.getElementById('copyDomainsBtn');
     const downloadUrlsBtn = document.getElementById('downloadUrlsBtn');
     const downloadDomainsBtn = document.getElementById('downloadDomainsBtn');
     const showFilesBtn = document.getElementById('showFilesBtn');
@@ -78,16 +80,6 @@
 
     let currentTaskId = null;
     let pollInterval = null;
-
-    // Extract domain from URL
-    function getDomain(url) {
-        try {
-            const parsed = new URL(url);
-            return parsed.hostname;
-        } catch(e) {
-            return url;
-        }
-    }
 
     form.addEventListener('submit', async function(e) {
         e.preventDefault();
@@ -115,6 +107,7 @@
             currentUrlSpan.textContent = '-';
             targetDomainSpan.textContent = '-';
             copyUrlsBtn.style.display = 'none';
+            copyDomainsBtn.style.display = 'none';
             downloadUrlsBtn.style.display = 'none';
             downloadDomainsBtn.style.display = 'none';
             if (pollInterval) clearInterval(pollInterval);
@@ -138,6 +131,7 @@
             const progress = data.progress || 0;
             const totalPages = data.total_pages || 0;
             const urls = data.internal_urls || [];
+            const domains = data.domains || [];
             const currentUrl = data.current_url || '-';
             const domain = data.target_domain || '-';
 
@@ -145,24 +139,12 @@
             currentUrlSpan.textContent = currentUrl;
             pagesVisitedSpan.textContent = totalPages;
             urlCountSpan.textContent = urls.length;
-
-            // Extract unique domains
-            const domainsSet = new Set();
-            urls.forEach(u => {
-                try {
-                    const d = new URL(u).hostname;
-                    if (d) domainsSet.add(d);
-                } catch(e) {}
-            });
-            const domains = Array.from(domainsSet).sort();
             domainCountSpan.textContent = domains.length;
 
             // Update URL list
             if (urls.length > 0) {
                 let html = '';
-                // Show all URLs (limit to 2000 for performance, but show count)
-                const displayUrls = urls.slice(0, 2000);
-                displayUrls.forEach(u => {
+                urls.slice(0, 2000).forEach(u => {
                     html += escapeHtml(u) + '\n';
                 });
                 if (urls.length > 2000) {
@@ -182,15 +164,16 @@
 
             if (status === 'done') {
                 clearInterval(pollInterval);
-                statusDiv.innerHTML = `✅ Crawling completed. Found ${urls.length} URLs across ${domains.length} domains.`;
+                statusDiv.innerHTML = `✅ Crawling completed. Found ${urls.length} URLs and ${domains.length} external domains.`;
                 copyUrlsBtn.style.display = 'inline-flex';
+                copyDomainsBtn.style.display = 'inline-flex';
                 downloadUrlsBtn.style.display = 'inline-flex';
                 downloadDomainsBtn.style.display = 'inline-flex';
                 // Copy URLs
                 copyUrlsBtn.onclick = () => {
                     const text = urls.join('\n');
                     navigator.clipboard.writeText(text).then(() => {
-                        showToast(`Copied ${urls.length} URLs to clipboard`);
+                        showToast(`Copied ${urls.length} URLs`);
                     }).catch(() => {
                         const textarea = document.createElement('textarea');
                         textarea.value = text;
@@ -199,6 +182,21 @@
                         document.execCommand('copy');
                         document.body.removeChild(textarea);
                         showToast('URLs copied (fallback)');
+                    });
+                };
+                // Copy Domains
+                copyDomainsBtn.onclick = () => {
+                    const text = domains.join('\n');
+                    navigator.clipboard.writeText(text).then(() => {
+                        showToast(`Copied ${domains.length} domains`);
+                    }).catch(() => {
+                        const textarea = document.createElement('textarea');
+                        textarea.value = text;
+                        document.body.appendChild(textarea);
+                        textarea.select();
+                        document.execCommand('copy');
+                        document.body.removeChild(textarea);
+                        showToast('Domains copied (fallback)');
                     });
                 };
                 downloadUrlsBtn.onclick = () => {
