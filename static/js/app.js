@@ -17,24 +17,11 @@ function escapeHtml(str) {
     });
 }
 
-// Helper: format bytes to human-readable
-function formatBytes(bytes) {
-    if (bytes === 0) return '0 B';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(1024));
-    const val = (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0);
-    return val + ' ' + units[i];
-}
-
-function formatSpeed(bytesPerSec) {
-    if (bytesPerSec === 0) return '0 B/s';
-    const units = ['B/s', 'KB/s', 'MB/s'];
-    const i = Math.floor(Math.log(bytesPerSec) / Math.log(1024));
-    const val = (bytesPerSec / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0);
-    return val + ' ' + units[i];
-}
-
 // ==================== Task Management ====================
+let pollInterval = null;
+let isPolling = false;
+const POLL_INTERVAL_MS = 5000; // 5 seconds (was 2000)
+
 async function fetchTasks() {
     const container = document.getElementById('tasksContainer');
     if (!container) return;
@@ -63,12 +50,11 @@ async function fetchTasks() {
 
         let html = '';
         activeTasks.forEach(task => {
-            let progress = task.download_progress || task.progress || 0;
+            let progress = task.download_progress || task.upload_progress || task.progress || 0;
             let statusText = task.status;
             let speed = task.download_speed || 0;
             let total = task.total_size || 0;
             let downloaded = task.downloaded_size || 0;
-            let elapsed = task.elapsed_time || 0;
 
             if (task.status === 'uploading') statusText = `📤 Uploading (${progress}%)`;
             else if (task.status === 'waiting_colab') statusText = `⏳ Waiting for Colab`;
@@ -121,6 +107,22 @@ async function fetchTasks() {
     }
 }
 
+function formatBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    const val = (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0);
+    return val + ' ' + units[i];
+}
+
+function formatSpeed(bytesPerSec) {
+    if (bytesPerSec === 0) return '0 B/s';
+    const units = ['B/s', 'KB/s', 'MB/s'];
+    const i = Math.floor(Math.log(bytesPerSec) / Math.log(1024));
+    const val = (bytesPerSec / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0);
+    return val + ' ' + units[i];
+}
+
 async function cancelTask(taskId) {
     if (!taskId) return showToast('No task ID', true);
     try {
@@ -160,11 +162,42 @@ function initTabs() {
     else if (tabBtns.length) switchTab(tabBtns[0].getAttribute('data-tab'));
 }
 
-// ==================== Start polling ====================
+// ==================== Start / Stop Polling with Visibility API ====================
+function startPolling() {
+    if (isPolling) return;
+    isPolling = true;
+    console.log('Task polling started (every 5s)');
+    fetchTasks(); // immediate first fetch
+    pollInterval = setInterval(fetchTasks, POLL_INTERVAL_MS);
+}
+
+function stopPolling() {
+    if (pollInterval) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+        isPolling = false;
+        console.log('Task polling stopped (tab hidden)');
+    }
+}
+
+// Handle page visibility: stop polling when tab is hidden, resume when visible
+function handleVisibilityChange() {
+    if (document.hidden) {
+        stopPolling();
+    } else {
+        startPolling();
+    }
+}
+
+// ==================== Initialization ====================
 document.addEventListener('DOMContentLoaded', () => {
     initTabs();
-    fetchTasks();
-    setInterval(fetchTasks, 2000);
+    // Start polling only if the tab is visible
+    if (!document.hidden) {
+        startPolling();
+    }
+    // Listen for visibility changes
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 });
 
 window.fetchTasks = fetchTasks;
