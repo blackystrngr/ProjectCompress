@@ -1,6 +1,6 @@
 <div class="card">
-    <h2><i class="fas fa-globe"></i> Domain Directory Crawler</h2>
-    <p>Extract all internal URLs and directory structure from a single domain (e.g., sltmobitel.lk).</p>
+    <h2><i class="fas fa-globe"></i> Domain Crawler – Extract All URLs</h2>
+    <p>Recursively crawl a domain and collect every internal URL.</p>
     <form id="crawlerForm">
         <div class="input-group">
             <input type="text" id="startUrl" placeholder="https://sltmobitel.lk" required>
@@ -12,34 +12,41 @@
     </form>
 
     <div id="crawlerResults">
-        <div style="display:flex; gap:1rem; flex-wrap:wrap; margin-bottom:1rem;">
+        <!-- Stats -->
+        <div style="display:flex; gap:1.5rem; flex-wrap:wrap; margin-bottom:1rem;">
             <span><strong>Domain:</strong> <span id="targetDomain">-</span></span>
-            <span><strong>Current:</strong> <span id="currentUrl" style="color:#80b3ff;">-</span></span>
-            <span><strong>Pages visited:</strong> <span id="pagesVisited">0</span></span>
-            <span><strong>Internal URLs:</strong> <span id="urlCount">0</span></span>
+            <span><strong>Current URL:</strong> <span id="currentUrl" style="color:#80b3ff; max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">-</span></span>
+            <span><strong>Pages crawled:</strong> <span id="pagesVisited">0</span></span>
+            <span><strong>Unique URLs found:</strong> <span id="urlCount">0</span></span>
+            <span><strong>Unique domains:</strong> <span id="domainCount">0</span></span>
         </div>
+
+        <!-- Action buttons -->
         <div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-bottom:1rem;">
+            <button id="copyUrlsBtn" class="primary" style="display:none;"><i class="fas fa-copy"></i> Copy All URLs</button>
             <button id="downloadUrlsBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download URLs</button>
-            <button id="downloadDirsBtn" class="primary" style="display:none;"><i class="fas fa-folder-tree"></i> Download Directories</button>
+            <button id="downloadDomainsBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download Domains</button>
             <button id="showFilesBtn" class="primary"><i class="fas fa-folder-open"></i> Show Saved Files</button>
         </div>
 
-        <div style="display:flex; gap:2rem; flex-wrap:wrap;">
-            <div style="flex:1; min-width:300px;">
-                <h4>Internal URLs</h4>
-                <div id="urlList" style="max-height:400px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem;">
-                    <div class="empty-state">No URLs yet.</div>
-                </div>
-            </div>
-            <div style="flex:1; min-width:250px;">
-                <h4>Directory Structure</h4>
-                <div id="dirList" style="max-height:400px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem; font-family:monospace; font-size:0.8rem;">
-                    <div class="empty-state">No directories yet.</div>
-                </div>
+        <!-- URL list -->
+        <div style="margin-bottom:1rem;">
+            <h4>All Discovered URLs</h4>
+            <div id="urlList" style="max-height:500px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem; font-family:monospace; font-size:0.8rem; white-space:pre-wrap; word-break:break-all;">
+                <div class="empty-state">No URLs yet.</div>
             </div>
         </div>
 
-        <div id="savedFilesSection" style="margin-top:1rem; display:none;">
+        <!-- Domains list -->
+        <div style="margin-bottom:1rem;">
+            <h4>Unique Domains Found</h4>
+            <div id="domainList" style="max-height:200px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem; font-family:monospace; font-size:0.8rem;">
+                <div class="empty-state">No domains yet.</div>
+            </div>
+        </div>
+
+        <!-- Saved files section -->
+        <div id="savedFilesSection" style="display:none;">
             <h4>Saved Files</h4>
             <div id="savedFilesList" style="max-height:200px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem;">
                 <div class="empty-state">No saved files.</div>
@@ -59,10 +66,12 @@
     const currentUrlSpan = document.getElementById('currentUrl');
     const pagesVisitedSpan = document.getElementById('pagesVisited');
     const urlCountSpan = document.getElementById('urlCount');
+    const domainCountSpan = document.getElementById('domainCount');
     const urlListDiv = document.getElementById('urlList');
-    const dirListDiv = document.getElementById('dirList');
+    const domainListDiv = document.getElementById('domainList');
+    const copyUrlsBtn = document.getElementById('copyUrlsBtn');
     const downloadUrlsBtn = document.getElementById('downloadUrlsBtn');
-    const downloadDirsBtn = document.getElementById('downloadDirsBtn');
+    const downloadDomainsBtn = document.getElementById('downloadDomainsBtn');
     const showFilesBtn = document.getElementById('showFilesBtn');
     const savedFilesSection = document.getElementById('savedFilesSection');
     const savedFilesList = document.getElementById('savedFilesList');
@@ -70,31 +79,14 @@
     let currentTaskId = null;
     let pollInterval = null;
 
-    // Helper: build directory tree display
-    function renderDirectoryTree(urls) {
-        const tree = {};
-        urls.forEach(url => {
+    // Extract domain from URL
+    function getDomain(url) {
+        try {
             const parsed = new URL(url);
-            const path = parsed.pathname || '/';
-            const parts = path.split('/').filter(p => p);
-            let current = tree;
-            parts.forEach(part => {
-                if (!current[part]) current[part] = {};
-                current = current[part];
-            });
-        });
-        function renderTree(obj, indent = 0) {
-            let html = '';
-            const keys = Object.keys(obj).sort();
-            keys.forEach(key => {
-                html += '  '.repeat(indent) + '📁 ' + escapeHtml(key) + '\n';
-                if (Object.keys(obj[key]).length) {
-                    html += renderTree(obj[key], indent + 1);
-                }
-            });
-            return html;
+            return parsed.hostname;
+        } catch(e) {
+            return url;
         }
-        return renderTree(tree);
     }
 
     form.addEventListener('submit', async function(e) {
@@ -116,13 +108,15 @@
             currentTaskId = data.task_id;
             statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Crawling started...';
             urlListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
-            dirListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
+            domainListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
             pagesVisitedSpan.textContent = '0';
             urlCountSpan.textContent = '0';
+            domainCountSpan.textContent = '0';
             currentUrlSpan.textContent = '-';
             targetDomainSpan.textContent = '-';
+            copyUrlsBtn.style.display = 'none';
             downloadUrlsBtn.style.display = 'none';
-            downloadDirsBtn.style.display = 'none';
+            downloadDomainsBtn.style.display = 'none';
             if (pollInterval) clearInterval(pollInterval);
             pollInterval = setInterval(pollCrawler, 1500);
         } catch (err) {
@@ -152,36 +146,66 @@
             pagesVisitedSpan.textContent = totalPages;
             urlCountSpan.textContent = urls.length;
 
-            // Update URL list (show first 200)
+            // Extract unique domains
+            const domainsSet = new Set();
+            urls.forEach(u => {
+                try {
+                    const d = new URL(u).hostname;
+                    if (d) domainsSet.add(d);
+                } catch(e) {}
+            });
+            const domains = Array.from(domainsSet).sort();
+            domainCountSpan.textContent = domains.length;
+
+            // Update URL list
             if (urls.length > 0) {
                 let html = '';
-                urls.slice(0, 200).forEach(u => {
-                    html += `<div style="font-size:0.8rem; padding:2px 0; border-bottom:1px solid #2a3248; word-break:break-all;">${escapeHtml(u)}</div>`;
+                // Show all URLs (limit to 2000 for performance, but show count)
+                const displayUrls = urls.slice(0, 2000);
+                displayUrls.forEach(u => {
+                    html += escapeHtml(u) + '\n';
                 });
-                if (urls.length > 200) html += `<div style="color:#aaa; font-size:0.8rem;">... and ${urls.length - 200} more</div>`;
-                urlListDiv.innerHTML = html;
+                if (urls.length > 2000) {
+                    html += `\n... and ${urls.length - 2000} more URLs not shown.`;
+                }
+                urlListDiv.innerHTML = `<pre style="margin:0; color:#eef2ff;">${html}</pre>`;
             } else {
                 urlListDiv.innerHTML = '<div class="empty-state">No URLs yet.</div>';
             }
 
-            // Update directory structure
-            if (urls.length > 0) {
-                const dirTree = renderDirectoryTree(urls);
-                dirListDiv.innerHTML = `<pre style="margin:0; color:#eef2ff; font-family:monospace; font-size:0.8rem;">${escapeHtml(dirTree)}</pre>`;
+            // Update domain list
+            if (domains.length > 0) {
+                domainListDiv.innerHTML = `<pre style="margin:0; color:#eef2ff;">${domains.join('\n')}</pre>`;
             } else {
-                dirListDiv.innerHTML = '<div class="empty-state">No directories yet.</div>';
+                domainListDiv.innerHTML = '<div class="empty-state">No domains yet.</div>';
             }
 
             if (status === 'done') {
                 clearInterval(pollInterval);
-                statusDiv.innerHTML = `✅ Crawling completed. Found ${urls.length} internal URLs.`;
+                statusDiv.innerHTML = `✅ Crawling completed. Found ${urls.length} URLs across ${domains.length} domains.`;
+                copyUrlsBtn.style.display = 'inline-flex';
                 downloadUrlsBtn.style.display = 'inline-flex';
-                downloadDirsBtn.style.display = 'inline-flex';
+                downloadDomainsBtn.style.display = 'inline-flex';
+                // Copy URLs
+                copyUrlsBtn.onclick = () => {
+                    const text = urls.join('\n');
+                    navigator.clipboard.writeText(text).then(() => {
+                        showToast(`Copied ${urls.length} URLs to clipboard`);
+                    }).catch(() => {
+                        const textarea = document.createElement('textarea');
+                        textarea.value = text;
+                        document.body.appendChild(textarea);
+                        textarea.select();
+                        document.execCommand('copy');
+                        document.body.removeChild(textarea);
+                        showToast('URLs copied (fallback)');
+                    });
+                };
                 downloadUrlsBtn.onclick = () => {
                     window.open(`/crawler/download_urls/${currentTaskId}`, '_blank');
                 };
-                downloadDirsBtn.onclick = () => {
-                    window.open(`/crawler/download_directories/${currentTaskId}`, '_blank');
+                downloadDomainsBtn.onclick = () => {
+                    window.open(`/crawler/download_domains/${currentTaskId}`, '_blank');
                 };
             } else if (status === 'error') {
                 clearInterval(pollInterval);
