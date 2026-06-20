@@ -15,11 +15,6 @@ logger = logging.getLogger(__name__)
 
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 
-# Asset extensions to skip
-SKIP_EXTENSIONS = ('.css', '.js', '.jpg', '.jpeg', '.png', '.gif', '.svg',
-                   '.ico', '.webp', '.woff', '.woff2', '.ttf', '.eot', '.pdf',
-                   '.mp4', '.webm', '.mp3', '.zip', '.tar', '.gz')
-
 def get_domain_from_url(url):
     try:
         parsed = urlparse(url)
@@ -39,20 +34,6 @@ def is_same_domain(url, target_domain):
         domain = domain[4:]
     return domain == target_domain
 
-def is_html_page(url):
-    """Return True if URL looks like an HTML page (not an asset)."""
-    if not url:
-        return False
-    # Skip known asset paths
-    if '/_nuxt/' in url or '/_ipx/' in url or '_Incapsula_Resource' in url:
-        return False
-    # Skip by extension
-    path = urlparse(url).path
-    if any(path.endswith(ext) for ext in SKIP_EXTENSIONS):
-        return False
-    # Keep URLs that look like pages
-    return True
-
 def normalize_url(url, base):
     try:
         return urljoin(base, url)
@@ -60,24 +41,20 @@ def normalize_url(url, base):
         return None
 
 def extract_urls_from_html(html, base_url):
-    """Extract all URLs from HTML: href, src, srcset, etc."""
     soup = BeautifulSoup(html, 'html.parser')
     urls = set()
-    # Tags with href
     for tag in soup.find_all(['a', 'link']):
         href = tag.get('href')
         if href:
             abs_url = normalize_url(href, base_url)
             if abs_url:
                 urls.add(abs_url)
-    # Tags with src
     for tag in soup.find_all(['script', 'img', 'iframe', 'source']):
         src = tag.get('src')
         if src:
             abs_url = normalize_url(src, base_url)
             if abs_url:
                 urls.add(abs_url)
-    # srcset (images)
     for tag in soup.find_all(['img', 'source']):
         srcset = tag.get('srcset')
         if srcset:
@@ -87,7 +64,6 @@ def extract_urls_from_html(html, base_url):
                     abs_url = normalize_url(part, base_url)
                     if abs_url:
                         urls.add(abs_url)
-    # data-* attributes with URLs
     for tag in soup.find_all():
         for attr in tag.attrs:
             if attr.startswith('data-') and 'src' in attr:
@@ -98,8 +74,32 @@ def extract_urls_from_html(html, base_url):
                         urls.add(abs_url)
     return urls
 
+def build_directory_tree(urls):
+    tree = {}
+    for url in urls:
+        parsed = urlparse(url)
+        path = parsed.path or '/'
+        if not path.startswith('/'):
+            path = '/' + path
+        parts = path.strip('/').split('/') if path != '/' else ['']
+        current = tree
+        for part in parts:
+            if part == '':
+                continue
+            if part not in current:
+                current[part] = {}
+            current = current[part]
+    return tree
+
+def render_tree(tree, indent=0):
+    lines = []
+    for key, value in sorted(tree.items()):
+        lines.append('  ' * indent + '📁 ' + key)
+        if value:
+            lines.extend(render_tree(value, indent + 1))
+    return lines
+
 def run_crawler(task_id, start_url, max_pages, max_depth):
-    """Crawler that ONLY follows HTML pages, not assets."""
     logger.info(f"Crawler {task_id} started: {start_url}")
 
     task = load_task(task_id)
@@ -109,7 +109,7 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
 
     target_domain = get_domain_from_url(start_url)
     visited = set()
-    internal_urls = set()
+    internal_urls = set()   # all internal URLs (including assets)
     domains = set()
     queue = [(start_url, 0)]
     visited.add(start_url)
@@ -164,8 +164,9 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
                     visited.add(extracted_url)
                     if is_same_domain(extracted_url, target_domain):
                         internal_urls.add(extracted_url)
-                        # ONLY follow if it's an HTML page
-                        if is_html_page(extracted_url) and depth + 1 <= max_depth:
+                        # Always queue even if it's an asset, but we'll still process it
+                        if depth + 1 <= max_depth:
+                            # But we only fetch HTML pages, so we check content-type later
                             queue.append((extracted_url, depth + 1))
                     dom = get_domain_from_url(extracted_url)
                     if dom:
@@ -198,12 +199,9 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
             task['current_url'] = None
             save_task(task_id, task)
 
-            # Build directory structure from internal URLs
-            dirs = set()
-            for u in internal_urls:
-                path = urlparse(u).path
-                if path:
-                    dirs.add(path)
+            # Build directory tree
+            tree = build_directory_tree(internal_urls)
+            tree_lines = render_tree(tree)
 
             # Save domain file
             domain_filename = f"{target_domain}_domains.txt"
@@ -215,12 +213,14 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
             with open(os.path.join(UPLOAD_FOLDER, urls_filename), 'w') as f:
                 f.write('\n'.join(sorted(internal_urls)))
 
-            # Save directory structure file
-            dirs_filename = f"{target_domain}_directories.txt"
-            with open(os.path.join(UPLOAD_FOLDER, dirs_filename), 'w') as f:
-                f.write('\n'.join(sorted(dirs)))
+            # Save directory tree file
+            tree_filename = f"{target_domain}_directories.txt"
+            with open(os.path.join(UPLOAD_FOLDER, tree_filename), 'w') as f:
+                f.write(f"Directory tree for {target_domain}\n")
+                f.write(f"Total files/URLs: {len(internal_urls)}\n\n")
+                f.write('\n'.join(tree_lines))
 
-            logger.info(f"Crawler {task_id} finished: {len(internal_urls)} URLs, {len(domains)} domains, {len(dirs)} directories")
+            logger.info(f"Crawler {task_id} finished: {len(internal_urls)} URLs, {len(domains)} domains")
 
     except Exception as e:
         logger.exception(f"Crawler {task_id} failed")
@@ -241,7 +241,7 @@ def register_routes(app):
             start_url = 'https://' + start_url
 
         max_pages = int(request.form.get('max_pages', 0))
-        max_depth = int(request.form.get('max_depth', 5))
+        max_depth = int(request.form.get('max_depth', 3))
 
         task_id = str(uuid.uuid4())
         task_data = {
@@ -322,18 +322,15 @@ def register_routes(app):
         urls = task.get('internal_urls', [])
         if not urls:
             return jsonify({'error': 'No URLs discovered'}), 404
-        dirs = set()
-        for u in urls:
-            path = urlparse(u).path
-            if path:
-                dirs.add(path)
-        if not dirs:
-            return jsonify({'error': 'No directories found'}), 404
+        tree = build_directory_tree(urls)
+        tree_lines = render_tree(tree)
         domain = task.get('target_domain', 'unknown')
         filename = f"{domain}_directories.txt"
         filepath = os.path.join(UPLOAD_FOLDER, filename)
         with open(filepath, 'w') as f:
-            f.write('\n'.join(sorted(dirs)))
+            f.write(f"Directory tree for {domain}\n")
+            f.write(f"Total files/URLs: {len(urls)}\n\n")
+            f.write('\n'.join(tree_lines))
         return send_file(filepath, as_attachment=True, download_name=filename)
 
     @app.route('/crawler/list_files')
