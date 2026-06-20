@@ -16,6 +16,33 @@ logger = logging.getLogger(__name__)
 
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 
+# ---- Constants ----
+DEFAULT_WORDLIST = [
+    'admin', 'backup', 'config', 'wp-admin', 'wp-content', 'wp-includes',
+    'uploads', 'images', 'css', 'js', 'assets', 'static', 'media',
+    'data', 'logs', 'tmp', 'temp', 'cache', 'sessions', 'cgi-bin',
+    'includes', 'lib', 'modules', 'plugins', 'themes', 'vendor',
+    'robots.txt', 'sitemap.xml', 'sitemap_index.xml', 'sitemap.xml.gz',
+    'humans.txt', 'crossdomain.xml', 'phpinfo.php', 'phpmyadmin',
+    'mysql', 'database', 'sql', 'dump', 'backup.sql', 'config.php',
+    'config.inc.php', 'settings.php', 'wp-config.php', '.env',
+    '.htaccess', '.htpasswd', 'server-status', 'server-info',
+    'phpinfo', 'test', 'example', 'demo', 'sample',
+    'index.php', 'index.html', 'default.php', 'default.html',
+    'home', 'main', 'public', 'private', 'restricted', 'secure',
+    'user', 'users', 'profile', 'account', 'login', 'register',
+    'contact', 'about', 'help', 'faq', 'support', 'terms', 'privacy',
+    'dashboard', 'control', 'panel', 'manage', 'adminer',
+]
+
+DEFAULT_EXTENSIONS = [
+    '.php', '.html', '.txt', '.log', '.bak', '.old', '.zip', '.tar.gz',
+    '.sql', '.env', '.ini', '.xml', '.json', '.yml', '.yaml', '.conf',
+    '.config', '.htaccess', '.htpasswd', '.inc', '.class', '.js', '.css',
+    '.jpg', '.png', '.gif', '.ico', '.svg', '.webp', '.woff', '.woff2',
+    '.ttf', '.eot'
+]
+
 # ---- Domain extraction helpers ----
 def extract_domain_from_url(url):
     try:
@@ -30,29 +57,15 @@ def extract_domain_from_url(url):
     return None
 
 def extract_domains_from_text(text, base_domain=None):
-    """Extract all domain names from a text (HTML, CSS, JS, etc.)."""
-    # Find all URLs in text using regex
     url_pattern = re.compile(r'(https?://[^\s<>"\']+)', re.IGNORECASE)
     domains = set()
     for match in url_pattern.finditer(text):
         url = match.group(1)
         domain = extract_domain_from_url(url)
-        if domain:
-            if base_domain and domain == base_domain:
-                continue  # skip the target domain itself
+        if domain and domain != base_domain:
             domains.add(domain)
-    # Also look for domain-like strings in CSS (e.g., @import url(...))
-    # Already covered by the regex.
     return domains
 
-def extract_domains_from_css(css_text, base_domain=None):
-    # Use the same generic function – it catches url(...)
-    return extract_domains_from_text(css_text, base_domain)
-
-def extract_domains_from_js(js_text, base_domain=None):
-    return extract_domains_from_text(js_text, base_domain)
-
-# ---- Crawling helpers ----
 def normalize_url(url, base):
     try:
         return urljoin(base, url)
@@ -64,7 +77,6 @@ def is_same_domain(url, target_domain):
     return domain == target_domain
 
 def fetch_and_extract_domains(url, session, base_domain, visited_files, queue_for_fetch):
-    """Fetch a URL, extract domains from its content, and discover linked assets."""
     if url in visited_files:
         return set()
     visited_files.add(url)
@@ -76,26 +88,21 @@ def fetch_and_extract_domains(url, session, base_domain, visited_files, queue_fo
         text = resp.text
         domains = set()
         if 'text/html' in content_type:
-            # Parse HTML for links and assets
             soup = BeautifulSoup(text, 'html.parser')
             for tag in soup.find_all(['a', 'link', 'script', 'img', 'iframe', 'source']):
                 src = tag.get('href') or tag.get('src')
                 if src:
                     abs_url = normalize_url(src, url)
                     if abs_url:
-                        domains.update(extract_domains_from_url(abs_url))
-                        # Queue this asset for fetching if it's CSS/JS/font/image
+                        domains.update(extract_domain_from_url(abs_url))
                         if is_same_domain(abs_url, base_domain) and abs_url not in visited_files:
                             queue_for_fetch.append(abs_url)
-            # Also extract domains from HTML text (e.g., inline JS)
             domains.update(extract_domains_from_text(text, base_domain))
         elif 'text/css' in content_type:
-            domains.update(extract_domains_from_css(text, base_domain))
+            domains.update(extract_domains_from_text(text, base_domain))
         elif 'application/javascript' in content_type or 'text/javascript' in content_type:
-            domains.update(extract_domains_from_js(text, base_domain))
-        # Images, fonts, etc. – we don't parse, but we already get domains from their URLs
-        # Also extract from the URL itself
-        domains.update(extract_domains_from_url(url))
+            domains.update(extract_domains_from_text(text, base_domain))
+        domains.update(extract_domain_from_url(url))
         return domains
     except Exception as e:
         logger.warning(f"Failed to fetch {url}: {e}")
@@ -123,8 +130,8 @@ def run_domain_crawler(task_id, start_url, max_pages, max_depth, enable_brutefor
     visited_files.add(start_url)
     pages_visited = 0
     current_url = start_url
-    asset_queue = []   # for CSS/JS/images discovered
-    bf_discovered_paths = []  # for bruteforce results
+    asset_queue = []
+    bf_discovered_paths = []
 
     task['status'] = 'crawling'
     task['progress'] = 0
@@ -158,14 +165,11 @@ def run_domain_crawler(task_id, start_url, max_pages, max_depth, enable_brutefor
                 task['current_url'] = current_url
                 save_task(task_id, task)
 
-            # Fetch HTML and extract domains, also collect asset URLs
             new_domains = fetch_and_extract_domains(url, session, target_domain, visited_files, asset_queue)
             all_domains.update(new_domains)
             pages_visited += 1
 
-            # Add new HTML pages to queue (if same domain)
-            # For this we also need to extract links from the HTML, but fetch_and_extract_domains already queues assets.
-            # We need to separately extract HTML links for further crawling.
+            # Extract links for further crawling
             try:
                 resp = session.get(url, timeout=20)
                 if resp.status_code == 200 and 'text/html' in resp.headers.get('content-type', ''):
@@ -195,9 +199,9 @@ def run_domain_crawler(task_id, start_url, max_pages, max_depth, enable_brutefor
                 logger.info(f"Task {task_id} cancelled")
                 break
 
-        # Phase 1 done – now fetch all discovered assets (CSS, JS, etc.)
+        # Phase 1 done – now fetch all discovered assets
         asset_count = 0
-        while asset_queue and asset_count < 5000:  # limit to avoid infinite loops
+        while asset_queue and asset_count < 5000:
             asset_url = asset_queue.pop(0)
             if asset_url in visited_files:
                 continue
@@ -255,8 +259,6 @@ def run_domain_crawler(task_id, start_url, max_pages, max_depth, enable_brutefor
                     bf_checked += 1
                     if url:
                         bf_discovered.append({'url': url, 'status': status})
-                        # Also fetch this file if it's CSS/JS to extract more domains
-                        # We'll handle this later.
                     if bf_checked % 50 == 0:
                         task = load_task(task_id)
                         if task:
@@ -271,7 +273,6 @@ def run_domain_crawler(task_id, start_url, max_pages, max_depth, enable_brutefor
             for item in bf_discovered:
                 url = item['url']
                 if url not in visited_files:
-                    # Check if it's likely CSS or JS by extension
                     if any(url.endswith(ext) for ext in ['.css', '.js', '.json', '.xml', '.txt']):
                         new_domains = fetch_and_extract_domains(url, session, target_domain, visited_files, [])
                         all_domains.update(new_domains)
