@@ -6,7 +6,7 @@ import time
 import logging
 import requests
 from urllib.parse import urljoin, urlparse
-from flask import request, jsonify, send_file, send_from_directory
+from flask import request, jsonify, send_file
 from bs4 import BeautifulSoup
 from tasks import save_task, load_task
 from config import UPLOAD_FOLDER
@@ -14,8 +14,6 @@ from config import UPLOAD_FOLDER
 logger = logging.getLogger(__name__)
 
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-CRAWLER_SAVE_DIR = os.path.join(UPLOAD_FOLDER, 'crawler_data')
-os.makedirs(CRAWLER_SAVE_DIR, exist_ok=True)
 
 def is_valid_url(url):
     parsed = urlparse(url)
@@ -42,8 +40,13 @@ def extract_domain(url):
     parsed = urlparse(url)
     return parsed.netloc
 
-def get_domain_from_url(url):
-    return extract_domain(url).replace('.', '_')
+def get_website_name_from_url(url):
+    parsed = urlparse(url)
+    domain = parsed.netloc
+    # Remove www.
+    if domain.startswith('www.'):
+        domain = domain[4:]
+    return domain
 
 def run_crawler(task_id, start_url, max_pages, max_depth):
     logger.info(f"Crawler task {task_id} started: {start_url}")
@@ -63,7 +66,6 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
     pages_visited = 0
     current_url = start_url
 
-    # Update task
     task['status'] = 'running'
     task['progress'] = 0
     task['total_pages'] = 0
@@ -81,10 +83,11 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
     try:
         while queue and pages_visited < max_pages:
             url, depth = queue.pop(0)
+            current_url = url
             if depth > max_depth:
                 continue
-            current_url = url
-            # Update current_url in task
+
+            # Update current_url
             task = load_task(task_id)
             if task:
                 task['current_url'] = current_url
@@ -124,13 +127,12 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
                 task['current_url'] = current_url
                 save_task(task_id, task)
 
-            # Check cancellation
             task = load_task(task_id)
             if task and task.get('cancelled', False):
                 logger.info(f"Crawler {task_id} cancelled")
                 break
 
-        # Done
+        # Done – save domain file
         task = load_task(task_id)
         if task:
             task['status'] = 'done'
@@ -138,28 +140,24 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
             task['total_pages'] = pages_visited
             task['discovered_urls'] = list(discovered_urls)
             task['domains'] = list(domains)
-            task['current_url'] = current_url
+            task['current_url'] = None
             save_task(task_id, task)
 
-            # Save files to crawler_data
-            base_name = get_domain_from_url(start_url)
-            urls_file = os.path.join(CRAWLER_SAVE_DIR, f"{base_name}_urls.txt")
-            domains_file = os.path.join(CRAWLER_SAVE_DIR, f"{base_name}_domains.txt")
-            try:
-                with open(urls_file, 'w') as f:
-                    f.write('\n'.join(discovered_urls))
-                with open(domains_file, 'w') as f:
-                    f.write('\n'.join(domains))
-                # Store file names in task for later retrieval
-                task['urls_file'] = os.path.basename(urls_file)
-                task['domains_file'] = os.path.basename(domains_file)
-                save_task(task_id, task)
-                logger.info(f"Crawler {task_id} saved files: {urls_file}, {domains_file}")
-            except Exception as e:
-                logger.error(f"Failed to save files for {task_id}: {e}")
-                task['status'] = 'error'
-                task['error_msg'] = f"File save error: {str(e)}"
-                save_task(task_id, task)
+            # Save domains file with website name
+            website_name = get_website_name_from_url(start_url)
+            domain_filename = f"{website_name}_domains.txt"
+            domain_filepath = os.path.join(UPLOAD_FOLDER, domain_filename)
+            with open(domain_filepath, 'w') as f:
+                f.write('\n'.join(sorted(domains)))
+            logger.info(f"Domains saved to {domain_filename}")
+
+            # Also save full URLs file (already does via download endpoint)
+            urls_filename = f"crawled_urls_{task_id[:8]}.txt"
+            urls_filepath = os.path.join(UPLOAD_FOLDER, urls_filename)
+            with open(urls_filepath, 'w') as f:
+                f.write('\n'.join(sorted(discovered_urls)))
+
+            logger.info(f"Crawler {task_id} finished: {len(discovered_urls)} URLs, {len(domains)} domains")
 
     except Exception as e:
         logger.exception(f"Crawler {task_id} failed")
@@ -167,6 +165,7 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
         if task:
             task['status'] = 'error'
             task['error_msg'] = str(e)
+            task['current_url'] = None
             save_task(task_id, task)
 
 def register_routes(app):
@@ -194,9 +193,9 @@ def register_routes(app):
             'max_pages': max_pages,
             'max_depth': max_depth,
             'total_pages': 0,
-            'current_url': '',
             'discovered_urls': [],
             'domains': [],
+            'current_url': None,
             'error_msg': None,
         }
         save_task(task_id, task_data)
@@ -215,44 +214,53 @@ def register_routes(app):
             'total_pages': task.get('total_pages', 0),
             'max_pages': task.get('max_pages', 0),
             'max_depth': task.get('max_depth', 0),
-            'current_url': task.get('current_url', ''),
             'discovered_urls': task.get('discovered_urls', []),
             'domains': task.get('domains', []),
+            'current_url': task.get('current_url'),
             'error_msg': task.get('error_msg'),
         })
 
-    @app.route('/crawler/download/<task_id>/<file_type>')
-    def crawler_download(task_id, file_type):
+    @app.route('/crawler/download_urls/<task_id>')
+    def crawler_download_urls(task_id):
         task = load_task(task_id)
         if not task:
             return jsonify({'error': 'Task not found'}), 404
-        if file_type == 'urls':
-            file_key = 'urls_file'
-        elif file_type == 'domains':
-            file_key = 'domains_file'
-        else:
-            return jsonify({'error': 'Invalid file type'}), 400
-        filename = task.get(file_key)
-        if not filename:
-            return jsonify({'error': 'File not available'}), 404
-        filepath = os.path.join(CRAWLER_SAVE_DIR, filename)
+        urls = task.get('discovered_urls', [])
+        if not urls:
+            return jsonify({'error': 'No URLs discovered'}), 404
+        filename = f"crawled_urls_{task_id[:8]}.txt"
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        # The file is already saved in run_crawler, but we can also create on demand
         if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found'}), 404
+            with open(filepath, 'w') as f:
+                f.write('\n'.join(urls))
         return send_file(filepath, as_attachment=True, download_name=filename)
 
-    @app.route('/crawler/list_files')
-    def crawler_list_files():
-        files = []
-        for f in os.listdir(CRAWLER_SAVE_DIR):
-            if f.endswith('_urls.txt') or f.endswith('_domains.txt'):
-                files.append({'name': f, 'type': 'domains' if '_domains' in f else 'urls'})
-        return jsonify(files)
-
-    @app.route('/crawler/view_file/<filename>')
-    def crawler_view_file(filename):
-        filepath = os.path.join(CRAWLER_SAVE_DIR, filename)
+    @app.route('/crawler/download_domains/<task_id>')
+    def crawler_download_domains(task_id):
+        task = load_task(task_id)
+        if not task:
+            return jsonify({'error': 'Task not found'}), 404
+        domains = task.get('domains', [])
+        if not domains:
+            return jsonify({'error': 'No domains discovered'}), 404
+        website_name = get_website_name_from_url(task.get('start_url'))
+        filename = f"{website_name}_domains.txt"
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        # Ensure the file exists (it should have been saved in run_crawler)
         if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found'}), 404
-        with open(filepath, 'r') as f:
-            content = f.read()
-        return jsonify({'content': content, 'filename': filename})
+            with open(filepath, 'w') as f:
+                f.write('\n'.join(sorted(domains)))
+        return send_file(filepath, as_attachment=True, download_name=filename)
+
+    @app.route('/crawler/list_domain_files')
+    def crawler_list_domain_files():
+        files = []
+        for f in os.listdir(UPLOAD_FOLDER):
+            if f.endswith('_domains.txt'):
+                files.append({
+                    'name': f,
+                    'path': f,
+                    'size': os.path.getsize(os.path.join(UPLOAD_FOLDER, f))
+                })
+        return jsonify(files)
