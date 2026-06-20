@@ -1,13 +1,21 @@
 <div class="card">
-    <h2><i class="fas fa-globe"></i> Domain Crawler – Full URL & Directory Extraction</h2>
-    <p>Crawl a domain, discover every internal URL (pages, CSS, JS, images, fonts) and build a directory tree.</p>
+    <h2><i class="fas fa-globe"></i> Domain Extractor (Crawl + Bruteforce)</h2>
+    <p>Discover every domain referenced in a website's HTML, CSS, JS, and other files.</p>
     <form id="crawlerForm">
         <div class="input-group">
             <input type="text" id="startUrl" placeholder="https://sltmobitel.lk" required>
-            <input type="number" id="maxPages" placeholder="Max pages (0 = unlimited)" value="0" min="0" max="10000" style="width:150px;">
-            <input type="number" id="maxDepth" placeholder="Max depth" value="5" min="1" max="10" style="width:120px;">
-            <button type="submit" class="primary"><i class="fas fa-play"></i> Start Crawl</button>
+            <input type="number" id="maxPages" placeholder="Max pages (0 = unlimited)" value="0" min="0" style="width:140px;">
+            <input type="number" id="maxDepth" placeholder="Max depth" value="3" min="1" max="10" style="width:120px;">
+            <label style="display:flex; align-items:center; gap:0.5rem;">
+                <input type="checkbox" id="enableBruteforce"> <span style="font-size:0.8rem;">Bruteforce</span>
+            </label>
+            <button type="submit" class="primary"><i class="fas fa-play"></i> Start</button>
             <button type="button" id="cancelBtn" class="danger" style="display:none;"><i class="fas fa-stop"></i> Cancel</button>
+        </div>
+        <div id="bfOptions" style="display:none; margin-top:0.5rem; flex-wrap:wrap; gap:0.5rem; align-items:center;">
+            <input type="text" id="wordlist" placeholder="Custom wordlist (comma separated)" style="flex:2; min-width:200px;">
+            <input type="text" id="extensions" placeholder="Extensions" value=".php,.html,.txt,.log,.bak,.old,.zip,.tar.gz,.sql,.env,.ini,.xml,.json,.yml,.yaml,.conf,.config,.htaccess,.htpasswd,.inc,.class,.js,.css,.jpg,.png,.gif,.ico,.svg,.webp,.woff,.woff2,.ttf,.eot" style="flex:2; min-width:200px;">
+            <input type="number" id="threads" placeholder="Threads" value="20" style="width:80px;">
         </div>
         <div id="crawlerStatus" class="help-text"></div>
     </form>
@@ -15,42 +23,39 @@
     <div id="crawlerResults">
         <!-- Stats -->
         <div style="display:flex; gap:1.5rem; flex-wrap:wrap; margin-bottom:1rem;">
-            <span><strong>Domain:</strong> <span id="targetDomain">-</span></span>
+            <span><strong>Target:</strong> <span id="targetDomain">-</span></span>
             <span><strong>Current URL:</strong> <span id="currentUrl" style="color:#80b3ff; max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">-</span></span>
             <span><strong>Pages crawled:</strong> <span id="pagesVisited">0</span></span>
-            <span><strong>Unique URLs found:</strong> <span id="urlCount">0</span></span>
-            <span><strong>Unique domains:</strong> <span id="domainCount">0</span></span>
+            <span><strong>Domains found:</strong> <span id="domainCount">0</span></span>
+            <span><strong>Bruteforce:</strong> <span id="bfStatus">disabled</span></span>
         </div>
 
         <!-- Action buttons -->
         <div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-bottom:1rem;">
-            <button id="copyUrlsBtn" class="primary" style="display:none;"><i class="fas fa-copy"></i> Copy URLs</button>
             <button id="copyDomainsBtn" class="primary" style="display:none;"><i class="fas fa-copy"></i> Copy Domains</button>
-            <button id="downloadUrlsBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download URLs</button>
             <button id="downloadDomainsBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download Domains</button>
-            <button id="downloadTreeBtn" class="primary" style="display:none;"><i class="fas fa-sitemap"></i> Download Directory Tree</button>
             <button id="showFilesBtn" class="primary"><i class="fas fa-folder-open"></i> Show Saved Files</button>
         </div>
 
-        <!-- Side‑by‑side lists -->
-        <div style="display:flex; gap:2rem; flex-wrap:wrap;">
-            <div style="flex:1; min-width:300px;">
-                <h4>All Discovered URLs</h4>
-                <div id="urlList" style="max-height:500px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem; font-family:monospace; font-size:0.8rem; white-space:pre-wrap; word-break:break-all;">
-                    <div class="empty-state">No URLs yet.</div>
-                </div>
+        <!-- Domain list -->
+        <div style="margin-bottom:1rem;">
+            <h4>Discovered Domains</h4>
+            <div id="domainList" style="max-height:500px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem; font-family:monospace; font-size:0.9rem; white-space:pre-wrap; word-break:break-all;">
+                <div class="empty-state">No domains yet.</div>
             </div>
-            <div style="flex:1; min-width:200px;">
-                <h4>Unique Domains Found</h4>
-                <div id="domainList" style="max-height:500px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem; font-family:monospace; font-size:0.8rem;">
-                    <div class="empty-state">No domains yet.</div>
-                </div>
+        </div>
+
+        <!-- Bruteforce results (optional) -->
+        <div id="bfSection" style="margin-bottom:1rem; display:none;">
+            <h4>Bruteforce Discovered Paths</h4>
+            <div id="bfList" style="max-height:200px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem; font-family:monospace; font-size:0.8rem; white-space:pre-wrap; word-break:break-all;">
+                <div class="empty-state">No bruteforce results yet.</div>
             </div>
         </div>
 
         <!-- Saved files section -->
         <div id="savedFilesSection" style="display:none; margin-top:1rem;">
-            <h4>Saved Files</h4>
+            <h4>Saved Domain Files</h4>
             <div id="savedFilesList" style="max-height:200px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem;">
                 <div class="empty-state">No saved files.</div>
             </div>
@@ -64,20 +69,23 @@
     const startUrlInput = document.getElementById('startUrl');
     const maxPagesInput = document.getElementById('maxPages');
     const maxDepthInput = document.getElementById('maxDepth');
+    const enableBfCheck = document.getElementById('enableBruteforce');
+    const bfOptions = document.getElementById('bfOptions');
+    const wordlistInput = document.getElementById('wordlist');
+    const extensionsInput = document.getElementById('extensions');
+    const threadsInput = document.getElementById('threads');
     const cancelBtn = document.getElementById('cancelBtn');
     const statusDiv = document.getElementById('crawlerStatus');
     const targetDomainSpan = document.getElementById('targetDomain');
     const currentUrlSpan = document.getElementById('currentUrl');
     const pagesVisitedSpan = document.getElementById('pagesVisited');
-    const urlCountSpan = document.getElementById('urlCount');
     const domainCountSpan = document.getElementById('domainCount');
-    const urlListDiv = document.getElementById('urlList');
+    const bfStatusSpan = document.getElementById('bfStatus');
     const domainListDiv = document.getElementById('domainList');
-    const copyUrlsBtn = document.getElementById('copyUrlsBtn');
+    const bfListDiv = document.getElementById('bfList');
+    const bfSection = document.getElementById('bfSection');
     const copyDomainsBtn = document.getElementById('copyDomainsBtn');
-    const downloadUrlsBtn = document.getElementById('downloadUrlsBtn');
     const downloadDomainsBtn = document.getElementById('downloadDomainsBtn');
-    const downloadTreeBtn = document.getElementById('downloadTreeBtn');
     const showFilesBtn = document.getElementById('showFilesBtn');
     const savedFilesSection = document.getElementById('savedFilesSection');
     const savedFilesList = document.getElementById('savedFilesList');
@@ -85,13 +93,18 @@
     let currentTaskId = null;
     let pollInterval = null;
 
+    // Toggle bruteforce options
+    enableBfCheck.addEventListener('change', function() {
+        bfOptions.style.display = this.checked ? 'flex' : 'none';
+    });
+
     cancelBtn.addEventListener('click', async function() {
         if (currentTaskId) {
             try {
                 const resp = await fetch(`/cancel/${currentTaskId}`, { method: 'POST' });
                 const data = await resp.json();
                 if (data.error) throw new Error(data.error);
-                showToast('Cancelling crawl...');
+                showToast('Cancelling task...');
                 cancelBtn.style.display = 'none';
             } catch (err) {
                 showToast(err.message, true);
@@ -104,31 +117,33 @@
         let startUrl = startUrlInput.value.trim();
         if (!startUrl) { showToast('Enter a start URL', true); return; }
         if (!startUrl.startsWith('http')) startUrl = 'https://' + startUrl;
-        let maxPages = parseInt(maxPagesInput.value) || 0;
+        const maxPages = parseInt(maxPagesInput.value) || 0;
         const maxDepth = parseInt(maxDepthInput.value) || 3;
+        const enableBf = enableBfCheck.checked;
+        const wordlist = wordlistInput.value.trim() || '';
+        const extensions = extensionsInput.value.trim() || '.php,.html,.txt';
+        const threads = parseInt(threadsInput.value) || 20;
 
         try {
             const resp = await fetch('/crawler/start', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                body: `start_url=${encodeURIComponent(startUrl)}&max_pages=${maxPages}&max_depth=${maxDepth}`
+                body: `start_url=${encodeURIComponent(startUrl)}&max_pages=${maxPages}&max_depth=${maxDepth}&enable_bruteforce=${enableBf}&wordlist=${encodeURIComponent(wordlist)}&extensions=${encodeURIComponent(extensions)}&threads=${threads}`
             });
             const data = await resp.json();
             if (data.error) throw new Error(data.error);
             currentTaskId = data.task_id;
-            statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Crawling started...';
-            urlListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
-            domainListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
+            statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Crawling...';
+            domainListDiv.innerHTML = '<div class="empty-state">Discovering domains...</div>';
+            bfListDiv.innerHTML = '';
+            bfSection.style.display = 'none';
             pagesVisitedSpan.textContent = '0';
-            urlCountSpan.textContent = '0';
             domainCountSpan.textContent = '0';
-            currentUrlSpan.textContent = '-';
+            bfStatusSpan.textContent = enableBf ? 'pending' : 'disabled';
             targetDomainSpan.textContent = '-';
-            copyUrlsBtn.style.display = 'none';
+            currentUrlSpan.textContent = '-';
             copyDomainsBtn.style.display = 'none';
-            downloadUrlsBtn.style.display = 'none';
             downloadDomainsBtn.style.display = 'none';
-            downloadTreeBtn.style.display = 'none';
             cancelBtn.style.display = 'inline-flex';
             if (pollInterval) clearInterval(pollInterval);
             pollInterval = setInterval(pollCrawler, 1500);
@@ -151,31 +166,20 @@
             const status = data.status;
             const progress = data.progress || 0;
             const totalPages = data.total_pages || 0;
-            const urls = data.internal_urls || [];
-            const domains = data.domains || [];
+            const domains = data.all_domains || [];
             const currentUrl = data.current_url || '-';
             const domain = data.target_domain || '-';
+            const bfDiscovered = data.bf_discovered || [];
+            const bfChecked = data.bf_checked || 0;
+            const bfTotal = data.bf_total || 0;
+            const bfDone = data.bf_done || false;
+            const enableBf = data.enable_bruteforce || false;
 
             targetDomainSpan.textContent = domain;
             currentUrlSpan.textContent = currentUrl;
             pagesVisitedSpan.textContent = totalPages;
-            urlCountSpan.textContent = urls.length;
             domainCountSpan.textContent = domains.length;
-
-            // Update URL list
-            if (urls.length > 0) {
-                let html = '';
-                const displayUrls = urls.slice(0, 2000);
-                displayUrls.forEach(u => {
-                    html += escapeHtml(u) + '\n';
-                });
-                if (urls.length > 2000) {
-                    html += `\n... and ${urls.length - 2000} more URLs not shown.`;
-                }
-                urlListDiv.innerHTML = `<pre style="margin:0; color:#eef2ff;">${html}</pre>`;
-            } else {
-                urlListDiv.innerHTML = '<div class="empty-state">No URLs yet.</div>';
-            }
+            bfStatusSpan.textContent = enableBf ? (bfDone ? 'done' : `${bfChecked}/${bfTotal}`) : 'disabled';
 
             // Update domain list
             if (domains.length > 0) {
@@ -184,30 +188,32 @@
                 domainListDiv.innerHTML = '<div class="empty-state">No domains yet.</div>';
             }
 
+            // Update bruteforce results
+            if (bfDiscovered.length > 0) {
+                bfSection.style.display = 'block';
+                let html = '';
+                bfDiscovered.slice(0, 500).forEach(item => {
+                    html += `${item.status} ${escapeHtml(item.url)}\n`;
+                });
+                if (bfDiscovered.length > 500) {
+                    html += `\n... and ${bfDiscovered.length - 500} more`;
+                }
+                bfListDiv.innerHTML = `<pre style="margin:0; color:#eef2ff;">${html}</pre>`;
+            } else if (enableBf && !bfDone) {
+                bfSection.style.display = 'block';
+                bfListDiv.innerHTML = '<div class="empty-state">Bruteforcing... (0 found so far)</div>';
+            } else if (enableBf && bfDone && bfDiscovered.length === 0) {
+                bfSection.style.display = 'none';
+            } else {
+                bfSection.style.display = 'none';
+            }
+
             if (status === 'done') {
                 clearInterval(pollInterval);
-                statusDiv.innerHTML = `✅ Crawling completed. Found ${urls.length} URLs across ${domains.length} domains.`;
+                statusDiv.innerHTML = `✅ Completed. Found ${domains.length} unique domains.`;
                 cancelBtn.style.display = 'none';
-                copyUrlsBtn.style.display = 'inline-flex';
                 copyDomainsBtn.style.display = 'inline-flex';
-                downloadUrlsBtn.style.display = 'inline-flex';
                 downloadDomainsBtn.style.display = 'inline-flex';
-                downloadTreeBtn.style.display = 'inline-flex';
-
-                copyUrlsBtn.onclick = () => {
-                    const text = urls.join('\n');
-                    navigator.clipboard.writeText(text).then(() => {
-                        showToast(`Copied ${urls.length} URLs`);
-                    }).catch(() => {
-                        const textarea = document.createElement('textarea');
-                        textarea.value = text;
-                        document.body.appendChild(textarea);
-                        textarea.select();
-                        document.execCommand('copy');
-                        document.body.removeChild(textarea);
-                        showToast('URLs copied (fallback)');
-                    });
-                };
                 copyDomainsBtn.onclick = () => {
                     const text = domains.join('\n');
                     navigator.clipboard.writeText(text).then(() => {
@@ -222,14 +228,8 @@
                         showToast('Domains copied (fallback)');
                     });
                 };
-                downloadUrlsBtn.onclick = () => {
-                    window.open(`/crawler/download_urls/${currentTaskId}`, '_blank');
-                };
                 downloadDomainsBtn.onclick = () => {
                     window.open(`/crawler/download_domains/${currentTaskId}`, '_blank');
-                };
-                downloadTreeBtn.onclick = () => {
-                    window.open(`/crawler/download_directories/${currentTaskId}`, '_blank');
                 };
             } else if (status === 'error') {
                 clearInterval(pollInterval);
@@ -237,10 +237,11 @@
                 cancelBtn.style.display = 'none';
             } else if (status === 'cancelled') {
                 clearInterval(pollInterval);
-                statusDiv.innerHTML = '⛔ Crawl cancelled.';
+                statusDiv.innerHTML = '⛔ Task cancelled.';
                 cancelBtn.style.display = 'none';
             } else {
-                statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Crawling... (${progress}%, ${totalPages} pages visited)`;
+                let msg = status === 'crawling' ? 'Crawling...' : (status === 'bruteforcing' ? 'Bruteforcing...' : 'Processing...');
+                statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${msg} (${progress}%)`;
             }
         } catch (err) {
             console.error(err);
