@@ -13,7 +13,7 @@
 
     <div id="crawlerResults">
         <div style="display:flex; gap:1rem; flex-wrap:wrap; margin-bottom:1rem;">
-            <span><strong>Current:</strong> <span id="currentUrl" style="color:#80b3ff;">-</span></span>
+            <span><strong>Current Directory:</strong> <span id="currentDir" style="color:#80b3ff;">-</span></span>
             <span><strong>Pages visited:</strong> <span id="pagesVisited">0</span></span>
             <span><strong>Unique URLs:</strong> <span id="urlCount">0</span></span>
             <span><strong>Unique domains:</strong> <span id="domainCount">0</span></span>
@@ -57,7 +57,7 @@
     const maxPagesInput = document.getElementById('maxPages');
     const maxDepthInput = document.getElementById('maxDepth');
     const statusDiv = document.getElementById('crawlerStatus');
-    const currentUrlSpan = document.getElementById('currentUrl');
+    const currentDirSpan = document.getElementById('currentDir');
     const pagesVisitedSpan = document.getElementById('pagesVisited');
     const urlCountSpan = document.getElementById('urlCount');
     const domainCountSpan = document.getElementById('domainCount');
@@ -95,7 +95,7 @@
             pagesVisitedSpan.textContent = '0';
             urlCountSpan.textContent = '0';
             domainCountSpan.textContent = '0';
-            currentUrlSpan.textContent = '-';
+            currentDirSpan.textContent = '-';
             copyDomainsBtn.style.display = 'none';
             downloadDomainsBtn.style.display = 'none';
             downloadUrlsBtn.style.display = 'none';
@@ -121,9 +121,9 @@
             const totalPages = data.total_pages || 0;
             const urls = data.discovered_urls || [];
             const domains = data.domains || [];
-            const currentUrl = data.current_url || '-';
+            const currentDir = data.current_directory || '-';
 
-            currentUrlSpan.textContent = currentUrl;
+            currentDirSpan.textContent = currentDir;
             pagesVisitedSpan.textContent = totalPages;
             urlCountSpan.textContent = urls.length;
             domainCountSpan.textContent = domains.length;
@@ -155,20 +155,17 @@
                 copyDomainsBtn.style.display = 'inline-flex';
                 downloadDomainsBtn.style.display = 'inline-flex';
                 downloadUrlsBtn.style.display = 'inline-flex';
-                // Set download URLs
                 downloadUrlsBtn.onclick = () => {
                     window.open(`/crawler/download_urls/${currentTaskId}`, '_blank');
                 };
                 downloadDomainsBtn.onclick = () => {
                     window.open(`/crawler/download_domains/${currentTaskId}`, '_blank');
                 };
-                // Copy domains
                 copyDomainsBtn.onclick = () => {
                     const text = domains.join('\n');
                     navigator.clipboard.writeText(text).then(() => {
                         showToast(`Copied ${domains.length} domains to clipboard`);
                     }).catch(() => {
-                        // Fallback
                         const textarea = document.createElement('textarea');
                         textarea.value = text;
                         document.body.appendChild(textarea);
