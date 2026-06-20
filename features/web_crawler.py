@@ -43,10 +43,24 @@ def extract_domain(url):
 def get_website_name_from_url(url):
     parsed = urlparse(url)
     domain = parsed.netloc
-    # Remove www.
     if domain.startswith('www.'):
         domain = domain[4:]
     return domain
+
+def get_directory_from_url(url):
+    """Extract the directory path from a URL (e.g., /foo/bar from https://example.com/foo/bar/baz.html)"""
+    parsed = urlparse(url)
+    path = parsed.path
+    if not path or path == '/':
+        return '/'
+    # Remove trailing slash
+    if path.endswith('/'):
+        path = path[:-1]
+    # If last segment looks like a file (has extension), remove it to get directory
+    segments = path.split('/')
+    if segments and '.' in segments[-1]:
+        segments = segments[:-1]
+    return '/' + '/'.join(segments) if segments else '/'
 
 def run_crawler(task_id, start_url, max_pages, max_depth):
     logger.info(f"Crawler task {task_id} started: {start_url}")
@@ -74,6 +88,7 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
     task['discovered_urls'] = list(discovered_urls)
     task['domains'] = list(domains)
     task['current_url'] = current_url
+    task['current_directory'] = get_directory_from_url(current_url)
     save_task(task_id, task)
 
     session = requests.Session()
@@ -87,10 +102,11 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
             if depth > max_depth:
                 continue
 
-            # Update current_url
+            # Update current_url and current_directory
             task = load_task(task_id)
             if task:
                 task['current_url'] = current_url
+                task['current_directory'] = get_directory_from_url(current_url)
                 save_task(task_id, task)
 
             try:
@@ -116,6 +132,7 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
                     if depth + 1 <= max_depth:
                         queue.append((link, depth + 1))
 
+            # Update progress every few pages
             if pages_visited % 5 == 0:
                 task = load_task(task_id)
                 if not task:
@@ -125,6 +142,7 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
                 task['discovered_urls'] = list(discovered_urls)
                 task['domains'] = list(domains)
                 task['current_url'] = current_url
+                task['current_directory'] = get_directory_from_url(current_url)
                 save_task(task_id, task)
 
             task = load_task(task_id)
@@ -141,6 +159,7 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
             task['discovered_urls'] = list(discovered_urls)
             task['domains'] = list(domains)
             task['current_url'] = None
+            task['current_directory'] = None
             save_task(task_id, task)
 
             # Save domains file with website name
@@ -166,6 +185,7 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
             task['status'] = 'error'
             task['error_msg'] = str(e)
             task['current_url'] = None
+            task['current_directory'] = None
             save_task(task_id, task)
 
 def register_routes(app):
@@ -196,6 +216,7 @@ def register_routes(app):
             'discovered_urls': [],
             'domains': [],
             'current_url': None,
+            'current_directory': None,
             'error_msg': None,
         }
         save_task(task_id, task_data)
@@ -217,6 +238,7 @@ def register_routes(app):
             'discovered_urls': task.get('discovered_urls', []),
             'domains': task.get('domains', []),
             'current_url': task.get('current_url'),
+            'current_directory': task.get('current_directory'),
             'error_msg': task.get('error_msg'),
         })
 
@@ -230,7 +252,6 @@ def register_routes(app):
             return jsonify({'error': 'No URLs discovered'}), 404
         filename = f"crawled_urls_{task_id[:8]}.txt"
         filepath = os.path.join(UPLOAD_FOLDER, filename)
-        # The file is already saved in run_crawler, but we can also create on demand
         if not os.path.exists(filepath):
             with open(filepath, 'w') as f:
                 f.write('\n'.join(urls))
@@ -247,7 +268,6 @@ def register_routes(app):
         website_name = get_website_name_from_url(task.get('start_url'))
         filename = f"{website_name}_domains.txt"
         filepath = os.path.join(UPLOAD_FOLDER, filename)
-        # Ensure the file exists (it should have been saved in run_crawler)
         if not os.path.exists(filepath):
             with open(filepath, 'w') as f:
                 f.write('\n'.join(sorted(domains)))
