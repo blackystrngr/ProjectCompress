@@ -1,20 +1,12 @@
 <div class="card">
-    <h2><i class="fas fa-spider"></i> Web Crawler / Link Extractor</h2>
-    <p>Starting from a URL, recursively crawl pages and extract all unique links and domains. Optionally brute‑force common paths to find hidden resources.</p>
+    <h2><i class="fas fa-spider"></i> Recursive Domain Crawler</h2>
+    <p>Starting from a URL, recursively fetch every page, CSS, JS, and other resources on the same domain (including subdomains) until all URLs are discovered. Extracts domains from all found URLs.</p>
     <form id="crawlerForm">
         <div class="input-group">
             <input type="text" id="startUrl" placeholder="https://example.com" required>
-            <input type="number" id="maxPages" placeholder="Max pages" value="100" min="1" max="5000" style="width:120px;">
-            <input type="number" id="maxDepth" placeholder="Max depth" value="2" min="1" max="5" style="width:120px;">
-            <label style="display:flex; align-items:center; gap:0.5rem;">
-                <input type="checkbox" id="enableBruteforce"> <span style="font-size:0.8rem;">Bruteforce</span>
-            </label>
+            <input type="number" id="maxPages" placeholder="Max pages (0 = unlimited)" value="0" min="0" style="width:140px;">
+            <input type="number" id="maxDepth" placeholder="Max depth" value="3" min="1" max="10" style="width:120px;">
             <button type="submit" class="primary"><i class="fas fa-play"></i> Start Crawl</button>
-        </div>
-        <div id="bfOptions" style="display:none; margin-top:0.5rem; flex-wrap:wrap; gap:0.5rem; align-items:center;">
-            <input type="text" id="wordlist" placeholder="Custom wordlist (comma separated)" style="flex:2; min-width:200px;">
-            <input type="text" id="extensions" placeholder="Extensions" value=".php,.html,.txt,.log,.bak,.old,.zip,.tar.gz,.sql,.env,.ini,.xml,.json,.yml,.yaml,.conf,.config,.htaccess,.htpasswd,.inc,.class,.js,.css,.jpg,.png,.gif,.ico,.svg,.webp,.woff,.woff2,.ttf,.eot" style="flex:2; min-width:200px;">
-            <input type="number" id="threads" placeholder="Threads" value="20" style="width:80px;">
         </div>
         <div id="crawlerStatus" class="help-text"></div>
     </form>
@@ -25,13 +17,12 @@
             <span><strong>Pages visited:</strong> <span id="pagesVisited">0</span></span>
             <span><strong>Unique URLs:</strong> <span id="urlCount">0</span></span>
             <span><strong>Unique domains:</strong> <span id="domainCount">0</span></span>
-            <span><strong>Bruteforce:</strong> <span id="bfStatus">disabled</span></span>
         </div>
         <div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-bottom:1rem;">
             <button id="copyDomainsBtn" class="primary" style="display:none;"><i class="fas fa-copy"></i> Copy Domains</button>
             <button id="downloadDomainsBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download Domains</button>
             <button id="downloadUrlsBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download URLs</button>
-            <button id="showSavedBtn" class="primary"><i class="fas fa-folder-open"></i> Show Saved Domains</button>
+            <button id="showSavedBtn" class="primary"><i class="fas fa-folder-open"></i> Show Saved Files</button>
         </div>
 
         <div style="display:flex; gap:2rem; flex-wrap:wrap;">
@@ -65,17 +56,11 @@
     const startUrlInput = document.getElementById('startUrl');
     const maxPagesInput = document.getElementById('maxPages');
     const maxDepthInput = document.getElementById('maxDepth');
-    const enableBfCheck = document.getElementById('enableBruteforce');
-    const bfOptions = document.getElementById('bfOptions');
-    const wordlistInput = document.getElementById('wordlist');
-    const extensionsInput = document.getElementById('extensions');
-    const threadsInput = document.getElementById('threads');
     const statusDiv = document.getElementById('crawlerStatus');
     const currentUrlSpan = document.getElementById('currentUrl');
     const pagesVisitedSpan = document.getElementById('pagesVisited');
     const urlCountSpan = document.getElementById('urlCount');
     const domainCountSpan = document.getElementById('domainCount');
-    const bfStatusSpan = document.getElementById('bfStatus');
     const urlListDiv = document.getElementById('urlList');
     const domainListDiv = document.getElementById('domainList');
     const copyDomainsBtn = document.getElementById('copyDomainsBtn');
@@ -88,27 +73,18 @@
     let currentTaskId = null;
     let pollInterval = null;
 
-    // Toggle bruteforce options
-    enableBfCheck.addEventListener('change', function() {
-        bfOptions.style.display = this.checked ? 'flex' : 'none';
-    });
-
     form.addEventListener('submit', async function(e) {
         e.preventDefault();
         const startUrl = startUrlInput.value.trim();
         if (!startUrl) { showToast('Enter a start URL', true); return; }
-        const maxPages = parseInt(maxPagesInput.value) || 100;
-        const maxDepth = parseInt(maxDepthInput.value) || 2;
-        const enableBf = enableBfCheck.checked;
-        const wordlist = wordlistInput.value.trim() || '';
-        const extensions = extensionsInput.value.trim() || '.php,.html,.txt';
-        const threads = parseInt(threadsInput.value) || 20;
+        const maxPages = parseInt(maxPagesInput.value) || 0;
+        const maxDepth = parseInt(maxDepthInput.value) || 3;
 
         try {
             const resp = await fetch('/crawler/start', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                body: `start_url=${encodeURIComponent(startUrl)}&max_pages=${maxPages}&max_depth=${maxDepth}&enable_bruteforce=${enableBf}&wordlist=${encodeURIComponent(wordlist)}&extensions=${encodeURIComponent(extensions)}&threads=${threads}`
+                body: `start_url=${encodeURIComponent(startUrl)}&max_pages=${maxPages}&max_depth=${maxDepth}`
             });
             const data = await resp.json();
             if (data.error) throw new Error(data.error);
@@ -120,7 +96,6 @@
             urlCountSpan.textContent = '0';
             domainCountSpan.textContent = '0';
             currentUrlSpan.textContent = '-';
-            bfStatusSpan.textContent = enableBf ? 'pending' : 'disabled';
             copyDomainsBtn.style.display = 'none';
             downloadDomainsBtn.style.display = 'none';
             downloadUrlsBtn.style.display = 'none';
@@ -147,13 +122,11 @@
             const urls = data.discovered_urls || [];
             const domains = data.domains || [];
             const currentUrl = data.current_url || '-';
-            const enableBf = data.enable_bruteforce || false;
 
             currentUrlSpan.textContent = currentUrl;
             pagesVisitedSpan.textContent = totalPages;
             urlCountSpan.textContent = urls.length;
             domainCountSpan.textContent = domains.length;
-            bfStatusSpan.textContent = enableBf ? (status === 'bruteforcing' ? 'running' : 'done') : 'disabled';
 
             if (urls.length > 0) {
                 let html = '';
@@ -206,8 +179,7 @@
                 clearInterval(pollInterval);
                 statusDiv.innerHTML = `<span style="color:#ff8a8a;">❌ Error: ${data.error_msg}</span>`;
             } else {
-                let msg = status === 'crawling' ? 'Crawling...' : (status === 'bruteforcing' ? 'Bruteforcing...' : 'Processing...');
-                statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${msg} (${progress}%)`;
+                statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Crawling... (${progress}%, ${totalPages} pages visited)`;
             }
         } catch (err) {
             console.error(err);
