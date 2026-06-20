@@ -20,7 +20,7 @@ function escapeHtml(str) {
 // ==================== Task Management ====================
 let pollInterval = null;
 let isPolling = false;
-const POLL_INTERVAL_MS = 5000; // 5 seconds (was 2000)
+const POLL_INTERVAL_MS = 5000; // 5 seconds
 
 async function fetchTasks() {
     const container = document.getElementById('tasksContainer');
@@ -136,38 +136,68 @@ async function cancelTask(taskId) {
     }
 }
 
-// ==================== Tab Switching ====================
+// ==================== Tab Switching (Fixed) ====================
 function initTabs() {
     const tabBtns = document.querySelectorAll('.tab-btn');
     const panes = document.querySelectorAll('.tab-pane');
-    if (!tabBtns.length) return;
+    if (!tabBtns.length) {
+        console.warn('No tab buttons found');
+        return;
+    }
+
     function switchTab(tabId) {
+        console.log('Switching to tab:', tabId);
+        // Update button states
         tabBtns.forEach(btn => btn.classList.remove('active'));
-        panes.forEach(pane => pane.classList.remove('active'));
         const activeBtn = document.querySelector(`.tab-btn[data-tab="${tabId}"]`);
         if (activeBtn) activeBtn.classList.add('active');
+
+        // Update pane states
+        panes.forEach(pane => pane.classList.remove('active'));
         const activePane = document.getElementById(`${tabId}-tab`);
         if (activePane) activePane.classList.add('active');
-        if (tabId === 'local' && typeof loadDirectory === 'function') loadDirectory();
-        if (tabId === 'drive' && typeof loadDriveFiles === 'function') loadDriveFiles();
+
+        // Optional: refresh tab-specific data (with error handling)
+        try {
+            if (tabId === 'local' && typeof loadDirectory === 'function') {
+                loadDirectory();
+            }
+            if (tabId === 'drive' && typeof loadDriveFiles === 'function') {
+                loadDriveFiles();
+            }
+        } catch (e) {
+            console.warn('Error refreshing tab data:', e);
+        }
     }
+
+    // Remove any old listeners and attach new ones (prevent duplicates)
     tabBtns.forEach(btn => {
-        btn.addEventListener('click', () => {
-            const tabId = btn.getAttribute('data-tab');
+        btn.removeEventListener('click', btn._listener);
+        const listener = function() {
+            const tabId = this.getAttribute('data-tab');
             switchTab(tabId);
-        });
+        };
+        btn._listener = listener;
+        btn.addEventListener('click', listener);
     });
+
+    // Activate the initially active tab
     const activeTab = document.querySelector('.tab-btn.active')?.getAttribute('data-tab');
-    if (activeTab) switchTab(activeTab);
-    else if (tabBtns.length) switchTab(tabBtns[0].getAttribute('data-tab'));
+    if (activeTab) {
+        switchTab(activeTab);
+    } else if (tabBtns.length) {
+        // fallback: activate first tab
+        const firstTab = tabBtns[0].getAttribute('data-tab');
+        switchTab(firstTab);
+    }
 }
 
-// ==================== Start / Stop Polling with Visibility API ====================
+// ==================== Polling with Visibility API ====================
 function startPolling() {
     if (isPolling) return;
     isPolling = true;
     console.log('Task polling started (every 5s)');
-    fetchTasks(); // immediate first fetch
+    fetchTasks();
     pollInterval = setInterval(fetchTasks, POLL_INTERVAL_MS);
 }
 
@@ -180,24 +210,26 @@ function stopPolling() {
     }
 }
 
-// Handle page visibility: stop polling when tab is hidden, resume when visible
 function handleVisibilityChange() {
     if (document.hidden) {
         stopPolling();
     } else {
         startPolling();
+        // Also re‑initialise tabs in case they were broken (optional)
+        // initTabs(); // not needed, but safe
     }
 }
 
 // ==================== Initialization ====================
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', function() {
     initTabs();
-    // Start polling only if the tab is visible
+
+    // Start polling only if tab is visible
     if (!document.hidden) {
         startPolling();
     }
-    // Listen for visibility changes
     document.addEventListener('visibilitychange', handleVisibilityChange);
 });
 
+// Expose fetchTasks globally so features can refresh manually
 window.fetchTasks = fetchTasks;
