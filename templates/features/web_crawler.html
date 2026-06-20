@@ -15,21 +15,27 @@
             <span><strong>Pages visited:</strong> <span id="pagesVisited">0</span></span>
             <span><strong>Unique URLs:</strong> <span id="urlCount">0</span></span>
             <span><strong>Unique domains:</strong> <span id="domainCount">0</span></span>
-            <button id="downloadBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download URLs</button>
+            <span><strong>Current URL:</strong> <span id="currentUrl" style="color:#aaa; font-size:0.8rem;">-</span></span>
         </div>
         <div style="display:flex; gap:2rem; flex-wrap:wrap;">
             <div style="flex:1; min-width:300px;">
-                <h4>Discovered URLs</h4>
+                <h4>Discovered URLs <button id="downloadUrlsBtn" class="primary" style="font-size:0.7rem; padding:0.2rem 0.6rem; display:none;"><i class="fas fa-download"></i> Download</button></h4>
                 <div id="urlList" style="max-height:400px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem;">
                     <div class="empty-state">No URLs yet.</div>
                 </div>
             </div>
             <div style="flex:1; min-width:200px;">
-                <h4>Domains</h4>
+                <h4>Domains <button id="downloadDomainsBtn" class="primary" style="font-size:0.7rem; padding:0.2rem 0.6rem; display:none;"><i class="fas fa-download"></i> Download</button></h4>
                 <div id="domainList" style="max-height:400px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem;">
                     <div class="empty-state">No domains yet.</div>
                 </div>
             </div>
+        </div>
+    </div>
+    <div style="margin-top:2rem;">
+        <h4>Saved Domain Files</h4>
+        <div id="savedFilesList" style="max-height:200px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem;">
+            <div class="empty-state">No saved files.</div>
         </div>
     </div>
 </div>
@@ -44,12 +50,53 @@
     const pagesVisitedSpan = document.getElementById('pagesVisited');
     const urlCountSpan = document.getElementById('urlCount');
     const domainCountSpan = document.getElementById('domainCount');
+    const currentUrlSpan = document.getElementById('currentUrl');
     const urlListDiv = document.getElementById('urlList');
     const domainListDiv = document.getElementById('domainList');
-    const downloadBtn = document.getElementById('downloadBtn');
+    const downloadUrlsBtn = document.getElementById('downloadUrlsBtn');
+    const downloadDomainsBtn = document.getElementById('downloadDomainsBtn');
+    const savedFilesDiv = document.getElementById('savedFilesList');
 
     let currentTaskId = null;
     let pollInterval = null;
+
+    async function loadSavedFiles() {
+        try {
+            const resp = await fetch('/crawler/list_files');
+            const files = await resp.json();
+            if (!files.length) {
+                savedFilesDiv.innerHTML = '<div class="empty-state">No saved files.</div>';
+                return;
+            }
+            let html = '';
+            files.forEach(f => {
+                const label = f.type === 'domains' ? 'Domains' : 'URLs';
+                html += `<div style="display:flex; justify-content:space-between; padding:4px 0; border-bottom:1px solid #2a3248;">
+                            <span>${escapeHtml(f.name)} (${label})</span>
+                            <span>
+                                <button class="view-file-btn" data-file="${escapeHtml(f.name)}" style="font-size:0.7rem; padding:0.1rem 0.5rem;">View</button>
+                                <a href="/crawler/download_file/${escapeHtml(f.name)}" style="font-size:0.7rem; padding:0.1rem 0.5rem;">Download</a>
+                            </span>
+                         </div>`;
+            });
+            savedFilesDiv.innerHTML = html;
+            // Attach view event
+            document.querySelectorAll('.view-file-btn').forEach(btn => {
+                btn.onclick = () => {
+                    const filename = btn.dataset.file;
+                    fetch(`/crawler/view_file/${filename}`)
+                        .then(r => r.json())
+                        .then(data => {
+                            alert('Content of ' + filename + ':\n\n' + data.content);
+                        })
+                        .catch(err => alert('Error: ' + err.message));
+                };
+            });
+        } catch (err) {
+            console.error(err);
+        }
+    }
+    loadSavedFiles();
 
     form.addEventListener('submit', async function(e) {
         e.preventDefault();
@@ -68,13 +115,14 @@
             if (data.error) throw new Error(data.error);
             currentTaskId = data.task_id;
             statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Crawling started...';
-            // Clear previous results
             urlListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
             domainListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
             pagesVisitedSpan.textContent = '0';
             urlCountSpan.textContent = '0';
             domainCountSpan.textContent = '0';
-            downloadBtn.style.display = 'none';
+            currentUrlSpan.textContent = '-';
+            downloadUrlsBtn.style.display = 'none';
+            downloadDomainsBtn.style.display = 'none';
             if (pollInterval) clearInterval(pollInterval);
             pollInterval = setInterval(pollCrawler, 2000);
         } catch (err) {
@@ -97,12 +145,14 @@
             const totalPages = data.total_pages || 0;
             const urls = data.discovered_urls || [];
             const domains = data.domains || [];
+            const currentUrl = data.current_url || '';
 
             pagesVisitedSpan.textContent = totalPages;
             urlCountSpan.textContent = urls.length;
             domainCountSpan.textContent = domains.length;
+            currentUrlSpan.textContent = currentUrl;
 
-            // Update URL list
+            // URL list
             if (urls.length > 0) {
                 let html = '';
                 urls.slice(0, 200).forEach(u => {
@@ -114,24 +164,52 @@
                 urlListDiv.innerHTML = '<div class="empty-state">No URLs yet.</div>';
             }
 
-            // Update domain list
+            // Domain list with copy button
             if (domains.length > 0) {
                 let html = '';
                 domains.forEach(d => {
-                    html += `<div style="font-size:0.8rem; padding:2px 0; border-bottom:1px solid #2a3248;">${escapeHtml(d)}</div>`;
+                    html += `<div style="display:flex; justify-content:space-between; padding:2px 0; border-bottom:1px solid #2a3248; font-size:0.8rem;">
+                                <span>${escapeHtml(d)}</span>
+                                <button class="copy-domain" data-domain="${escapeHtml(d)}" style="font-size:0.7rem; padding:0 0.4rem; background:none; border:none; color:#5f8fe0; cursor:pointer;"><i class="fas fa-copy"></i></button>
+                             </div>`;
                 });
                 domainListDiv.innerHTML = html;
+                // Attach copy events
+                document.querySelectorAll('.copy-domain').forEach(btn => {
+                    btn.onclick = () => {
+                        const domain = btn.dataset.domain;
+                        navigator.clipboard.writeText(domain).then(() => {
+                            showToast('Copied: ' + domain);
+                        }).catch(err => {
+                            // Fallback
+                            const textarea = document.createElement('textarea');
+                            textarea.value = domain;
+                            document.body.appendChild(textarea);
+                            textarea.select();
+                            document.execCommand('copy');
+                            document.body.removeChild(textarea);
+                            showToast('Copied: ' + domain);
+                        });
+                    };
+                });
             } else {
                 domainListDiv.innerHTML = '<div class="empty-state">No domains yet.</div>';
             }
 
+            // Download buttons visibility
             if (status === 'done') {
                 clearInterval(pollInterval);
                 statusDiv.innerHTML = `✅ Crawling completed. Found ${urls.length} unique URLs across ${domains.length} domains.`;
-                downloadBtn.style.display = 'inline-flex';
-                downloadBtn.onclick = () => {
-                    window.open(`/crawler/download/${currentTaskId}`, '_blank');
+                downloadUrlsBtn.style.display = 'inline-flex';
+                downloadUrlsBtn.onclick = () => {
+                    window.open(`/crawler/download/${currentTaskId}/urls`, '_blank');
                 };
+                downloadDomainsBtn.style.display = 'inline-flex';
+                downloadDomainsBtn.onclick = () => {
+                    window.open(`/crawler/download/${currentTaskId}/domains`, '_blank');
+                };
+                // Reload saved files
+                loadSavedFiles();
             } else if (status === 'error') {
                 clearInterval(pollInterval);
                 statusDiv.innerHTML = `<span style="color:#ff8a8a;">❌ Error: ${data.error_msg}</span>`;
