@@ -1,14 +1,11 @@
 <div class="card">
-    <h2><i class="fas fa-globe"></i> Domain Crawler – Extract All URLs & Domains</h2>
-    <p>Recursively crawl a domain, parse HTML/CSS/JS, and extract every URL and domain found.</p>
+    <h2><i class="fas fa-globe"></i> Domain Crawler – Full URL & Directory Extraction</h2>
+    <p>Crawl a domain, discover every internal URL (pages, CSS, JS, images, fonts) and build a directory tree.</p>
     <form id="crawlerForm">
         <div class="input-group">
             <input type="text" id="startUrl" placeholder="https://sltmobitel.lk" required>
             <input type="number" id="maxPages" placeholder="Max pages (0 = unlimited)" value="0" min="0" max="10000" style="width:150px;">
-            <input type="number" id="maxDepth" placeholder="Max depth" value="3" min="1" max="10" style="width:120px;">
-            <label style="display:flex; align-items:center; gap:0.5rem;">
-                <input type="checkbox" id="noLimit" checked> <span style="font-size:0.8rem;">No limit</span>
-            </label>
+            <input type="number" id="maxDepth" placeholder="Max depth" value="5" min="1" max="10" style="width:120px;">
             <button type="submit" class="primary"><i class="fas fa-play"></i> Start Crawl</button>
             <button type="button" id="cancelBtn" class="danger" style="display:none;"><i class="fas fa-stop"></i> Cancel</button>
         </div>
@@ -21,7 +18,7 @@
             <span><strong>Domain:</strong> <span id="targetDomain">-</span></span>
             <span><strong>Current URL:</strong> <span id="currentUrl" style="color:#80b3ff; max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">-</span></span>
             <span><strong>Pages crawled:</strong> <span id="pagesVisited">0</span></span>
-            <span><strong>Unique URLs:</strong> <span id="urlCount">0</span></span>
+            <span><strong>Unique URLs found:</strong> <span id="urlCount">0</span></span>
             <span><strong>Unique domains:</strong> <span id="domainCount">0</span></span>
         </div>
 
@@ -31,6 +28,7 @@
             <button id="copyDomainsBtn" class="primary" style="display:none;"><i class="fas fa-copy"></i> Copy Domains</button>
             <button id="downloadUrlsBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download URLs</button>
             <button id="downloadDomainsBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download Domains</button>
+            <button id="downloadTreeBtn" class="primary" style="display:none;"><i class="fas fa-sitemap"></i> Download Directory Tree</button>
             <button id="showFilesBtn" class="primary"><i class="fas fa-folder-open"></i> Show Saved Files</button>
         </div>
 
@@ -44,7 +42,7 @@
             </div>
             <div style="flex:1; min-width:200px;">
                 <h4>Unique Domains Found</h4>
-                <div id="domainList" style="max-height:500px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem; font-family:monospace; font-size:0.8rem; white-space:pre-wrap; word-break:break-all;">
+                <div id="domainList" style="max-height:500px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem; font-family:monospace; font-size:0.8rem;">
                     <div class="empty-state">No domains yet.</div>
                 </div>
             </div>
@@ -66,7 +64,6 @@
     const startUrlInput = document.getElementById('startUrl');
     const maxPagesInput = document.getElementById('maxPages');
     const maxDepthInput = document.getElementById('maxDepth');
-    const noLimitCheck = document.getElementById('noLimit');
     const cancelBtn = document.getElementById('cancelBtn');
     const statusDiv = document.getElementById('crawlerStatus');
     const targetDomainSpan = document.getElementById('targetDomain');
@@ -80,6 +77,7 @@
     const copyDomainsBtn = document.getElementById('copyDomainsBtn');
     const downloadUrlsBtn = document.getElementById('downloadUrlsBtn');
     const downloadDomainsBtn = document.getElementById('downloadDomainsBtn');
+    const downloadTreeBtn = document.getElementById('downloadTreeBtn');
     const showFilesBtn = document.getElementById('showFilesBtn');
     const savedFilesSection = document.getElementById('savedFilesSection');
     const savedFilesList = document.getElementById('savedFilesList');
@@ -87,17 +85,6 @@
     let currentTaskId = null;
     let pollInterval = null;
 
-    // Toggle maxPages input based on checkbox
-    noLimitCheck.addEventListener('change', function() {
-        maxPagesInput.disabled = this.checked;
-        if (this.checked) {
-            maxPagesInput.value = 0;
-        } else {
-            maxPagesInput.value = 100;
-        }
-    });
-
-    // Cancel button
     cancelBtn.addEventListener('click', async function() {
         if (currentTaskId) {
             try {
@@ -118,7 +105,6 @@
         if (!startUrl) { showToast('Enter a start URL', true); return; }
         if (!startUrl.startsWith('http')) startUrl = 'https://' + startUrl;
         let maxPages = parseInt(maxPagesInput.value) || 0;
-        if (noLimitCheck.checked) maxPages = 0;
         const maxDepth = parseInt(maxDepthInput.value) || 3;
 
         try {
@@ -142,6 +128,7 @@
             copyDomainsBtn.style.display = 'none';
             downloadUrlsBtn.style.display = 'none';
             downloadDomainsBtn.style.display = 'none';
+            downloadTreeBtn.style.display = 'none';
             cancelBtn.style.display = 'inline-flex';
             if (pollInterval) clearInterval(pollInterval);
             pollInterval = setInterval(pollCrawler, 1500);
@@ -205,7 +192,8 @@
                 copyDomainsBtn.style.display = 'inline-flex';
                 downloadUrlsBtn.style.display = 'inline-flex';
                 downloadDomainsBtn.style.display = 'inline-flex';
-                // Copy URLs
+                downloadTreeBtn.style.display = 'inline-flex';
+
                 copyUrlsBtn.onclick = () => {
                     const text = urls.join('\n');
                     navigator.clipboard.writeText(text).then(() => {
@@ -239,6 +227,9 @@
                 };
                 downloadDomainsBtn.onclick = () => {
                     window.open(`/crawler/download_domains/${currentTaskId}`, '_blank');
+                };
+                downloadTreeBtn.onclick = () => {
+                    window.open(`/crawler/download_directories/${currentTaskId}`, '_blank');
                 };
             } else if (status === 'error') {
                 clearInterval(pollInterval);
