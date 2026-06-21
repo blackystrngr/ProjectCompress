@@ -1,6 +1,6 @@
 <div class="card">
     <h2><i class="fas fa-spider"></i> Recursive Domain Crawler</h2>
-    <p>Recursively crawl a domain – real‑time updates with minimal bandwidth. Only domains/IPs are shown.</p>
+    <p>Real‑time domain discovery – uses almost no bandwidth. Updates only when you're on this tab.</p>
     <form id="crawlerForm">
         <div class="input-group">
             <input type="text" id="startUrl" placeholder="https://example.com" required>
@@ -75,6 +75,81 @@
         domainCountSpan.textContent = allDomains.length;
     }
 
+    function connectSSE(taskId) {
+        if (eventSource) {
+            eventSource.close();
+            eventSource = null;
+        }
+        // Only connect if the page is visible
+        if (document.hidden) return;
+
+        eventSource = new EventSource(`/crawler/stream/${taskId}`);
+
+        eventSource.addEventListener('update', function(event) {
+            const payload = JSON.parse(event.data);
+            appendDomains(payload.domains);
+            pagesVisitedSpan.textContent = payload.pages || 0;
+            statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Crawling... (${payload.progress}%)`;
+        });
+
+        eventSource.addEventListener('done', function(event) {
+            statusDiv.innerHTML = `✅ Crawling completed. Found ${allDomains.length} domains/IPs.`;
+            cancelBtn.style.display = 'none';
+            copyDomainsBtn.style.display = 'inline-flex';
+            downloadDomainsBtn.style.display = 'inline-flex';
+            downloadDomainsBtn.onclick = () => {
+                window.open(`/crawler/download_domains/${currentTaskId}`, '_blank');
+            };
+            copyDomainsBtn.onclick = () => {
+                const text = allDomains.join('\n');
+                navigator.clipboard.writeText(text).then(() => {
+                    showToast(`Copied ${allDomains.length} domains/IPs`);
+                }).catch(() => {
+                    const textarea = document.createElement('textarea');
+                    textarea.value = text;
+                    document.body.appendChild(textarea);
+                    textarea.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(textarea);
+                    showToast('Domains/IPs copied (fallback)');
+                });
+            };
+            eventSource.close();
+            eventSource = null;
+        });
+
+        eventSource.addEventListener('cancelled', function(event) {
+            statusDiv.innerHTML = '⛔ Crawl cancelled.';
+            cancelBtn.style.display = 'none';
+            eventSource.close();
+            eventSource = null;
+        });
+
+        eventSource.addEventListener('error', function(event) {
+            if (eventSource.readyState === EventSource.CLOSED) {
+                statusDiv.innerHTML = '❌ Connection lost. Please refresh.';
+                cancelBtn.style.display = 'none';
+                eventSource = null;
+            }
+        });
+    }
+
+    // Visibility change: pause/resume SSE
+    document.addEventListener('visibilitychange', function() {
+        if (document.hidden) {
+            // Page hidden – close SSE to save bandwidth
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+        } else {
+            // Page visible – reconnect if we have a task
+            if (currentTaskId) {
+                connectSSE(currentTaskId);
+            }
+        }
+    });
+
     cancelBtn.addEventListener('click', async function() {
         if (currentTaskId) {
             try {
@@ -83,7 +158,10 @@
                 if (data.error) throw new Error(data.error);
                 showToast('Cancelling crawl...');
                 cancelBtn.style.display = 'none';
-                if (eventSource) eventSource.close();
+                if (eventSource) {
+                    eventSource.close();
+                    eventSource = null;
+                }
             } catch (err) {
                 showToast(err.message, true);
             }
@@ -118,54 +196,13 @@
             if (data.error) throw new Error(data.error);
             currentTaskId = data.task_id;
 
-            if (eventSource) eventSource.close();
-            eventSource = new EventSource(`/crawler/stream/${currentTaskId}`);
-
-            eventSource.addEventListener('update', function(event) {
-                const payload = JSON.parse(event.data);
-                appendDomains(payload.new_domains);
-                pagesVisitedSpan.textContent = payload.pages || 0;
-                currentUrlSpan.textContent = payload.current_url || '-';
-                statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Crawling... (${payload.progress}%)`;
-            });
-
-            eventSource.addEventListener('done', function(event) {
-                statusDiv.innerHTML = `✅ Crawling completed. Found ${allDomains.length} domains/IPs.`;
-                cancelBtn.style.display = 'none';
-                copyDomainsBtn.style.display = 'inline-flex';
-                downloadDomainsBtn.style.display = 'inline-flex';
-                downloadDomainsBtn.onclick = () => {
-                    window.open(`/crawler/download_domains/${currentTaskId}`, '_blank');
-                };
-                copyDomainsBtn.onclick = () => {
-                    const text = allDomains.join('\n');
-                    navigator.clipboard.writeText(text).then(() => {
-                        showToast(`Copied ${allDomains.length} domains/IPs`);
-                    }).catch(() => {
-                        const textarea = document.createElement('textarea');
-                        textarea.value = text;
-                        document.body.appendChild(textarea);
-                        textarea.select();
-                        document.execCommand('copy');
-                        document.body.removeChild(textarea);
-                        showToast('Domains/IPs copied (fallback)');
-                    });
-                };
-                eventSource.close();
-            });
-
-            eventSource.addEventListener('cancelled', function(event) {
-                statusDiv.innerHTML = '⛔ Crawl cancelled.';
-                cancelBtn.style.display = 'none';
-                eventSource.close();
-            });
-
-            eventSource.addEventListener('error', function(event) {
-                if (eventSource.readyState === EventSource.CLOSED) {
-                    statusDiv.innerHTML = '❌ Connection lost. Please refresh.';
-                    cancelBtn.style.display = 'none';
-                }
-            });
+            // Connect only if page is visible
+            if (!document.hidden) {
+                connectSSE(currentTaskId);
+            } else {
+                // Will connect when page becomes visible
+                showToast('Crawler started – reconnect when you return to this tab.');
+            }
 
         } catch (err) {
             showToast(err.message, true);
