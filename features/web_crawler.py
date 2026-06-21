@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 from tasks import save_task, load_task
 from config import UPLOAD_FOLDER
 
+
 logger = logging.getLogger(__name__)
 
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
