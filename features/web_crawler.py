@@ -369,7 +369,7 @@ def register_routes(app):
                 yield "event: error\ndata: Task not found\n\n"
                 return
 
-            # Use the task's stored sent count so we don't resend old domains
+            # Always start from the last sent count stored in the task
             last_domain_count = task.get('last_sent_domains_count', 0)
             last_path = None
 
