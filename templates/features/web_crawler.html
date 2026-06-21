@@ -49,16 +49,18 @@ document.addEventListener('DOMContentLoaded', function() {
     let domains = new Set();
     let currentTaskId = null;
     let es = null;
+    let isCrawling = false;
 
     // ---------- Form submission ----------
     form.addEventListener('submit', async function(event) {
-        event.preventDefault();   // critical – prevents page reload
+        event.preventDefault();
         console.log('Form submitted – starting crawler');
 
         domains.clear();
         domainList.innerHTML = '';
         copyBtn.style.display = 'none';
         downloadBtn.style.display = 'none';
+        isCrawling = true;
 
         const startUrl = document.getElementById('startUrl').value.trim();
         const maxPages = document.getElementById('maxPages').value;
@@ -87,15 +89,19 @@ document.addEventListener('DOMContentLoaded', function() {
                 cancelBtn.style.display = 'inline-block';
                 connectStream();
                 statusEl.innerHTML = '⏳ Crawl started – waiting for updates...';
+                // Refresh file list immediately to show the empty file (created on start)
+                loadFileList();
             } else {
                 statusEl.innerHTML = '❌ Error: ' + (data.error || 'Unknown error');
+                isCrawling = false;
             }
         } catch (err) {
             console.error('Fetch error:', err);
             statusEl.innerHTML = '❌ Error: ' + err.message;
+            isCrawling = false;
         }
 
-        return false; // extra safety
+        return false;
     });
 
     // ---------- SSE connection ----------
@@ -120,6 +126,9 @@ document.addEventListener('DOMContentLoaded', function() {
                 statusEl.textContent = `Crawling... ${p.progress || 0}%`;
 
                 if (p.domains.length) renderDomains();
+
+                // Refresh file list on every update to show the growing file
+                loadFileList();
             } catch (err) {
                 console.error('Error processing SSE update:', err);
             }
@@ -131,6 +140,7 @@ document.addEventListener('DOMContentLoaded', function() {
             cancelBtn.style.display = 'none';
             copyBtn.style.display = 'inline-block';
             downloadBtn.style.display = 'inline-block';
+            isCrawling = false;
             loadFileList();
             if (es) es.close();
         });
@@ -139,12 +149,15 @@ document.addEventListener('DOMContentLoaded', function() {
             console.log('SSE cancelled event');
             statusEl.innerHTML = '⛔ Cancelled by user';
             cancelBtn.style.display = 'none';
+            isCrawling = false;
+            loadFileList();
             if (es) es.close();
         });
 
         es.onerror = function(e) {
-            // SSE connections may log errors for keep-alive pings; ignore if we have a task
             console.warn('SSE error (may be normal):', e);
+            // If the task is still crawling but SSE dies, we might try to reconnect? 
+            // For simplicity, we just log.
         };
     }
 
@@ -162,6 +175,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 await fetch(`/crawler/cancel/${currentTaskId}`, { method: 'POST' });
                 statusEl.innerHTML = '⛔ Cancellation requested...';
                 cancelBtn.style.display = 'none';
+                isCrawling = false;
             } catch (err) {
                 console.error('Cancel error:', err);
             }
@@ -202,7 +216,11 @@ document.addEventListener('DOMContentLoaded', function() {
             const resp = await fetch('/crawler/list_files');
             const files = await resp.json();
             if (files.length === 0) {
-                fileListDiv.innerHTML = '<div class="empty-state">No domain files saved yet.</div>';
+                if (isCrawling) {
+                    fileListDiv.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-pulse"></i> Crawling... file will appear once domains are found.</div>';
+                } else {
+                    fileListDiv.innerHTML = '<div class="empty-state">No domain files saved yet.</div>';
+                }
                 return;
             }
             let html = '';
