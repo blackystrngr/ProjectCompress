@@ -1,4 +1,3 @@
-
 import os
 import re
 import uuid
@@ -370,7 +369,8 @@ def register_routes(app):
                 yield "event: error\ndata: Task not found\n\n"
                 return
 
-            last_domain_count = 0
+            # Use the task's stored sent count so we don't resend old domains
+            last_domain_count = task.get('last_sent_domains_count', 0)
             last_path = None
 
             while True:
@@ -383,14 +383,13 @@ def register_routes(app):
                 domains = task.get('domains', [])
                 current_url = task.get('current_url', '')
 
-                # Extract the path part to show ongoing directories
                 current_path = ''
                 if current_url:
                     parsed = urlparse(current_url)
                     current_path = parsed.path or '/'
 
+                # Only send if there are new domains OR path changed
                 new_domains = domains[last_domain_count:]
-                # We only send an event if there are new domains OR the path has changed
                 if new_domains or (current_path != last_path and status == 'crawling'):
                     payload = {
                         'domains': new_domains,
@@ -399,15 +398,18 @@ def register_routes(app):
                         'pages': task.get('total_pages', 0)
                     }
                     yield f"event: update\ndata: {json.dumps(payload)}\n\n"
-                    last_domain_count = len(domains)
+                    # Update the sent count in the task itself
+                    if new_domains:
+                        last_domain_count = len(domains)
+                        task['last_sent_domains_count'] = last_domain_count
+                        save_task(task_id, task)
                     last_path = current_path
 
                 if status in ('done', 'cancelled', 'error'):
                     yield f"event: {status}\ndata: \n\n"
                     break
 
-                # Check every 5 seconds – minimal traffic
-                time.sleep(5)
+                time.sleep(5)  # 5 seconds between checks
 
         return Response(stream_with_context(event_generator()), mimetype="text/event-stream")
 
