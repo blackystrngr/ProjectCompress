@@ -18,7 +18,6 @@ USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 IPV4_RE = re.compile(r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b')
 IPV6_RE = re.compile(r'\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b')
 
-# Extensions to skip (never treat as domains)
 SKIP_EXTENSIONS = {
     '.jpg', '.jpeg', '.png', '.gif', '.svg', '.ico', '.webp', '.bmp',
     '.mp4', '.webm', '.mkv', '.avi', '.mov', '.flv',
@@ -34,10 +33,6 @@ SKIP_EXTENSIONS = {
     '.log', '.tmp', '.bak', '.exe', '.dll', '.so', '.dylib',
     '.pem', '.key', '.crt', '.csr'
 }
-
-# ---------------------------------------------------------------------
-# STRICT DOMAIN VALIDATION
-# ---------------------------------------------------------------------
 
 def is_valid_domain(domain):
     if not domain or not isinstance(domain, str):
@@ -84,10 +79,6 @@ def extract_domain(url):
         return clean_domain(dom)
     except:
         return None
-
-# ---------------------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------------------
 
 def is_valid_url(url):
     if not url:
@@ -182,10 +173,6 @@ def extract_ips_from_text(text):
     ips.update(IPV6_RE.findall(text))
     return ips
 
-# ---------------------------------------------------------------------
-# MAIN CRAWLER – CHECKS CANCELLATION EVERYWHERE
-# ---------------------------------------------------------------------
-
 def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
     logger.info(f"Crawler task {task_id} started: {start_url}")
     task = load_task(task_id)
@@ -226,10 +213,9 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
     session.timeout = (10, 20)
 
     while queue and (pages_visited < max_pages or max_pages == 0):
-        # ---- CHECK CANCELLATION ----
         task = load_task(task_id)
         if task and task.get('cancelled', False):
-            logger.info(f"Task {task_id} cancelled by user (before processing queue)")
+            logger.info(f"Task {task_id} cancelled by user")
             task['status'] = 'cancelled'
             save_task(task_id, task)
             return
@@ -240,16 +226,14 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
         processed.add(url)
         current_url = url
 
-        # Update current URL
         task = load_task(task_id)
         if task:
             task['current_url'] = current_url
             save_task(task_id, task)
 
-        # ---- CHECK CANCELLATION AGAIN ----
         task = load_task(task_id)
         if task and task.get('cancelled', False):
-            logger.info(f"Task {task_id} cancelled by user (before fetching)")
+            logger.info(f"Task {task_id} cancelled before fetch")
             task['status'] = 'cancelled'
             save_task(task_id, task)
             return
@@ -263,7 +247,6 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
             text = resp.text
             logger.info(f"Fetched {url} (status {resp.status_code}, type {content_type}, length {len(text)})")
 
-            # Only process HTML
             if 'text/html' not in content_type:
                 logger.info(f"Skipping non‑HTML content: {content_type}")
                 continue
@@ -288,7 +271,6 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
 
             pages_visited += 1
 
-            # Update task progress
             task = load_task(task_id)
             if task:
                 task['progress'] = int(100 * pages_visited / max_pages) if max_pages > 0 else 0
@@ -302,7 +284,6 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
             logger.warning(f"Exception fetching {url}: {e}")
             continue
 
-    # Done
     combined = set(domains) | set(ip_addresses)
     task = load_task(task_id)
     if task:
@@ -316,7 +297,6 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
         task['last_sent_domains_count'] = len(combined)
         save_task(task_id, task)
 
-    # Save to files
     website_name = get_website_name_from_url(start_url)
     domain_filename = f"{website_name}_domains.txt"
     domain_filepath = os.path.join(UPLOAD_FOLDER, domain_filename)
@@ -330,10 +310,6 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
         f.write('\n'.join(sorted(all_urls)))
 
     logger.info(f"Crawler {task_id} finished: {len(all_urls)} URLs, {len(combined)} domains/IPs")
-
-# ---------------------------------------------------------------------
-# FLASK ROUTES
-# ---------------------------------------------------------------------
 
 def register_routes(app):
     @app.route('/crawler/start', methods=['POST'])
@@ -393,7 +369,6 @@ def register_routes(app):
                 yield "event: error\ndata: Task not found\n\n"
                 return
 
-            last_url_count = 0
             last_domain_count = 0
 
             while True:
@@ -403,29 +378,23 @@ def register_routes(app):
                     break
 
                 status = task.get('status')
-                urls = task.get('discovered_urls', [])
                 domains = task.get('domains', [])
-                new_urls = urls[last_url_count:]
                 new_domains = domains[last_domain_count:]
 
-                if new_urls or new_domains:
+                if new_domains:
                     payload = {
-                        'new_urls': new_urls,
-                        'new_domains': new_domains,
-                        'total_urls': len(urls),
-                        'total_domains': len(domains),
+                        'domains': new_domains,
                         'progress': task.get('progress', 0),
-                        'pages': task.get('total_pages', 0),
-                        'current_url': task.get('current_url')
+                        'pages': task.get('total_pages', 0)
                     }
                     yield f"event: update\ndata: {json.dumps(payload)}\n\n"
-                    last_url_count = len(urls)
                     last_domain_count = len(domains)
 
                 if status in ('done', 'cancelled', 'error'):
                     yield f"event: {status}\ndata: \n\n"
                     break
 
+                # Check every 2 seconds – only sends when new domains exist
                 time.sleep(2)
 
         return Response(stream_with_context(event_generator()), mimetype="text/event-stream")
