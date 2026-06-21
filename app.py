@@ -3,21 +3,23 @@
 
 import os
 import sys
+import time
+import json
 import logging
 import psutil
-import time
 import threading
 import hmac
 import hashlib
 import subprocess
-from flask import Flask, render_template, jsonify, request, send_from_directory
+from flask import Flask, render_template, jsonify, request, send_from_directory, Response, stream_with_context
 from waitress import serve
 from werkzeug.exceptions import NotFound
 from config import SECRET_KEY, MAX_CONTENT_LENGTH, UPLOAD_FOLDER, TASKS_DIR
 from tasks import get_all_task_ids, load_task, save_task
 from features import register_all_features
 
-WEBHOOK_SECRET = "atomisfake"
+# Webhook secret (for auto‑deploy)
+WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'your-super-secret-webhook-key')
 GITHUB_DEPLOY_KEY = os.path.expanduser('~/.ssh/github_deploy')
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -37,16 +39,14 @@ def create_app():
     # Register all feature routes
     register_all_features(app)
 
-    # ---------- 404 handler for missing endpoints ----------
+    # ---------- 404 handler ----------
     @app.errorhandler(NotFound)
     def handle_not_found(e):
-        # If the request is for an API-like path, return JSON
         if request.path.startswith(('/api', '/get_tasks', '/progress')):
             return jsonify({'error': 'Endpoint not found'}), 404
-        # For HTML requests, redirect to home or show a simple message
         return render_template('index.html'), 404
 
-    # ---------- Webhook endpoint ----------
+    # ---------- Webhook endpoint (auto‑deploy) ----------
     @app.route('/webhook', methods=['POST'])
     def webhook():
         signature = request.headers.get('X-Hub-Signature-256')
@@ -100,6 +100,7 @@ def create_app():
     # ---------- Task endpoints ----------
     @app.route('/get_tasks', methods=['GET'])
     def get_tasks():
+        """Legacy endpoint – kept for compatibility (not used by SSE)."""
         active = []
         terminal_statuses = {'done', 'error', 'cancelled', 'search_done', 'scan_done'}
         try:
@@ -115,6 +116,33 @@ def create_app():
         except Exception as e:
             logger.error(f"Failed to list tasks: {e}")
         return jsonify(active)
+
+    # ---------- NEW: SSE stream for real‑time task updates (no polling) ----------
+    @app.route('/tasks/stream')
+    def tasks_stream():
+        def event_stream():
+            last_sent = None
+            while True:
+                # Gather current active tasks
+                active = []
+                terminal_statuses = {'done', 'error', 'cancelled', 'search_done', 'scan_done'}
+                try:
+                    for tid in get_all_task_ids():
+                        task = load_task(tid)
+                        if task and task.get('status') not in terminal_statuses:
+                            safe = {k: v for k, v in task.items() if k not in ['process_pid']}
+                            active.append(safe)
+                except Exception as e:
+                    logger.error(f"Error in SSE stream: {e}")
+                    active = []
+
+                current = json.dumps(active)
+                if current != last_sent:
+                    last_sent = current
+                    yield f"data: {current}\n\n"
+                time.sleep(1)  # lightweight check on the server
+
+        return Response(stream_with_context(event_stream()), mimetype="text/event-stream")
 
     @app.route('/progress/<task_id>', methods=['GET'])
     def progress(task_id):
@@ -173,6 +201,7 @@ def create_app():
     return app
 
 if __name__ == '__main__':
+    # Clean up stale task files
     for tid in get_all_task_ids():
         if not load_task(tid):
             try:
