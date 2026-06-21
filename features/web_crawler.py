@@ -14,26 +14,18 @@ from config import UPLOAD_FOLDER
 logger = logging.getLogger(__name__)
 
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-
-# Regex for URLs
 URL_RE = re.compile(r'(https?://[^\s<>"\']+)', re.IGNORECASE)
-# Plain domain regex (without protocol)
 PLAIN_DOMAIN_RE = re.compile(r'\b([a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?)\b')
-# IPv4 and IPv6
 IPV4_RE = re.compile(r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b')
 IPV6_RE = re.compile(r'\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b')
 
 def is_valid_url(url):
-    if not url or not isinstance(url, str):
+    if not url:
         return False
     url = url.rstrip('.,;:!?)]}')
     try:
         parsed = urlparse(url)
-        if parsed.scheme not in ('http', 'https'):
-            return False
-        if not parsed.netloc:
-            return False
-        return True
+        return parsed.scheme in ('http', 'https') and parsed.netloc
     except:
         return False
 
@@ -41,7 +33,6 @@ def normalize_url(url, base):
     try:
         if url.startswith('//'):
             url = 'https:' + url
-        url = url.rstrip('.,;:!?)]}')
         return urljoin(base, url)
     except:
         return None
@@ -55,18 +46,14 @@ def clean_domain(domain):
     if domain.startswith('www.'):
         domain = domain[4:]
     domain = domain.rstrip('.')
-    if not domain:
-        return None
-    # Filter out invalid/local domains
-    if domain in ('localhost', 'local', 'internal', 'intranet', 'router', 'gateway'):
+    if not domain or domain in ('localhost', 'local', 'internal'):
         return None
     return domain
 
 def extract_domain(url):
     try:
         parsed = urlparse(url)
-        domain = parsed.netloc.lower()
-        return clean_domain(domain)
+        return clean_domain(parsed.netloc.lower())
     except:
         return None
 
@@ -92,9 +79,7 @@ def is_same_domain(url, target_domain):
     return domain == target or domain.endswith('.' + target)
 
 def extract_urls_from_html(html, base_url):
-    """Extract all URLs from HTML using BeautifulSoup and regex fallback."""
     urls = set()
-    # Use BeautifulSoup
     soup = BeautifulSoup(html, 'html.parser')
     for tag in soup.find_all(['a', 'link', 'script', 'img', 'iframe', 'source', 'object', 'embed']):
         src = tag.get('href') or tag.get('src') or tag.get('data')
@@ -119,13 +104,11 @@ def extract_urls_from_html(html, base_url):
                     abs_url = normalize_url(val, base_url)
                     if abs_url and is_valid_url(abs_url):
                         urls.add(abs_url)
-    # Base tag
     base = soup.find('base')
     if base and base.get('href'):
         abs_url = normalize_url(base['href'], base_url)
         if abs_url and is_valid_url(abs_url):
             urls.add(abs_url)
-    # Meta tags
     for meta in soup.find_all('meta'):
         content = meta.get('content')
         if content:
@@ -134,7 +117,6 @@ def extract_urls_from_html(html, base_url):
                 abs_url = normalize_url(content, base_url)
                 if abs_url and is_valid_url(abs_url):
                     urls.add(abs_url)
-    # Inline JavaScript
     for script in soup.find_all('script'):
         if script.string:
             for match in re.finditer(r'[\'"](https?://[^\'"]+)[\'"]', script.string):
@@ -142,7 +124,7 @@ def extract_urls_from_html(html, base_url):
                 abs_url = normalize_url(url, base_url)
                 if abs_url and is_valid_url(abs_url):
                     urls.add(abs_url)
-    # Regex fallback on entire HTML text
+    # regex fallback
     for match in URL_RE.finditer(html):
         url = match.group(1).strip()
         abs_url = normalize_url(url, base_url)
@@ -159,8 +141,7 @@ def extract_ips_from_text(text):
 def extract_domains_from_text(text, base_domain=None):
     domains = set()
     for match in URL_RE.finditer(text):
-        url = match.group(1)
-        dom = extract_domain(url)
+        dom = extract_domain(match.group(1))
         if dom and dom != base_domain:
             domains.add(dom)
     for match in PLAIN_DOMAIN_RE.finditer(text):
@@ -172,26 +153,21 @@ def extract_domains_from_text(text, base_domain=None):
     return domains
 
 def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
-    # threads parameter is ignored (kept for compatibility)
     logger.info(f"Crawler task {task_id} started: {start_url}")
-
     task = load_task(task_id)
     if not task:
         logger.error(f"Task {task_id} not found")
         return
-
     target_domain = extract_domain(start_url)
     if not target_domain:
         logger.error(f"Could not extract domain from {start_url}")
         return
 
-    visited_urls = set()
-    processed_urls = set()
     all_urls = set()
     domains = set()
     ip_addresses = set()
+    processed = set()
     queue = [(start_url, 0)]
-    visited_urls.add(start_url)
     all_urls.add(start_url)
     dom = extract_domain(start_url)
     if dom:
@@ -217,12 +193,12 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
 
     while queue and (pages_visited < max_pages or max_pages == 0):
         url, depth = queue.pop(0)
-        if url in processed_urls:
+        if url in processed:
             continue
-        processed_urls.add(url)
+        processed.add(url)
         current_url = url
 
-        # Update task with current URL
+        # update current URL
         task = load_task(task_id)
         if task:
             task['current_url'] = current_url
@@ -237,17 +213,14 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
             text = resp.text
             logger.info(f"Fetched {url} (status {resp.status_code}, type {content_type}, length {len(text)})")
 
-            # Extract IPs
             ips = extract_ips_from_text(text)
             ip_addresses.update(ips)
 
-            # Extract URLs
+            extracted_urls = set()
             if 'text/html' in content_type:
                 extracted_urls = extract_urls_from_html(text, url)
                 domains.update(extract_domains_from_text(text, target_domain))
             elif 'text/css' in content_type:
-                extracted_urls = extract_urls_from_css(text, url)   # not defined here, but we'll inline CSS extraction
-                # We'll add a simple CSS extraction inline
                 for match in re.finditer(r'url\([\'"]?([^\'"\)]+)[\'"]?\)', text):
                     u = match.group(1).strip()
                     if u and not u.startswith('data:') and not u.startswith('#'):
@@ -256,40 +229,26 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
                             extracted_urls.add(abs_u)
                 domains.update(extract_domains_from_text(text, target_domain))
             elif 'application/javascript' in content_type or 'text/javascript' in content_type:
-                extracted_urls = set()
                 for match in re.finditer(r'[\'"](https?://[^\'"]+)[\'"]', text):
                     u = match.group(1).strip()
                     abs_u = normalize_url(u, url)
                     if abs_u and is_valid_url(abs_u):
                         extracted_urls.add(abs_u)
                 domains.update(extract_domains_from_text(text, target_domain))
-            elif 'application/json' in content_type:
-                extracted_urls = set()
-                domains.update(extract_domains_from_text(text, target_domain))
-            elif 'text/xml' in content_type or 'application/xml' in content_type:
-                extracted_urls = set()
-                domains.update(extract_domains_from_text(text, target_domain))
-            elif 'text/plain' in content_type:
-                extracted_urls = set()
-                domains.update(extract_domains_from_text(text, target_domain))
             else:
-                extracted_urls = set()
-                # Still extract domain from the URL itself
+                # For other content, just extract domain from the URL itself
                 dom = extract_domain(url)
                 if dom and dom != target_domain:
                     domains.add(dom)
-                # For other content, we can't parse, so just continue
                 continue
 
-            # Also add domain from this URL
+            # Add domain from current URL
             dom = extract_domain(url)
             if dom and dom != target_domain:
                 domains.add(dom)
 
-            # Process extracted URLs
             for extracted_url in extracted_urls:
-                if extracted_url not in visited_urls:
-                    visited_urls.add(extracted_url)
+                if extracted_url not in processed:
                     all_urls.add(extracted_url)
                     dom = extract_domain(extracted_url)
                     if dom and dom != target_domain:
@@ -327,7 +286,6 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
         task['last_sent_domains_count'] = len(combined)
         save_task(task_id, task)
 
-    # Save to files
     website_name = get_website_name_from_url(start_url)
     domain_filename = f"{website_name}_domains.txt"
     domain_filepath = os.path.join(UPLOAD_FOLDER, domain_filename)
@@ -360,7 +318,6 @@ def register_routes(app):
         max_depth = int(request.form.get('max_depth', 3))
         max_depth = max(1, min(max_depth, 10))
 
-        # threads parameter removed – we ignore it
         task_id = str(uuid.uuid4())
         task_data = {
             'task_id': task_id,
