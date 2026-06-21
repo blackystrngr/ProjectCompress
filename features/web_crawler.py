@@ -370,6 +370,7 @@ def register_routes(app):
                 return
 
             last_domain_count = 0
+            last_path = None
 
             while True:
                 task = load_task(task_id)
@@ -379,23 +380,33 @@ def register_routes(app):
 
                 status = task.get('status')
                 domains = task.get('domains', [])
-                new_domains = domains[last_domain_count:]
+                current_url = task.get('current_url', '')
 
-                if new_domains:
+                # Extract the path part to show ongoing directories
+                current_path = ''
+                if current_url:
+                    parsed = urlparse(current_url)
+                    current_path = parsed.path or '/'
+
+                new_domains = domains[last_domain_count:]
+                # We only send an event if there are new domains OR the path has changed
+                if new_domains or (current_path != last_path and status == 'crawling'):
                     payload = {
                         'domains': new_domains,
+                        'path': current_path,
                         'progress': task.get('progress', 0),
                         'pages': task.get('total_pages', 0)
                     }
                     yield f"event: update\ndata: {json.dumps(payload)}\n\n"
                     last_domain_count = len(domains)
+                    last_path = current_path
 
                 if status in ('done', 'cancelled', 'error'):
                     yield f"event: {status}\ndata: \n\n"
                     break
 
-                # Check every 2 seconds – only sends when new domains exist
-                time.sleep(2)
+                # Check every 5 seconds – minimal traffic
+                time.sleep(5)
 
         return Response(stream_with_context(event_generator()), mimetype="text/event-stream")
 
