@@ -20,7 +20,7 @@ function escapeHtml(str) {
 // ==================== Task Management ====================
 let pollInterval = null;
 let isPolling = false;
-const POLL_INTERVAL_MS = 5000; // 5 seconds
+const POLL_INTERVAL_MS = 5000;
 
 async function fetchTasks() {
     const container = document.getElementById('tasksContainer');
@@ -29,25 +29,17 @@ async function fetchTasks() {
         const resp = await fetch('/get_tasks');
         if (!resp.ok) throw new Error(`HTTP ${resp.status} - ${resp.statusText}`);
         const data = await resp.json();
-        console.log('fetchTasks received:', data);
-
         if (!Array.isArray(data)) {
             console.error('Invalid response: not an array', data);
             container.innerHTML = '<div class="empty-state" style="color:#ff8a8a;">⚠️ Invalid response from server.</div>';
             return;
         }
-
         const terminalStatuses = ['done', 'error', 'cancelled', 'search_done', 'scan_done'];
-        const activeTasks = data.filter(t =>
-            t && t.task_id &&
-            !terminalStatuses.includes(t.status)
-        );
-
+        const activeTasks = data.filter(t => t && t.task_id && !terminalStatuses.includes(t.status));
         if (activeTasks.length === 0) {
             container.innerHTML = '<div class="empty-state">No active tasks.</div>';
             return;
         }
-
         let html = '';
         activeTasks.forEach(task => {
             let progress = task.download_progress || task.upload_progress || task.progress || 0;
@@ -55,7 +47,6 @@ async function fetchTasks() {
             let speed = task.download_speed || 0;
             let total = task.total_size || 0;
             let downloaded = task.downloaded_size || 0;
-
             if (task.status === 'uploading') statusText = `📤 Uploading (${progress}%)`;
             else if (task.status === 'waiting_colab') statusText = `⏳ Waiting for Colab`;
             else if (task.status === 'downloading') {
@@ -73,10 +64,8 @@ async function fetchTasks() {
             else if (task.status === 'searching') statusText = `🔎 Searching (${progress}%)`;
             else if (task.status === 'testing') statusText = `🧪 Testing (${progress}%)`;
             else statusText = task.status;
-
             const taskIdShort = task.task_id.substring(0, 8);
             const fileName = task.output_file || 'downloading...';
-
             html += `<div class="task-card" data-task-id="${task.task_id}">
                         <div class="task-header">
                             <span class="task-id">${taskIdShort}</span>
@@ -94,7 +83,6 @@ async function fetchTasks() {
                     </div>`;
         });
         container.innerHTML = html;
-
         document.querySelectorAll('.cancel-task-btn').forEach(btn => {
             btn.addEventListener('click', (e) => {
                 const taskId = btn.getAttribute('data-task-id');
@@ -136,51 +124,39 @@ async function cancelTask(taskId) {
     }
 }
 
-// ==================== Tab Switching (Fixed) ====================
+// ==================== Tab Switching (Robust) ====================
 function initTabs() {
+    console.log('initTabs called');
     const tabBtns = document.querySelectorAll('.tab-btn');
     const panes = document.querySelectorAll('.tab-pane');
     if (!tabBtns.length) {
         console.warn('No tab buttons found');
         return;
     }
-
     function switchTab(tabId) {
         console.log('Switching to tab:', tabId);
-        // Update button states
         tabBtns.forEach(btn => btn.classList.remove('active'));
         const activeBtn = document.querySelector(`.tab-btn[data-tab="${tabId}"]`);
         if (activeBtn) activeBtn.classList.add('active');
-
-        // Update pane states
         panes.forEach(pane => pane.classList.remove('active'));
         const activePane = document.getElementById(`${tabId}-tab`);
         if (activePane) activePane.classList.add('active');
-
-        // Optional: refresh tab-specific data (with error handling)
+        // Optional refresh
         try {
-            if (tabId === 'local' && typeof loadDirectory === 'function') {
-                loadDirectory();
-            }
-            if (tabId === 'drive' && typeof loadDriveFiles === 'function') {
-                loadDriveFiles();
-            }
-        } catch (e) {
-            console.warn('Error refreshing tab data:', e);
-        }
+            if (tabId === 'local' && typeof loadDirectory === 'function') loadDirectory();
+            if (tabId === 'drive' && typeof loadDriveFiles === 'function') loadDriveFiles();
+        } catch (e) { console.warn('Refresh error:', e); }
     }
-
-    // Remove any old listeners and attach new ones (prevent duplicates)
+    // Remove old listeners to avoid duplicates
     tabBtns.forEach(btn => {
         btn.removeEventListener('click', btn._listener);
-        const listener = function() {
+        const listener = function(e) {
             const tabId = this.getAttribute('data-tab');
             switchTab(tabId);
         };
         btn._listener = listener;
         btn.addEventListener('click', listener);
     });
-
     // Activate the initially active tab
     const activeTab = document.querySelector('.tab-btn.active')?.getAttribute('data-tab');
     if (activeTab) {
@@ -215,21 +191,18 @@ function handleVisibilityChange() {
         stopPolling();
     } else {
         startPolling();
-        // Also re‑initialise tabs in case they were broken (optional)
-        // initTabs(); // not needed, but safe
     }
 }
 
 // ==================== Initialization ====================
 document.addEventListener('DOMContentLoaded', function() {
+    console.log('DOMContentLoaded fired');
     initTabs();
-
-    // Start polling only if tab is visible
     if (!document.hidden) {
         startPolling();
     }
     document.addEventListener('visibilitychange', handleVisibilityChange);
 });
 
-// Expose fetchTasks globally so features can refresh manually
 window.fetchTasks = fetchTasks;
+console.log('app.js loaded');
