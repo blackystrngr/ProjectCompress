@@ -1,26 +1,40 @@
+// ==================== Global Helper Functions ====================
+function showToast(message, isError = false) {
+    const toast = document.createElement('div');
+    toast.className = 'toast';
+    toast.innerHTML = `<i class="fas ${isError ? 'fa-exclamation-triangle' : 'fa-check-circle'}"></i> ${escapeHtml(message)}`;
+    document.body.appendChild(toast);
+    setTimeout(() => toast.remove(), 3000);
+}
+
+function escapeHtml(str) {
+    if (!str) return '';
+    return str.replace(/[&<>]/g, function(m) {
+        if (m === '&') return '&amp;';
+        if (m === '<') return '&lt;';
+        if (m === '>') return '&gt;';
+        return m;
+    });
+}
+
+function formatBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    const val = (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0);
+    return val + ' ' + units[i];
+}
+
+function formatSpeed(bytesPerSec) {
+    if (bytesPerSec === 0) return '0 B/s';
+    const units = ['B/s', 'KB/s', 'MB/s'];
+    const i = Math.floor(Math.log(bytesPerSec) / Math.log(1024));
+    const val = (bytesPerSec / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0);
+    return val + ' ' + units[i];
+}
+
+// ==================== Task Management with SSE ====================
 (function() {
-    'use strict';
-
-    // ==================== Toast ====================
-    function showToast(message, isError = false) {
-        const toast = document.createElement('div');
-        toast.className = 'toast';
-        toast.innerHTML = `<i class="fas ${isError ? 'fa-exclamation-triangle' : 'fa-check-circle'}"></i> ${escapeHtml(message)}`;
-        document.body.appendChild(toast);
-        setTimeout(() => toast.remove(), 3000);
-    }
-
-    function escapeHtml(str) {
-        if (!str) return '';
-        return str.replace(/[&<>]/g, function(m) {
-            if (m === '&') return '&amp;';
-            if (m === '<') return '&lt;';
-            if (m === '>') return '&gt;';
-            return m;
-        });
-    }
-
-    // ==================== Task Management with SSE ====================
     let eventSource = null;
     let reconnectAttempts = 0;
     const MAX_RECONNECT_ATTEMPTS = 5;
@@ -34,7 +48,7 @@
             try {
                 const tasks = JSON.parse(event.data);
                 renderTasks(tasks);
-                reconnectAttempts = 0; // reset on success
+                reconnectAttempts = 0;
             } catch (e) {
                 console.error('SSE parse error:', e);
             }
@@ -47,8 +61,10 @@
                 setTimeout(connectSSE, 2000 * reconnectAttempts);
             } else {
                 console.error('SSE connection failed after multiple attempts.');
-                document.getElementById('tasksContainer').innerHTML =
-                    '<div class="empty-state" style="color:#ff8a8a;">⚠️ Could not connect to task updates. Refresh the page.</div>';
+                const container = document.getElementById('tasksContainer');
+                if (container) {
+                    container.innerHTML = '<div class="empty-state" style="color:#ff8a8a;">⚠️ Could not connect to task updates. Refresh the page.</div>';
+                }
             }
         };
     }
@@ -117,22 +133,6 @@
         });
     }
 
-    function formatBytes(bytes) {
-        if (bytes === 0) return '0 B';
-        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-        const i = Math.floor(Math.log(bytes) / Math.log(1024));
-        const val = (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0);
-        return val + ' ' + units[i];
-    }
-
-    function formatSpeed(bytesPerSec) {
-        if (bytesPerSec === 0) return '0 B/s';
-        const units = ['B/s', 'KB/s', 'MB/s'];
-        const i = Math.floor(Math.log(bytesPerSec) / Math.log(1024));
-        const val = (bytesPerSec / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0);
-        return val + ' ' + units[i];
-    }
-
     async function cancelTask(taskId) {
         if (!taskId) return showToast('No task ID', true);
         try {
@@ -145,7 +145,7 @@
         }
     }
 
-    // ==================== Tab Switching ====================
+    // ==================== Tab Switching (unchanged) ====================
     function initTabs() {
         const tabBtns = document.querySelectorAll('.tab-btn');
         const panes = document.querySelectorAll('.tab-pane');
@@ -182,8 +182,7 @@
         connectSSE();
     });
 
-    // Expose for features that need manual refresh (if any)
-    window.fetchTasks = renderTasks; // only for compatibility
-
+    // Expose fetchTasks for compatibility (though not used by SSE)
+    window.fetchTasks = renderTasks;
     console.log('app.js loaded with SSE (no polling)');
 })();
