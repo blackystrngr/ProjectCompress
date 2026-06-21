@@ -1,6 +1,6 @@
 <div class="card">
     <h2><i class="fas fa-spider"></i> Recursive Domain Crawler</h2>
-    <p style="color:#8b9dc3">Grok-style low bandwidth real-time crawler</p>
+    <p style="color:#8b9dc3">Grok‑style low‑bandwidth real‑time crawler – results saved in real‑time</p>
 
     <form id="crawlerForm">
         <input type="text" id="startUrl" placeholder="https://example.com" required style="flex:1">
@@ -15,7 +15,7 @@
     <div style="margin:15px 0; display:flex; gap:15px; font-size:0.9rem; flex-wrap:wrap;">
         <span>Pages: <b id="pages">0</b></span>
         <span>Domains: <b id="count">0</b></span>
-        <span>URLs: <b id="urlsCount">0</b></span>   <!-- new -->
+        <span>URLs: <b id="urlsCount">0</b></span>
         <span>Current: <span id="path" style="color:#7cc3ff">-</span></span>
     </div>
 
@@ -23,20 +23,34 @@
     <button id="downloadBtn" style="display:none">Download Domains</button>
 
     <div id="domainList" style="margin-top:15px; max-height:500px; overflow:auto; background:#1a2033; padding:12px; border-radius:8px; font-family:monospace; font-size:0.85rem;"></div>
+
+    <hr style="margin:1.5rem 0; border-color:#2a3248;">
+
+    <!-- File management -->
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+        <h3 style="margin:0;"><i class="fas fa-files"></i> Saved Domain Files</h3>
+        <button id="refreshFilesBtn" class="primary"><i class="fas fa-sync-alt"></i> Refresh List</button>
+    </div>
+    <div id="fileList" class="file-grid empty-state" style="margin-top:1rem;">No domain files found.</div>
 </div>
 
 <script>
 let taskId = null, es = null, domains = new Set();
+let currentTaskId = null;
 
 const form = document.getElementById('crawlerForm');
 const statusEl = document.getElementById('status');
 const domainList = document.getElementById('domainList');
+const fileListDiv = document.getElementById('fileList');
 
+// ---------- Crawler control ----------
 form.addEventListener('submit', async e => {
     e.preventDefault();
     domains.clear();
     domainList.innerHTML = '';
-    
+    document.getElementById('copyBtn').style.display = 'none';
+    document.getElementById('downloadBtn').style.display = 'none';
+
     const resp = await fetch('/crawler/start', {
         method: 'POST',
         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
@@ -49,7 +63,7 @@ form.addEventListener('submit', async e => {
 
     const data = await resp.json();
     if (data.task_id) {
-        taskId = data.task_id;
+        currentTaskId = data.task_id;
         document.getElementById('cancelBtn').style.display = 'inline-block';
         connectStream();
     }
@@ -57,17 +71,17 @@ form.addEventListener('submit', async e => {
 
 function connectStream() {
     if (es) es.close();
-    es = new EventSource(`/crawler/stream/${taskId}`);
+    es = new EventSource(`/crawler/stream/${currentTaskId}`);
 
     es.addEventListener('update', e => {
         const p = JSON.parse(e.data);
         p.domains.forEach(d => domains.add(d));
-        
-        document.getElementById('pages').textContent = p.pages;
+
+        document.getElementById('pages').textContent = p.pages || 0;
         document.getElementById('count').textContent = domains.size;
-        document.getElementById('urlsCount').textContent = p.urls_count || 0;  // new
-        document.getElementById('path').textContent = p.path;
-        statusEl.textContent = `Crawling... ${p.progress}%`;
+        document.getElementById('urlsCount').textContent = p.urls_count || 0;
+        document.getElementById('path').textContent = p.path || '/';
+        statusEl.textContent = `Crawling... ${p.progress || 0}%`;
 
         if (p.domains.length) renderDomains();
     });
@@ -75,9 +89,28 @@ function connectStream() {
     es.addEventListener('done', () => {
         statusEl.innerHTML = `✅ Completed — ${domains.size} domains found`;
         document.getElementById('cancelBtn').style.display = 'none';
-        document.getElementById('copyBtn').style.display = 
+        document.getElementById('copyBtn').style.display = 'inline-block';
         document.getElementById('downloadBtn').style.display = 'inline-block';
+        loadFileList();
+        es.close();
     });
+
+    es.addEventListener('cancelled', () => {
+        statusEl.innerHTML = '⛔ Cancelled by user';
+        document.getElementById('cancelBtn').style.display = 'none';
+        es.close();
+    });
+
+    es.addEventListener('error', () => {
+        // Keep-alive pings may cause no-op errors; ignore
+    });
+
+    // Handle unexpected close
+    es.onerror = function(e) {
+        // If task is still crawling, we might reconnect; but we rely on the task status.
+        // For simplicity, we just log.
+        console.log('SSE connection closed');
+    };
 }
 
 function renderDomains() {
@@ -86,10 +119,85 @@ function renderDomains() {
     domainList.innerHTML = html;
 }
 
-document.getElementById('cancelBtn').onclick = () => fetch(`/crawler/cancel/${taskId}`, {method:'POST'});
-document.getElementById('copyBtn').onclick = () => {
-    navigator.clipboard.writeText([...domains].join('\n'));
-    alert('Copied!');
+document.getElementById('cancelBtn').onclick = () => {
+    if (currentTaskId) {
+        fetch(`/crawler/cancel/${currentTaskId}`, {method:'POST'});
+        statusEl.innerHTML = '⛔ Cancellation requested...';
+        document.getElementById('cancelBtn').style.display = 'none';
+    }
 };
-document.getElementById('downloadBtn').onclick = () => window.open(`/crawler/download_domains/${taskId}`);
+
+document.getElementById('copyBtn').onclick = () => {
+    if (domains.size === 0) {
+        alert('No domains to copy');
+        return;
+    }
+    const text = [...domains].join('\n');
+    navigator.clipboard.writeText(text).then(() => alert('Copied!'));
+};
+
+document.getElementById('downloadBtn').onclick = () => {
+    if (currentTaskId) {
+        window.open(`/crawler/download_domains/${currentTaskId}`);
+    }
+};
+
+// ---------- File list management ----------
+async function loadFileList() {
+    try {
+        const resp = await fetch('/crawler/list_files');
+        const files = await resp.json();
+        if (files.length === 0) {
+            fileListDiv.innerHTML = '<div class="empty-state">No domain files saved yet.</div>';
+            return;
+        }
+        let html = '';
+        files.forEach(f => {
+            const sizeStr = f.size_str || formatBytes(f.size);
+            const mtime = new Date(f.mtime * 1000).toLocaleString();
+            html += `<div class="file-card">
+                        <div class="file-name"><i class="fas fa-file-alt"></i> ${escapeHtml(f.name)}</div>
+                        <div class="file-size">${sizeStr} · ${mtime}</div>
+                        <div class="file-actions">
+                            <a href="/crawler/download_domains_by_filename?filename=${encodeURIComponent(f.path)}" target="_blank"><i class="fas fa-download"></i> Download</a>
+                            <button class="view-file-btn" data-filename="${escapeHtml(f.path)}"><i class="fas fa-eye"></i> View</button>
+                        </div>
+                    </div>`;
+        });
+        fileListDiv.innerHTML = html;
+        document.querySelectorAll('.view-file-btn').forEach(btn => {
+            btn.onclick = () => {
+                const name = btn.dataset.filename;
+                window.open(`/crawler/view/${encodeURIComponent(name)}`, '_blank');
+            };
+        });
+    } catch (err) {
+        fileListDiv.innerHTML = `<div class="empty-state" style="color:#ff8a8a;">Error loading files: ${err.message}</div>`;
+    }
+}
+
+// Helper to format bytes
+function formatBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    const val = (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0);
+    return val + ' ' + units[i];
+}
+
+// Escape HTML (fallback if not defined globally)
+function escapeHtml(str) {
+    if (!str) return '';
+    return str.replace(/[&<>]/g, function(m) {
+        if (m === '&') return '&amp;';
+        if (m === '<') return '&lt;';
+        if (m === '>') return '&gt;';
+        return m;
+    });
+}
+
+document.getElementById('refreshFilesBtn').addEventListener('click', loadFileList);
+
+// Load files on page load
+loadFileList();
 </script>
