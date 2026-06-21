@@ -1,3 +1,4 @@
+// ==================== IIFE: isolate all variables ====================
 (function() {
     'use strict';
 
@@ -23,7 +24,7 @@
     // ==================== Task Management ====================
     let pollInterval = null;
     let isPolling = false;
-    const POLL_INTERVAL_MS = 5000;
+    const POLL_INTERVAL_MS = 10000; // 10 seconds – reduce bandwidth
 
     async function fetchTasks() {
         const container = document.getElementById('tasksContainer');
@@ -34,7 +35,7 @@
             const data = await resp.json();
             if (!Array.isArray(data)) {
                 console.error('Invalid response: not an array', data);
-                container.innerHTML = '<div class="empty-state" style="color:#ff8a8a;">⚠️ Invalid response from server.</div>';
+                container.innerHTML = '<div class="empty-state" style="color:#ff8a8a;">⚠️ Invalid response.</div>';
                 return;
             }
             const terminalStatuses = ['done', 'error', 'cancelled', 'search_done', 'scan_done'];
@@ -94,7 +95,7 @@
             });
         } catch (err) {
             console.error('fetchTasks error:', err);
-            container.innerHTML = `<div class="empty-state" style="color:#ff8a8a;">⚠️ Failed to load tasks. ${err.message}</div>`;
+            container.innerHTML = `<div class="empty-state" style="color:#ff8a8a;">⚠️ ${escapeHtml(err.message)}</div>`;
         }
     }
 
@@ -144,12 +145,12 @@
             panes.forEach(pane => pane.classList.remove('active'));
             const activePane = document.getElementById(`${tabId}-tab`);
             if (activePane) activePane.classList.add('active');
+            // Optional refresh
             try {
                 if (tabId === 'local' && typeof loadDirectory === 'function') loadDirectory();
                 if (tabId === 'drive' && typeof loadDriveFiles === 'function') loadDriveFiles();
             } catch (e) { console.warn('Refresh error:', e); }
         }
-        // Remove old listeners to avoid duplicates
         tabBtns.forEach(btn => {
             btn.removeEventListener('click', btn._listener);
             const listener = function(e) {
@@ -159,7 +160,6 @@
             btn._listener = listener;
             btn.addEventListener('click', listener);
         });
-        // Activate the initially active tab
         const activeTab = document.querySelector('.tab-btn.active')?.getAttribute('data-tab');
         if (activeTab) {
             switchTab(activeTab);
@@ -173,8 +173,8 @@
     function startPolling() {
         if (isPolling) return;
         isPolling = true;
-        console.log('Task polling started (every 5s)');
-        fetchTasks();
+        console.log('Task polling started (every 10s)');
+        fetchTasks(); // immediate first fetch
         pollInterval = setInterval(fetchTasks, POLL_INTERVAL_MS);
     }
 
@@ -205,7 +205,8 @@
         document.addEventListener('visibilitychange', handleVisibilityChange);
     });
 
-    // Expose fetchTasks globally so other scripts can trigger refresh
+    // Expose fetchTasks so that feature scripts can manually refresh
     window.fetchTasks = fetchTasks;
     console.log('app.js loaded (IIFE)');
-})();
+
+})(); // end IIFE
