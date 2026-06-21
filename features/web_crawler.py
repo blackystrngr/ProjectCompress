@@ -18,7 +18,7 @@ USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 IPV4_RE = re.compile(r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b')
 IPV6_RE = re.compile(r'\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b')
 
-# Media/script extensions – we never treat these as domains
+# Extensions to skip (never treat as domains)
 SKIP_EXTENSIONS = {
     '.jpg', '.jpeg', '.png', '.gif', '.svg', '.ico', '.webp', '.bmp',
     '.mp4', '.webm', '.mkv', '.avi', '.mov', '.flv',
@@ -36,14 +36,13 @@ SKIP_EXTENSIONS = {
 }
 
 # ---------------------------------------------------------------------
-# STRICT DOMAIN VALIDATION – only for domains from full URLs
+# STRICT DOMAIN VALIDATION
 # ---------------------------------------------------------------------
 
 def is_valid_domain(domain):
     if not domain or not isinstance(domain, str):
         return False
     domain = domain.lower().strip()
-
     if '.' not in domain:
         return False
     if re.match(r'^\d+\.\d+\.\d+\.\d+$', domain):
@@ -53,12 +52,9 @@ def is_valid_domain(domain):
     for ext in SKIP_EXTENSIONS:
         if domain.endswith(ext):
             return False
-
-    # Must match standard domain pattern
     pattern = re.compile(r'^([a-z0-9]([a-z0-9-]*[a-z0-9])?)\.([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)*[a-z]{2,}$')
     if not pattern.match(domain):
         return False
-
     parts = domain.split('.')
     if len(parts) < 2 or len(parts[0]) < 2:
         return False
@@ -133,7 +129,6 @@ def is_same_domain(url, target_domain):
     return domain == target or domain.endswith('.' + target)
 
 def extract_urls_from_html(html, base_url):
-    """Extract all absolute URLs from HTML tags – this is the only source of domains."""
     urls = set()
     soup = BeautifulSoup(html, 'html.parser')
     for tag in soup.find_all(['a', 'link', 'script', 'img', 'iframe', 'source', 'object', 'embed']):
@@ -172,7 +167,6 @@ def extract_urls_from_html(html, base_url):
                 abs_url = normalize_url(content, base_url)
                 if abs_url and is_valid_url(abs_url):
                     urls.add(abs_url)
-    # Also scan inline script tags for URLs (they may contain http://...)
     for script in soup.find_all('script'):
         if script.string:
             for match in re.finditer(r'[\'"](https?://[^\'"]+)[\'"]', script.string):
@@ -189,7 +183,7 @@ def extract_ips_from_text(text):
     return ips
 
 # ---------------------------------------------------------------------
-# MAIN CRAWLER – ONLY FETCHES HTML
+# MAIN CRAWLER – CHECKS CANCELLATION EVERYWHERE
 # ---------------------------------------------------------------------
 
 def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
@@ -232,10 +226,10 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
     session.timeout = (10, 20)
 
     while queue and (pages_visited < max_pages or max_pages == 0):
-        # Check cancellation
+        # ---- CHECK CANCELLATION ----
         task = load_task(task_id)
         if task and task.get('cancelled', False):
-            logger.info(f"Task {task_id} cancelled by user")
+            logger.info(f"Task {task_id} cancelled by user (before processing queue)")
             task['status'] = 'cancelled'
             save_task(task_id, task)
             return
@@ -252,6 +246,14 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
             task['current_url'] = current_url
             save_task(task_id, task)
 
+        # ---- CHECK CANCELLATION AGAIN ----
+        task = load_task(task_id)
+        if task and task.get('cancelled', False):
+            logger.info(f"Task {task_id} cancelled by user (before fetching)")
+            task['status'] = 'cancelled'
+            save_task(task_id, task)
+            return
+
         try:
             resp = session.get(url, allow_redirects=True, timeout=15)
             if resp.status_code != 200:
@@ -261,24 +263,20 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
             text = resp.text
             logger.info(f"Fetched {url} (status {resp.status_code}, type {content_type}, length {len(text)})")
 
-            # Skip non‑HTML pages (CSS, JS, images, etc.)
+            # Only process HTML
             if 'text/html' not in content_type:
                 logger.info(f"Skipping non‑HTML content: {content_type}")
                 continue
 
-            # Extract IPs (optional)
             ips = extract_ips_from_text(text)
             ip_addresses.update(ips)
 
-            # Extract URLs from HTML – this is the only source for domains
             extracted_urls = extract_urls_from_html(text, url)
 
-            # Extract domain from the current URL itself
             dom = extract_domain(url)
             if dom and dom != target_domain:
                 domains.add(dom)
 
-            # Process extracted URLs
             for extracted_url in extracted_urls:
                 if extracted_url not in processed:
                     all_urls.add(extracted_url)
@@ -334,7 +332,7 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
     logger.info(f"Crawler {task_id} finished: {len(all_urls)} URLs, {len(combined)} domains/IPs")
 
 # ---------------------------------------------------------------------
-# FLASK ROUTES (unchanged)
+# FLASK ROUTES
 # ---------------------------------------------------------------------
 
 def register_routes(app):
