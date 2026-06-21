@@ -26,7 +26,7 @@
         <div style="display:flex; gap:1rem; flex-wrap:wrap; margin-bottom:1rem;">
             <span><strong>Current:</strong> <span id="currentUrl" style="color:#80b3ff;">-</span></span>
             <span><strong>Pages visited:</strong> <span id="pagesVisited">0</span></span>
-            <span><strong>Unique URLs:</strong> <span id="urlCount">0</span></span>
+            <span><strong>Discovered URLs:</strong> <span id="urlCount">0</span></span>
             <span><strong>Domains / IPs:</strong> <span id="domainCount">0</span></span>
             <span><strong>Last update:</strong> <span id="lastUpdate">-</span></span>
         </div>
@@ -39,7 +39,7 @@
 
         <div style="display:flex; gap:2rem; flex-wrap:wrap;">
             <div style="flex:1; min-width:300px;">
-                <h4>Discovered URLs</h4>
+                <h4>Discovered URLs <span id="urlTotalNote" style="font-weight:normal; color:#aaa;"></span></h4>
                 <div id="urlList" style="max-height:400px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem; font-family:monospace; font-size:0.8rem; white-space:pre-wrap; word-break:break-all;">
                     <div class="empty-state">No URLs yet.</div>
                 </div>
@@ -84,6 +84,7 @@
     const lastUpdateSpan = document.getElementById('lastUpdate');
     const urlListDiv = document.getElementById('urlList');
     const domainListDiv = document.getElementById('domainList');
+    const urlTotalNote = document.getElementById('urlTotalNote');
     const copyDomainsBtn = document.getElementById('copyDomainsBtn');
     const downloadDomainsBtn = document.getElementById('downloadDomainsBtn');
     const downloadUrlsBtn = document.getElementById('downloadUrlsBtn');
@@ -93,7 +94,11 @@
 
     let currentTaskId = null;
     let pollInterval = null;
-    const POLL_INTERVAL_MS = 30000; // 30 seconds – drastically reduce data usage
+    const POLL_INTERVAL_MS = 30000; // 30 seconds
+
+    // Store all discovered items to append new ones
+    let allUrls = [];
+    let allDomains = [];
 
     // Toggle bruteforce options
     enableBfCheck.addEventListener('change', function() {
@@ -114,10 +119,9 @@
         }
     });
 
-    // Manual refresh
     refreshBtn.addEventListener('click', function() {
         if (currentTaskId) {
-            pollCrawler(); // fetch immediately
+            pollCrawler();
         } else {
             showToast('No active crawl to refresh.', true);
         }
@@ -136,6 +140,10 @@
         const extensions = extensionsInput.value.trim() || '.php,.html,.txt';
         const threadsBf = parseInt(threadsBfInput.value) || 20;
 
+        // Reset stored lists for new crawl
+        allUrls = [];
+        allDomains = [];
+
         try {
             const resp = await fetch('/crawler/start', {
                 method: 'POST',
@@ -153,13 +161,13 @@
             domainCountSpan.textContent = '0';
             currentUrlSpan.textContent = '-';
             lastUpdateSpan.textContent = '-';
+            urlTotalNote.textContent = '';
             copyDomainsBtn.style.display = 'none';
             downloadDomainsBtn.style.display = 'none';
             downloadUrlsBtn.style.display = 'none';
             cancelBtn.style.display = 'inline-flex';
             if (pollInterval) clearInterval(pollInterval);
             pollInterval = setInterval(pollCrawler, POLL_INTERVAL_MS);
-            // Immediate first fetch
             pollCrawler();
         } catch (err) {
             showToast(err.message, true);
@@ -180,30 +188,51 @@
             const status = data.status;
             const progress = data.progress || 0;
             const totalPages = data.total_pages || 0;
-            const urls = data.discovered_urls || [];
-            const domains = data.domains || [];
+            const newUrls = data.new_urls || [];
+            const newDomains = data.new_domains || [];
+            const totalUrls = data.total_urls || 0;
+            const totalDomains = data.total_domains || 0;
             const currentUrl = data.current_url || '-';
+
+            // Append new items
+            allUrls = allUrls.concat(newUrls);
+            allDomains = allDomains.concat(newDomains);
+
+            // Remove duplicates (just in case)
+            allUrls = [...new Set(allUrls)];
+            allDomains = [...new Set(allDomains)];
 
             currentUrlSpan.textContent = currentUrl;
             pagesVisitedSpan.textContent = totalPages;
-            urlCountSpan.textContent = urls.length;
-            domainCountSpan.textContent = domains.length;
+            urlCountSpan.textContent = allUrls.length;
+            domainCountSpan.textContent = allDomains.length;
             lastUpdateSpan.textContent = new Date().toLocaleTimeString();
 
-            if (urls.length > 0) {
+            // Show total if truncated
+            if (totalUrls > allUrls.length) {
+                urlTotalNote.textContent = `(showing ${allUrls.length} of ${totalUrls})`;
+            } else {
+                urlTotalNote.textContent = '';
+            }
+
+            // Render URL list (show all, but limit display for performance)
+            if (allUrls.length > 0) {
                 let html = '';
-                urls.slice(0, 200).forEach(u => {
+                const displayUrls = allUrls.slice(0, 200);
+                displayUrls.forEach(u => {
                     html += `<div style="font-size:0.8rem; padding:2px 0; border-bottom:1px solid #2a3248; word-break:break-all;">${escapeHtml(u)}</div>`;
                 });
-                if (urls.length > 200) html += `<div style="color:#aaa; font-size:0.8rem;">... and ${urls.length - 200} more</div>`;
+                if (allUrls.length > 200) {
+                    html += `<div style="color:#aaa; font-size:0.8rem;">... and ${allUrls.length - 200} more</div>`;
+                }
                 urlListDiv.innerHTML = html;
             } else {
                 urlListDiv.innerHTML = '<div class="empty-state">No URLs yet.</div>';
             }
 
-            if (domains.length > 0) {
+            if (allDomains.length > 0) {
                 let html = '';
-                domains.forEach(d => {
+                allDomains.forEach(d => {
                     html += `<div style="font-size:0.8rem; padding:2px 0; border-bottom:1px solid #2a3248;">${escapeHtml(d)}</div>`;
                 });
                 domainListDiv.innerHTML = html;
@@ -213,7 +242,7 @@
 
             if (status === 'done') {
                 clearInterval(pollInterval);
-                statusDiv.innerHTML = `✅ Crawling completed. Found ${urls.length} unique URLs and ${domains.length} domains/IPs.`;
+                statusDiv.innerHTML = `✅ Crawling completed. Found ${allUrls.length} unique URLs and ${allDomains.length} domains/IPs.`;
                 cancelBtn.style.display = 'none';
                 copyDomainsBtn.style.display = 'inline-flex';
                 downloadDomainsBtn.style.display = 'inline-flex';
@@ -225,9 +254,9 @@
                     window.open(`/crawler/download_domains/${currentTaskId}`, '_blank');
                 };
                 copyDomainsBtn.onclick = () => {
-                    const text = domains.join('\n');
+                    const text = allDomains.join('\n');
                     navigator.clipboard.writeText(text).then(() => {
-                        showToast(`Copied ${domains.length} domains/IPs`);
+                        showToast(`Copied ${allDomains.length} domains/IPs`);
                     }).catch(() => {
                         const textarea = document.createElement('textarea');
                         textarea.value = text;
