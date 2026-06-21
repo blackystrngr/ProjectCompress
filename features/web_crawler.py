@@ -202,7 +202,7 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
     task['max_pages'] = max_pages
     task['max_depth'] = max_depth
     task['discovered_urls'] = list(all_urls)
-    task['domains'] = list(domains)
+    task['domains'] = sorted(domains)  # SORTED
     task['current_url'] = current_url
     task['last_sent_count'] = 0
     task['last_sent_domains_count'] = 0
@@ -276,7 +276,7 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
                 task['progress'] = int(100 * pages_visited / max_pages) if max_pages > 0 else 0
                 task['total_pages'] = pages_visited
                 task['discovered_urls'] = list(all_urls)
-                task['domains'] = list(domains | ip_addresses)
+                task['domains'] = sorted(domains | ip_addresses)   # SORTED
                 task['current_url'] = current_url
                 save_task(task_id, task)
 
@@ -291,7 +291,7 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
         task['progress'] = 100
         task['total_pages'] = pages_visited
         task['discovered_urls'] = list(all_urls)
-        task['domains'] = list(combined)
+        task['domains'] = sorted(combined)   # SORTED
         task['current_url'] = None
         task['last_sent_count'] = len(all_urls)
         task['last_sent_domains_count'] = len(combined)
@@ -369,7 +369,6 @@ def register_routes(app):
                 yield "event: error\ndata: Task not found\n\n"
                 return
 
-            # Always start from the last sent count stored in the task
             last_domain_count = task.get('last_sent_domains_count', 0)
             last_path = None
 
@@ -388,8 +387,9 @@ def register_routes(app):
                     parsed = urlparse(current_url)
                     current_path = parsed.path or '/'
 
-                # Only send if there are new domains OR path changed
                 new_domains = domains[last_domain_count:]
+
+                # Send only when there are new domains OR path changed significantly
                 if new_domains or (current_path != last_path and status == 'crawling'):
                     payload = {
                         'domains': new_domains,
@@ -398,7 +398,6 @@ def register_routes(app):
                         'pages': task.get('total_pages', 0)
                     }
                     yield f"event: update\ndata: {json.dumps(payload)}\n\n"
-                    # Update the sent count in the task itself
                     if new_domains:
                         last_domain_count = len(domains)
                         task['last_sent_domains_count'] = last_domain_count
@@ -409,7 +408,7 @@ def register_routes(app):
                     yield f"event: {status}\ndata: \n\n"
                     break
 
-                time.sleep(5)  # 5 seconds between checks
+                time.sleep(5)
 
         return Response(stream_with_context(event_generator()), mimetype="text/event-stream")
 
