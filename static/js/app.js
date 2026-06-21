@@ -1,4 +1,3 @@
-// ==================== IIFE: isolate all variables ====================
 (function() {
     'use strict';
 
@@ -21,82 +20,101 @@
         });
     }
 
-    // ==================== Task Management ====================
-    let pollInterval = null;
-    let isPolling = false;
-    const POLL_INTERVAL_MS = 10000; // 10 seconds – reduce bandwidth
+    // ==================== Task Management with SSE ====================
+    let eventSource = null;
+    let reconnectAttempts = 0;
+    const MAX_RECONNECT_ATTEMPTS = 5;
 
-    async function fetchTasks() {
+    function connectSSE() {
+        if (eventSource) {
+            eventSource.close();
+        }
+        eventSource = new EventSource('/tasks/stream');
+        eventSource.onmessage = function(event) {
+            try {
+                const tasks = JSON.parse(event.data);
+                renderTasks(tasks);
+                reconnectAttempts = 0; // reset on success
+            } catch (e) {
+                console.error('SSE parse error:', e);
+            }
+        };
+        eventSource.onerror = function(e) {
+            console.warn('SSE connection error, reconnecting...', e);
+            eventSource.close();
+            if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                reconnectAttempts++;
+                setTimeout(connectSSE, 2000 * reconnectAttempts);
+            } else {
+                console.error('SSE connection failed after multiple attempts.');
+                document.getElementById('tasksContainer').innerHTML =
+                    '<div class="empty-state" style="color:#ff8a8a;">⚠️ Could not connect to task updates. Refresh the page.</div>';
+            }
+        };
+    }
+
+    function renderTasks(tasks) {
         const container = document.getElementById('tasksContainer');
         if (!container) return;
-        try {
-            const resp = await fetch('/get_tasks');
-            if (!resp.ok) throw new Error(`HTTP ${resp.status} - ${resp.statusText}`);
-            const data = await resp.json();
-            if (!Array.isArray(data)) {
-                console.error('Invalid response: not an array', data);
-                container.innerHTML = '<div class="empty-state" style="color:#ff8a8a;">⚠️ Invalid response.</div>';
-                return;
-            }
-            const terminalStatuses = ['done', 'error', 'cancelled', 'search_done', 'scan_done'];
-            const activeTasks = data.filter(t => t && t.task_id && !terminalStatuses.includes(t.status));
-            if (activeTasks.length === 0) {
-                container.innerHTML = '<div class="empty-state">No active tasks.</div>';
-                return;
-            }
-            let html = '';
-            activeTasks.forEach(task => {
-                let progress = task.download_progress || task.upload_progress || task.progress || 0;
-                let statusText = task.status;
-                let speed = task.download_speed || 0;
-                let total = task.total_size || 0;
-                let downloaded = task.downloaded_size || 0;
-                if (task.status === 'uploading') statusText = `📤 Uploading (${progress}%)`;
-                else if (task.status === 'waiting_colab') statusText = `⏳ Waiting for Colab`;
-                else if (task.status === 'downloading') {
-                    let speedDisplay = speed > 0 ? ` (${formatSpeed(speed * 1024)})` : '';
-                    let sizeDisplay = total > 0 ? ` ${formatBytes(downloaded)} / ${formatBytes(total)}` : ` ${formatBytes(downloaded)}`;
-                    statusText = `📥 Downloading${sizeDisplay}${speedDisplay}`;
-                } else if (task.status === 'done') statusText = `✅ Done`;
-                else if (task.status === 'error') statusText = `❌ Error`;
-                else if (task.status === 'cancelled') statusText = `⛔ Cancelled`;
-                else if (task.status === 'detecting_scenes') statusText = `🎬 Detecting scenes (${progress}%)`;
-                else if (task.status === 'clipping') statusText = `✂️ Clipping (${progress}%)`;
-                else if (task.status === 'merging') statusText = `🔗 Merging (${progress}%)`;
-                else if (task.status === 'ytdlp_extract') statusText = `🔍 Extracting (${progress}%)`;
-                else if (task.status === 'fetching') statusText = `🌐 Fetching (${progress}%)`;
-                else if (task.status === 'searching') statusText = `🔎 Searching (${progress}%)`;
-                else if (task.status === 'testing') statusText = `🧪 Testing (${progress}%)`;
-                else statusText = task.status;
-                const taskIdShort = task.task_id.substring(0, 8);
-                const fileName = task.output_file || 'downloading...';
-                html += `<div class="task-card" data-task-id="${task.task_id}">
-                            <div class="task-header">
-                                <span class="task-id">${taskIdShort}</span>
-                                <span class="task-status">${statusText}</span>
-                            </div>
-                            <div style="font-size:0.8rem; margin-bottom:0.2rem;">${escapeHtml(fileName)}</div>
-                            <div class="progress-bar"><div class="progress-fill" style="width: ${progress}%"></div></div>
-                            <div style="display: flex; justify-content: flex-end; gap: 0.5rem;">
-                                ${(task.status !== 'done' && task.status !== 'error' && task.status !== 'cancelled') ?
-                                    `<button class="cancel-task-btn" data-task-id="${task.task_id}" style="background:#3a2e2e; padding:0.2rem 0.8rem;"><i class="fas fa-ban"></i> Cancel</button>` : ''}
-                                ${task.status === 'done' && task.output_file ?
-                                    `<a href="/download/${task.output_file}" style="background:#2b8c5e; padding:0.2rem 0.8rem; text-decoration:none; color:white; border-radius:2rem;"><i class="fas fa-download"></i> Result</a>` : ''}
-                            </div>
-                            ${task.error_msg ? `<div style="font-size:0.7rem; color:#ff8a8a; margin-top:0.3rem;">${escapeHtml(task.error_msg)}</div>` : ''}
-                        </div>`;
-            });
-            container.innerHTML = html;
-            document.querySelectorAll('.cancel-task-btn').forEach(btn => {
-                btn.addEventListener('click', (e) => {
-                    const taskId = btn.getAttribute('data-task-id');
-                    if (taskId) cancelTask(taskId);
-                });
-            });
-        } catch (err) {
-            console.error('fetchTasks error:', err);
-            container.innerHTML = `<div class="empty-state" style="color:#ff8a8a;">⚠️ ${escapeHtml(err.message)}</div>`;
+        if (!Array.isArray(tasks) || tasks.length === 0) {
+            container.innerHTML = '<div class="empty-state">No active tasks.</div>';
+            return;
         }
+        const terminalStatuses = ['done', 'error', 'cancelled', 'search_done', 'scan_done'];
+        const activeTasks = tasks.filter(t => t && t.task_id && !terminalStatuses.includes(t.status));
+        if (activeTasks.length === 0) {
+            container.innerHTML = '<div class="empty-state">No active tasks.</div>';
+            return;
+        }
+        let html = '';
+        activeTasks.forEach(task => {
+            let progress = task.download_progress || task.upload_progress || task.progress || 0;
+            let statusText = task.status;
+            let speed = task.download_speed || 0;
+            let total = task.total_size || 0;
+            let downloaded = task.downloaded_size || 0;
+            if (task.status === 'uploading') statusText = `📤 Uploading (${progress}%)`;
+            else if (task.status === 'waiting_colab') statusText = `⏳ Waiting for Colab`;
+            else if (task.status === 'downloading') {
+                let speedDisplay = speed > 0 ? ` (${formatSpeed(speed * 1024)})` : '';
+                let sizeDisplay = total > 0 ? ` ${formatBytes(downloaded)} / ${formatBytes(total)}` : ` ${formatBytes(downloaded)}`;
+                statusText = `📥 Downloading${sizeDisplay}${speedDisplay}`;
+            } else if (task.status === 'done') statusText = `✅ Done`;
+            else if (task.status === 'error') statusText = `❌ Error`;
+            else if (task.status === 'cancelled') statusText = `⛔ Cancelled`;
+            else if (task.status === 'detecting_scenes') statusText = `🎬 Detecting scenes (${progress}%)`;
+            else if (task.status === 'clipping') statusText = `✂️ Clipping (${progress}%)`;
+            else if (task.status === 'merging') statusText = `🔗 Merging (${progress}%)`;
+            else if (task.status === 'ytdlp_extract') statusText = `🔍 Extracting (${progress}%)`;
+            else if (task.status === 'fetching') statusText = `🌐 Fetching (${progress}%)`;
+            else if (task.status === 'searching') statusText = `🔎 Searching (${progress}%)`;
+            else if (task.status === 'testing') statusText = `🧪 Testing (${progress}%)`;
+            else statusText = task.status;
+            const taskIdShort = task.task_id.substring(0, 8);
+            const fileName = task.output_file || 'downloading...';
+            html += `<div class="task-card" data-task-id="${task.task_id}">
+                        <div class="task-header">
+                            <span class="task-id">${taskIdShort}</span>
+                            <span class="task-status">${statusText}</span>
+                        </div>
+                        <div style="font-size:0.8rem; margin-bottom:0.2rem;">${escapeHtml(fileName)}</div>
+                        <div class="progress-bar"><div class="progress-fill" style="width: ${progress}%"></div></div>
+                        <div style="display: flex; justify-content: flex-end; gap: 0.5rem;">
+                            ${(task.status !== 'done' && task.status !== 'error' && task.status !== 'cancelled') ?
+                                `<button class="cancel-task-btn" data-task-id="${task.task_id}" style="background:#3a2e2e; padding:0.2rem 0.8rem;"><i class="fas fa-ban"></i> Cancel</button>` : ''}
+                            ${task.status === 'done' && task.output_file ?
+                                `<a href="/download/${task.output_file}" style="background:#2b8c5e; padding:0.2rem 0.8rem; text-decoration:none; color:white; border-radius:2rem;"><i class="fas fa-download"></i> Result</a>` : ''}
+                        </div>
+                        ${task.error_msg ? `<div style="font-size:0.7rem; color:#ff8a8a; margin-top:0.3rem;">${escapeHtml(task.error_msg)}</div>` : ''}
+                    </div>`;
+        });
+        container.innerHTML = html;
+        document.querySelectorAll('.cancel-task-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                const taskId = btn.getAttribute('data-task-id');
+                if (taskId) cancelTask(taskId);
+            });
+        });
     }
 
     function formatBytes(bytes) {
@@ -122,7 +140,6 @@
             const data = await resp.json();
             if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
             showToast(`Cancelling task ${taskId.substring(0,8)}`);
-            fetchTasks();
         } catch (err) {
             showToast(err.message, true);
         }
@@ -130,30 +147,24 @@
 
     // ==================== Tab Switching ====================
     function initTabs() {
-        console.log('initTabs called');
         const tabBtns = document.querySelectorAll('.tab-btn');
         const panes = document.querySelectorAll('.tab-pane');
-        if (!tabBtns.length) {
-            console.warn('No tab buttons found');
-            return;
-        }
+        if (!tabBtns.length) return;
         function switchTab(tabId) {
-            console.log('Switching to tab:', tabId);
             tabBtns.forEach(btn => btn.classList.remove('active'));
             const activeBtn = document.querySelector(`.tab-btn[data-tab="${tabId}"]`);
             if (activeBtn) activeBtn.classList.add('active');
             panes.forEach(pane => pane.classList.remove('active'));
             const activePane = document.getElementById(`${tabId}-tab`);
             if (activePane) activePane.classList.add('active');
-            // Optional refresh
             try {
                 if (tabId === 'local' && typeof loadDirectory === 'function') loadDirectory();
                 if (tabId === 'drive' && typeof loadDriveFiles === 'function') loadDriveFiles();
-            } catch (e) { console.warn('Refresh error:', e); }
+            } catch (e) { /* ignore */ }
         }
         tabBtns.forEach(btn => {
             btn.removeEventListener('click', btn._listener);
-            const listener = function(e) {
+            const listener = function() {
                 const tabId = this.getAttribute('data-tab');
                 switchTab(tabId);
             };
@@ -161,52 +172,18 @@
             btn.addEventListener('click', listener);
         });
         const activeTab = document.querySelector('.tab-btn.active')?.getAttribute('data-tab');
-        if (activeTab) {
-            switchTab(activeTab);
-        } else if (tabBtns.length) {
-            const firstTab = tabBtns[0].getAttribute('data-tab');
-            switchTab(firstTab);
-        }
-    }
-
-    // ==================== Polling with Visibility API ====================
-    function startPolling() {
-        if (isPolling) return;
-        isPolling = true;
-        console.log('Task polling started (every 10s)');
-        fetchTasks(); // immediate first fetch
-        pollInterval = setInterval(fetchTasks, POLL_INTERVAL_MS);
-    }
-
-    function stopPolling() {
-        if (pollInterval) {
-            clearInterval(pollInterval);
-            pollInterval = null;
-            isPolling = false;
-            console.log('Task polling stopped (tab hidden)');
-        }
-    }
-
-    function handleVisibilityChange() {
-        if (document.hidden) {
-            stopPolling();
-        } else {
-            startPolling();
-        }
+        if (activeTab) switchTab(activeTab);
+        else if (tabBtns.length) switchTab(tabBtns[0].getAttribute('data-tab'));
     }
 
     // ==================== Initialization ====================
     document.addEventListener('DOMContentLoaded', function() {
-        console.log('DOMContentLoaded fired');
         initTabs();
-        if (!document.hidden) {
-            startPolling();
-        }
-        document.addEventListener('visibilitychange', handleVisibilityChange);
+        connectSSE();
     });
 
-    // Expose fetchTasks so that feature scripts can manually refresh
-    window.fetchTasks = fetchTasks;
-    console.log('app.js loaded (IIFE)');
+    // Expose for features that need manual refresh (if any)
+    window.fetchTasks = renderTasks; // only for compatibility
 
-})(); // end IIFE
+    console.log('app.js loaded with SSE (no polling)');
+})();
