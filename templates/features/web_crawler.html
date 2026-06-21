@@ -1,6 +1,6 @@
 <div class="card">
     <h2><i class="fas fa-spider"></i> Recursive Domain Crawler</h2>
-    <p>Recursively crawl a domain – real‑time updates with minimal bandwidth.</p>
+    <p>Recursively crawl a domain – real‑time updates with minimal bandwidth. Only domains/IPs are shown.</p>
     <form id="crawlerForm">
         <div class="input-group">
             <input type="text" id="startUrl" placeholder="https://example.com" required>
@@ -16,28 +16,18 @@
         <div style="display:flex; gap:1rem; flex-wrap:wrap; margin-bottom:1rem;">
             <span><strong>Current:</strong> <span id="currentUrl" style="color:#80b3ff;">-</span></span>
             <span><strong>Pages visited:</strong> <span id="pagesVisited">0</span></span>
-            <span><strong>Discovered URLs:</strong> <span id="urlCount">0</span></span>
             <span><strong>Domains / IPs:</strong> <span id="domainCount">0</span></span>
         </div>
         <div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-bottom:1rem;">
             <button id="copyDomainsBtn" class="primary" style="display:none;"><i class="fas fa-copy"></i> Copy Domains / IPs</button>
             <button id="downloadDomainsBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download Domains / IPs</button>
-            <button id="downloadUrlsBtn" class="primary" style="display:none;"><i class="fas fa-download"></i> Download URLs</button>
             <button id="showSavedBtn" class="primary"><i class="fas fa-folder-open"></i> Show Saved Files</button>
         </div>
 
-        <div style="display:flex; gap:2rem; flex-wrap:wrap;">
-            <div style="flex:1; min-width:300px;">
-                <h4>Discovered URLs</h4>
-                <div id="urlList" style="max-height:400px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem; font-family:monospace; font-size:0.8rem; white-space:pre-wrap; word-break:break-all;">
-                    <div class="empty-state">No URLs yet.</div>
-                </div>
-            </div>
-            <div style="flex:1; min-width:200px;">
-                <h4>Domains & IPs</h4>
-                <div id="domainList" style="max-height:400px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem; font-family:monospace; font-size:0.8rem; white-space:pre-wrap; word-break:break-all;">
-                    <div class="empty-state">No domains/IPs yet.</div>
-                </div>
+        <div style="flex:1; min-width:200px;">
+            <h4>Domains & IPs</h4>
+            <div id="domainList" style="max-height:400px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem; font-family:monospace; font-size:0.8rem; white-space:pre-wrap; word-break:break-all;">
+                <div class="empty-state">No domains/IPs yet.</div>
             </div>
         </div>
 
@@ -61,40 +51,17 @@
     const statusDiv = document.getElementById('crawlerStatus');
     const currentUrlSpan = document.getElementById('currentUrl');
     const pagesVisitedSpan = document.getElementById('pagesVisited');
-    const urlCountSpan = document.getElementById('urlCount');
     const domainCountSpan = document.getElementById('domainCount');
-    const urlListDiv = document.getElementById('urlList');
     const domainListDiv = document.getElementById('domainList');
     const copyDomainsBtn = document.getElementById('copyDomainsBtn');
     const downloadDomainsBtn = document.getElementById('downloadDomainsBtn');
-    const downloadUrlsBtn = document.getElementById('downloadUrlsBtn');
     const showSavedBtn = document.getElementById('showSavedBtn');
     const savedFilesSection = document.getElementById('savedFilesSection');
     const savedFilesList = document.getElementById('savedFilesList');
 
     let currentTaskId = null;
     let eventSource = null;
-    let allUrls = [];
     let allDomains = [];
-
-    // Helper to append new items to the list
-    function appendUrls(newUrls) {
-        if (!newUrls || newUrls.length === 0) return;
-        allUrls = allUrls.concat(newUrls);
-        // Remove duplicates (though server sends only new ones)
-        allUrls = [...new Set(allUrls)];
-        // Render only up to 200 for performance
-        let html = '';
-        const display = allUrls.slice(0, 200);
-        display.forEach(u => {
-            html += `<div style="font-size:0.8rem; padding:2px 0; border-bottom:1px solid #2a3248; word-break:break-all;">${escapeHtml(u)}</div>`;
-        });
-        if (allUrls.length > 200) {
-            html += `<div style="color:#aaa; font-size:0.8rem;">... and ${allUrls.length - 200} more</div>`;
-        }
-        urlListDiv.innerHTML = html;
-        urlCountSpan.textContent = allUrls.length;
-    }
 
     function appendDomains(newDomains) {
         if (!newDomains || newDomains.length === 0) return;
@@ -111,7 +78,7 @@
     cancelBtn.addEventListener('click', async function() {
         if (currentTaskId) {
             try {
-                const resp = await fetch(`/cancel/${currentTaskId}`, { method: 'POST' });
+                const resp = await fetch(`/crawler/cancel/${currentTaskId}`, { method: 'POST' });
                 const data = await resp.json();
                 if (data.error) throw new Error(data.error);
                 showToast('Cancelling crawl...');
@@ -131,17 +98,13 @@
         const maxPages = parseInt(maxPagesInput.value) || 0;
         const maxDepth = parseInt(maxDepthInput.value) || 3;
 
-        allUrls = [];
         allDomains = [];
-        urlListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
         domainListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
         pagesVisitedSpan.textContent = '0';
-        urlCountSpan.textContent = '0';
         domainCountSpan.textContent = '0';
         currentUrlSpan.textContent = '-';
         copyDomainsBtn.style.display = 'none';
         downloadDomainsBtn.style.display = 'none';
-        downloadUrlsBtn.style.display = 'none';
         cancelBtn.style.display = 'inline-flex';
         statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Starting...';
 
@@ -155,13 +118,11 @@
             if (data.error) throw new Error(data.error);
             currentTaskId = data.task_id;
 
-            // Open SSE connection
             if (eventSource) eventSource.close();
             eventSource = new EventSource(`/crawler/stream/${currentTaskId}`);
 
             eventSource.addEventListener('update', function(event) {
                 const payload = JSON.parse(event.data);
-                appendUrls(payload.new_urls);
                 appendDomains(payload.new_domains);
                 pagesVisitedSpan.textContent = payload.pages || 0;
                 currentUrlSpan.textContent = payload.current_url || '-';
@@ -169,14 +130,10 @@
             });
 
             eventSource.addEventListener('done', function(event) {
-                statusDiv.innerHTML = `✅ Crawling completed. Found ${allUrls.length} unique URLs and ${allDomains.length} domains/IPs.`;
+                statusDiv.innerHTML = `✅ Crawling completed. Found ${allDomains.length} domains/IPs.`;
                 cancelBtn.style.display = 'none';
                 copyDomainsBtn.style.display = 'inline-flex';
                 downloadDomainsBtn.style.display = 'inline-flex';
-                downloadUrlsBtn.style.display = 'inline-flex';
-                downloadUrlsBtn.onclick = () => {
-                    window.open(`/crawler/download_urls/${currentTaskId}`, '_blank');
-                };
                 downloadDomainsBtn.onclick = () => {
                     window.open(`/crawler/download_domains/${currentTaskId}`, '_blank');
                 };
@@ -204,8 +161,6 @@
             });
 
             eventSource.addEventListener('error', function(event) {
-                // If the stream closes unexpectedly, try to reconnect? 
-                // But we'll just show an error.
                 if (eventSource.readyState === EventSource.CLOSED) {
                     statusDiv.innerHTML = '❌ Connection lost. Please refresh.';
                     cancelBtn.style.display = 'none';
@@ -218,7 +173,6 @@
     });
 
     showSavedBtn.addEventListener('click', async function() {
-        // same as before
         try {
             const resp = await fetch('/crawler/list_files');
             const files = await resp.json();
