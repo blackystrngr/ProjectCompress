@@ -6,6 +6,7 @@ import time
 import logging
 import requests
 from urllib.parse import urljoin, urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import request, jsonify, send_file
 from bs4 import BeautifulSoup
 from tasks import save_task, load_task
@@ -15,25 +16,82 @@ logger = logging.getLogger(__name__)
 
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 
-# Regex to extract URLs from CSS (url(...))
+# Regex for CSS url(...)
 CSS_URL_RE = re.compile(r'url\([\'"]?([^\'"\)]+)[\'"]?\)', re.IGNORECASE)
-
-# Regex for simple JS string URLs (optional)
 JS_URL_RE = re.compile(r'[\'"](https?://[^\'"]+)[\'"]', re.IGNORECASE)
+IPV4_RE = re.compile(r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b')
+IPV6_RE = re.compile(r'\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b')
+
+# Default wordlist and extensions for bruteforce
+DEFAULT_WORDLIST = [
+    'admin', 'backup', 'config', 'wp-admin', 'wp-content', 'wp-includes',
+    'uploads', 'images', 'css', 'js', 'assets', 'static', 'media',
+    'data', 'logs', 'tmp', 'temp', 'cache', 'sessions', 'cgi-bin',
+    'includes', 'lib', 'modules', 'plugins', 'themes', 'vendor',
+    'robots.txt', 'sitemap.xml', 'sitemap_index.xml', 'sitemap.xml.gz',
+    'humans.txt', 'crossdomain.xml', 'phpinfo.php', 'phpmyadmin',
+    'mysql', 'database', 'sql', 'dump', 'backup.sql', 'config.php',
+    'config.inc.php', 'settings.php', 'wp-config.php', '.env',
+    '.htaccess', '.htpasswd', 'server-status', 'server-info',
+    'phpinfo', 'test', 'example', 'demo', 'sample',
+    'index.php', 'index.html', 'default.php', 'default.html',
+    'home', 'main', 'public', 'private', 'restricted', 'secure',
+    'user', 'users', 'profile', 'account', 'login', 'register',
+    'contact', 'about', 'help', 'faq', 'support', 'terms', 'privacy',
+    'dashboard', 'control', 'panel', 'manage', 'adminer',
+]
+
+DEFAULT_EXTENSIONS = [
+    '.php', '.html', '.txt', '.log', '.bak', '.old', '.zip', '.tar.gz',
+    '.sql', '.env', '.ini', '.xml', '.json', '.yml', '.yaml', '.conf',
+    '.config', '.htaccess', '.htpasswd', '.inc', '.class', '.js', '.css',
+    '.jpg', '.png', '.gif', '.ico', '.svg', '.webp', '.woff', '.woff2',
+    '.ttf', '.eot'
+]
 
 def is_valid_url(url):
-    parsed = urlparse(url)
-    return parsed.scheme in ('http', 'https') and parsed.netloc
+    if not url or not isinstance(url, str):
+        return False
+    url = url.rstrip('.,;:!?)]}')
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https'):
+            return False
+        if not parsed.netloc:
+            return False
+        return True
+    except:
+        return False
 
 def normalize_url(url, base):
     try:
+        if url.startswith('//'):
+            url = 'https:' + url
+        url = url.rstrip('.,;:!?)]}')
         return urljoin(base, url)
     except:
         return None
 
+def clean_domain(domain):
+    if not domain:
+        return None
+    domain = domain.lower()
+    if ':' in domain:
+        domain = domain.split(':')[0]
+    if domain.startswith('www.'):
+        domain = domain[4:]
+    domain = domain.rstrip('.')
+    if not domain:
+        return None
+    return domain
+
 def extract_domain(url):
-    parsed = urlparse(url)
-    return parsed.netloc
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        return clean_domain(domain)
+    except:
+        return None
 
 def get_website_name_from_url(url):
     parsed = urlparse(url)
@@ -49,6 +107,8 @@ def is_same_domain(url, target_domain):
     domain = parsed.netloc.lower()
     if domain.startswith('www.'):
         domain = domain[4:]
+    if ':' in domain:
+        domain = domain.split(':')[0]
     return domain == target_domain or domain.endswith('.' + target_domain)
 
 def extract_urls_from_html(html, base_url):
@@ -60,7 +120,6 @@ def extract_urls_from_html(html, base_url):
             abs_url = normalize_url(src, base_url)
             if abs_url and is_valid_url(abs_url):
                 urls.add(abs_url)
-    # Also parse srcset
     for tag in soup.find_all(['img', 'source']):
         srcset = tag.get('srcset')
         if srcset:
@@ -68,16 +127,15 @@ def extract_urls_from_html(html, base_url):
                 part = part.strip().split(' ')[0]
                 if part:
                     abs_url = normalize_url(part, base_url)
-                    if abs_url:
+                    if abs_url and is_valid_url(abs_url):
                         urls.add(abs_url)
-    # data-* attributes with URLs
     for tag in soup.find_all():
         for attr in tag.attrs:
-            if attr.startswith('data-') and 'src' in attr:
+            if attr.startswith('data-') and ('src' in attr or 'url' in attr):
                 val = tag.get(attr)
-                if val and (val.startswith('http') or val.startswith('/')):
+                if val and isinstance(val, str) and (val.startswith('http') or val.startswith('/')):
                     abs_url = normalize_url(val, base_url)
-                    if abs_url:
+                    if abs_url and is_valid_url(abs_url):
                         urls.add(abs_url)
     return urls
 
@@ -87,14 +145,13 @@ def extract_urls_from_css(css_text, base_url):
         url = match.group(1).strip()
         if url and not url.startswith('data:') and not url.startswith('#'):
             abs_url = normalize_url(url, base_url)
-            if abs_url:
+            if abs_url and is_valid_url(abs_url):
                 urls.add(abs_url)
-    # @import rules
     import_re = re.compile(r'@import\s+[\'"]([^\'"]+)[\'"]', re.IGNORECASE)
     for match in import_re.finditer(css_text):
         url = match.group(1).strip()
         abs_url = normalize_url(url, base_url)
-        if abs_url:
+        if abs_url and is_valid_url(abs_url):
             urls.add(abs_url)
     return urls
 
@@ -103,21 +160,67 @@ def extract_urls_from_js(js_text, base_url):
     for match in JS_URL_RE.finditer(js_text):
         url = match.group(1).strip()
         abs_url = normalize_url(url, base_url)
-        if abs_url:
+        if abs_url and is_valid_url(abs_url):
             urls.add(abs_url)
     return urls
 
-def extract_domains_from_text(text):
+def extract_ips_from_text(text):
+    ips = set()
+    ips.update(IPV4_RE.findall(text))
+    ips.update(IPV6_RE.findall(text))
+    return ips
+
+def extract_domains_from_text(text, base_domain=None):
     domain_pattern = re.compile(r'(https?://[^\s<>"\']+)', re.IGNORECASE)
     domains = set()
     for match in domain_pattern.finditer(text):
         url = match.group(1)
         dom = extract_domain(url)
-        if dom:
+        if dom and dom != base_domain:
             domains.add(dom)
     return domains
 
-def run_crawler(task_id, start_url, max_pages, max_depth):
+def fetch_and_extract(url, session, processed, target_domain, all_urls, domains, ip_addresses, queue, max_depth, depth):
+    if url in processed:
+        return
+    processed.add(url)
+    try:
+        resp = session.get(url, allow_redirects=True, timeout=15)
+        if resp.status_code != 200:
+            return
+        content_type = resp.headers.get('content-type', '').lower()
+        text = resp.text
+        ips = extract_ips_from_text(text)
+        ip_addresses.update(ips)
+        extracted_urls = set()
+        if 'text/html' in content_type:
+            extracted_urls = extract_urls_from_html(text, url)
+            domains.update(extract_domains_from_text(text, target_domain))
+        elif 'text/css' in content_type:
+            extracted_urls = extract_urls_from_css(text, url)
+            domains.update(extract_domains_from_text(text, target_domain))
+        elif 'application/javascript' in content_type or 'text/javascript' in content_type:
+            extracted_urls = extract_urls_from_js(text, url)
+            domains.update(extract_domains_from_text(text, target_domain))
+        else:
+            dom = extract_domain(url)
+            if dom and dom != target_domain:
+                domains.add(dom)
+            return
+        dom = extract_domain(url)
+        if dom and dom != target_domain:
+            domains.add(dom)
+        for extracted_url in extracted_urls:
+            all_urls.add(extracted_url)
+            dom = extract_domain(extracted_url)
+            if dom and dom != target_domain:
+                domains.add(dom)
+            if is_same_domain(extracted_url, target_domain) and depth + 1 <= max_depth:
+                queue.append((extracted_url, depth + 1))
+    except Exception as e:
+        logger.warning(f"Failed to fetch {url}: {e}")
+
+def run_crawler(task_id, start_url, max_pages, max_depth, enable_bruteforce, wordlist, extensions, threads):
     logger.info(f"Crawler task {task_id} started: {start_url}")
 
     task = load_task(task_id)
@@ -126,18 +229,25 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
         return
 
     target_domain = extract_domain(start_url)
-    visited = set()          # URLs already fetched (queued or processed)
-    processed_urls = set()   # URLs that have been fetched and parsed
-    all_urls = set()         # all discovered URLs (internal and external)
+    if not target_domain:
+        logger.error(f"Could not extract domain from {start_url}")
+        return
+
+    visited_urls = set()
+    processed_urls = set()
+    all_urls = set()
     domains = set()
+    ip_addresses = set()
     queue = [(start_url, 0)]
-    visited.add(start_url)
+    visited_urls.add(start_url)
     all_urls.add(start_url)
-    domains.add(extract_domain(start_url))
+    dom = extract_domain(start_url)
+    if dom:
+        domains.add(dom)
     pages_visited = 0
     current_url = start_url
 
-    task['status'] = 'running'
+    task['status'] = 'crawling'
     task['progress'] = 0
     task['total_pages'] = 0
     task['max_pages'] = max_pages
@@ -145,120 +255,150 @@ def run_crawler(task_id, start_url, max_pages, max_depth):
     task['discovered_urls'] = list(all_urls)
     task['domains'] = list(domains)
     task['current_url'] = current_url
+    task['enable_bruteforce'] = enable_bruteforce
+    task['last_sent_count'] = 0
+    task['last_sent_domains_count'] = 0
     save_task(task_id, task)
 
     session = requests.Session()
     session.headers.update({'User-Agent': USER_AGENT})
     session.timeout = (10, 20)
 
-    try:
-        while queue and (pages_visited < max_pages or max_pages == 0):
-            url, depth = queue.pop(0)
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        futures = set()
+        def submit_task(url, depth):
             if url in processed_urls:
-                continue
+                return
             processed_urls.add(url)
-            current_url = url
+            future = executor.submit(fetch_and_extract, url, session, processed_urls, target_domain, all_urls, domains, ip_addresses, queue, max_depth, depth)
+            futures.add(future)
 
-            task = load_task(task_id)
-            if task:
-                task['current_url'] = current_url
-                save_task(task_id, task)
+        submit_task(start_url, 0)
 
-            try:
-                resp = session.get(url, allow_redirects=True, timeout=15)
-                if resp.status_code != 200:
+        while queue or futures:
+            while queue and len(futures) < threads:
+                url, depth = queue.pop(0)
+                if url in processed_urls:
                     continue
-                content_type = resp.headers.get('content-type', '').lower()
-                text = resp.text
-            except Exception as e:
-                logger.warning(f"Failed to fetch {url}: {e}")
-                continue
+                submit_task(url, depth)
 
-            # Extract URLs based on content type
-            extracted_urls = set()
-            if 'text/html' in content_type:
-                extracted_urls = extract_urls_from_html(text, url)
-                # Also extract domains from HTML text (e.g., inline JS)
-                domains.update(extract_domains_from_text(text))
-            elif 'text/css' in content_type:
-                extracted_urls = extract_urls_from_css(text, url)
-                domains.update(extract_domains_from_text(text))
-            elif 'application/javascript' in content_type or 'text/javascript' in content_type:
-                extracted_urls = extract_urls_from_js(text, url)
-                domains.update(extract_domains_from_text(text))
-            else:
-                # For images/fonts/etc., we still might want to extract domain from the URL itself
-                dom = extract_domain(url)
-                if dom:
-                    domains.add(dom)
-                continue
+            done = set()
+            for future in futures:
+                if future.done():
+                    done.add(future)
+            for future in done:
+                futures.remove(future)
 
-            pages_visited += 1
-
-            # Process all extracted URLs
-            for extracted_url in extracted_urls:
-                if extracted_url not in visited:
-                    visited.add(extracted_url)
-                    all_urls.add(extracted_url)
-                    # If same domain (including subdomains), add to queue
-                    if is_same_domain(extracted_url, target_domain):
-                        if depth + 1 <= max_depth:
-                            queue.append((extracted_url, depth + 1))
-                    # Extract domain
-                    dom = extract_domain(extracted_url)
-                    if dom:
-                        domains.add(dom)
-
-            # Update progress every few pages
+            pages_visited = len(processed_urls)
             if pages_visited % 5 == 0:
                 task = load_task(task_id)
-                if not task:
-                    break
-                task['progress'] = int(100 * pages_visited / max_pages) if max_pages > 0 else 0
-                task['total_pages'] = pages_visited
-                task['discovered_urls'] = list(all_urls)
-                task['domains'] = list(domains)
-                task['current_url'] = current_url
-                save_task(task_id, task)
+                if task:
+                    task['progress'] = int(100 * pages_visited / max_pages) if max_pages > 0 else 0
+                    task['total_pages'] = pages_visited
+                    task['discovered_urls'] = list(all_urls)
+                    task['domains'] = list(domains | ip_addresses)
+                    task['current_url'] = current_url
+                    save_task(task_id, task)
 
             task = load_task(task_id)
             if task and task.get('cancelled', False):
-                logger.info(f"Crawler {task_id} cancelled")
-                break
+                logger.info(f"Task {task_id} cancelled")
+                executor.shutdown(wait=False)
+                return
 
-        # Done – save results
+            time.sleep(0.05)
+
+    # Bruteforce phase (if enabled)
+    if enable_bruteforce and not load_task(task_id).get('cancelled', False):
+        logger.info(f"Starting bruteforce for {task_id}")
         task = load_task(task_id)
         if task:
-            task['status'] = 'done'
-            task['progress'] = 100
-            task['total_pages'] = pages_visited
-            task['discovered_urls'] = list(all_urls)
-            task['domains'] = list(domains)
-            task['current_url'] = None
+            task['status'] = 'bruteforcing'
             save_task(task_id, task)
 
-            website_name = get_website_name_from_url(start_url)
-            domain_filename = f"{website_name}_domains.txt"
-            domain_filepath = os.path.join(UPLOAD_FOLDER, domain_filename)
-            with open(domain_filepath, 'w') as f:
-                f.write('\n'.join(sorted(domains)))
-            logger.info(f"Domains saved to {domain_filename}")
+        base_url = start_url if start_url.endswith('/') else start_url + '/'
+        bf_session = requests.Session()
+        bf_session.headers.update({'User-Agent': USER_AGENT})
+        bf_session.timeout = (5, 10)
 
-            urls_filename = f"crawled_urls_{task_id[:8]}.txt"
-            urls_filepath = os.path.join(UPLOAD_FOLDER, urls_filename)
-            with open(urls_filepath, 'w') as f:
-                f.write('\n'.join(sorted(all_urls)))
+        paths = []
+        for word in wordlist:
+            paths.append(word + '/')
+            for ext in extensions:
+                paths.append(word + ext)
 
-            logger.info(f"Crawler {task_id} finished: {len(all_urls)} URLs, {len(domains)} domains")
+        bf_total = len(paths)
+        bf_checked = 0
 
-    except Exception as e:
-        logger.exception(f"Crawler {task_id} failed")
-        task = load_task(task_id)
-        if task:
-            task['status'] = 'error'
-            task['error_msg'] = str(e)
-            task['current_url'] = None
-            save_task(task_id, task)
+        def check_path(path):
+            full_url = normalize_url(path, base_url)
+            if not full_url:
+                return None
+            try:
+                resp = bf_session.head(full_url, allow_redirects=True, timeout=5)
+                if resp.status_code in (200, 301, 302, 403, 401):
+                    return full_url, resp.status_code
+                return None
+            except:
+                return None
+
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            futures = {executor.submit(check_path, p): p for p in paths}
+            for future in as_completed(futures):
+                if load_task(task_id).get('cancelled', False):
+                    executor.shutdown(wait=False)
+                    break
+                result = future.result()
+                bf_checked += 1
+                if result:
+                    full_url, status = result[0], result[1]
+                    all_urls.add(full_url)
+                    dom = extract_domain(full_url)
+                    if dom and dom != target_domain:
+                        domains.add(dom)
+                    if any(full_url.endswith(ext) for ext in ['.css', '.js', '.json', '.xml', '.txt', '.php', '.html']):
+                        try:
+                            resp = bf_session.get(full_url, timeout=10)
+                            if resp.status_code == 200:
+                                text = resp.text
+                                domains.update(extract_domains_from_text(text, target_domain))
+                        except:
+                            pass
+                if bf_checked % 50 == 0:
+                    task = load_task(task_id)
+                    if task:
+                        task['progress'] = 50 + int(25 * bf_checked / bf_total) if bf_total > 0 else 0
+                        task['discovered_urls'] = list(all_urls)
+                        task['domains'] = list(domains | ip_addresses)
+                        save_task(task_id, task)
+
+    # Done
+    combined = set(domains) | set(ip_addresses)
+    task = load_task(task_id)
+    if task:
+        task['status'] = 'done'
+        task['progress'] = 100
+        task['total_pages'] = len(processed_urls)
+        task['discovered_urls'] = list(all_urls)
+        task['domains'] = list(combined)
+        task['current_url'] = None
+        task['last_sent_count'] = len(all_urls)  # final sync
+        task['last_sent_domains_count'] = len(combined)
+        save_task(task_id, task)
+
+    website_name = get_website_name_from_url(start_url)
+    domain_filename = f"{website_name}_domains.txt"
+    domain_filepath = os.path.join(UPLOAD_FOLDER, domain_filename)
+    with open(domain_filepath, 'w') as f:
+        f.write('\n'.join(sorted(combined)))
+    logger.info(f"Domains/IPs saved to {domain_filename}")
+
+    urls_filename = f"crawled_urls_{task_id[:8]}.txt"
+    urls_filepath = os.path.join(UPLOAD_FOLDER, urls_filename)
+    with open(urls_filepath, 'w') as f:
+        f.write('\n'.join(sorted(all_urls)))
+
+    logger.info(f"Crawler {task_id} finished: {len(all_urls)} URLs, {len(combined)} domains/IPs")
 
 def register_routes(app):
     @app.route('/crawler/start', methods=['POST'])
@@ -271,12 +411,26 @@ def register_routes(app):
 
         max_pages = int(request.form.get('max_pages', 0))
         if max_pages == 0:
-            max_pages = 999999  # practically unlimited
+            max_pages = 999999
         else:
             max_pages = max(1, min(max_pages, 5000))
 
         max_depth = int(request.form.get('max_depth', 3))
         max_depth = max(1, min(max_depth, 10))
+
+        enable_bruteforce = request.form.get('enable_bruteforce', 'false').lower() == 'true'
+        wordlist_raw = request.form.get('wordlist', '').strip()
+        if wordlist_raw:
+            wordlist = [w.strip() for w in wordlist_raw.split(',') if w.strip()]
+        else:
+            wordlist = DEFAULT_WORDLIST
+        extensions_raw = request.form.get('extensions', '').strip()
+        if extensions_raw:
+            extensions = [e.strip() for e in extensions_raw.split(',') if e.strip()]
+        else:
+            extensions = DEFAULT_EXTENSIONS
+        threads = int(request.form.get('threads', 20))
+        threads = max(1, min(threads, 50))
 
         task_id = str(uuid.uuid4())
         task_data = {
@@ -288,15 +442,21 @@ def register_routes(app):
             'start_url': start_url,
             'max_pages': max_pages,
             'max_depth': max_depth,
+            'enable_bruteforce': enable_bruteforce,
+            'wordlist': wordlist,
+            'extensions': extensions,
+            'threads': threads,
             'total_pages': 0,
             'discovered_urls': [],
             'domains': [],
             'current_url': None,
             'error_msg': None,
+            'last_sent_count': 0,
+            'last_sent_domains_count': 0,
         }
         save_task(task_id, task_data)
 
-        threading.Thread(target=run_crawler, args=(task_id, start_url, max_pages, max_depth), daemon=True).start()
+        threading.Thread(target=run_crawler, args=(task_id, start_url, max_pages, max_depth, enable_bruteforce, wordlist, extensions, threads), daemon=True).start()
         return jsonify({'task_id': task_id})
 
     @app.route('/crawler/status/<task_id>')
@@ -304,16 +464,33 @@ def register_routes(app):
         task = load_task(task_id)
         if not task:
             return jsonify({'error': 'Task not found'}), 404
+
+        urls = task.get('discovered_urls', [])
+        domains = task.get('domains', [])
+        last_url_count = task.get('last_sent_count', 0)
+        last_domain_count = task.get('last_sent_domains_count', 0)
+
+        new_urls = urls[last_url_count:]
+        new_domains = domains[last_domain_count:]
+
+        # Update counters
+        task['last_sent_count'] = len(urls)
+        task['last_sent_domains_count'] = len(domains)
+        save_task(task_id, task)
+
         return jsonify({
             'status': task.get('status'),
             'progress': task.get('progress', 0),
             'total_pages': task.get('total_pages', 0),
             'max_pages': task.get('max_pages', 0),
             'max_depth': task.get('max_depth', 0),
-            'discovered_urls': task.get('discovered_urls', []),
-            'domains': task.get('domains', []),
+            'new_urls': new_urls,
+            'new_domains': new_domains,
+            'total_urls': len(urls),
+            'total_domains': len(domains),
             'current_url': task.get('current_url'),
             'error_msg': task.get('error_msg'),
+            'enable_bruteforce': task.get('enable_bruteforce', False),
         })
 
     @app.route('/crawler/download_urls/<task_id>')
@@ -347,11 +524,11 @@ def register_routes(app):
                 f.write('\n'.join(sorted(domains)))
         return send_file(filepath, as_attachment=True, download_name=filename)
 
-    @app.route('/crawler/list_domain_files')
-    def crawler_list_domain_files():
+    @app.route('/crawler/list_files')
+    def crawler_list_files():
         files = []
         for f in os.listdir(UPLOAD_FOLDER):
-            if f.endswith('_domains.txt'):
+            if f.endswith('_domains.txt') or f.endswith('_urls.txt'):
                 files.append({
                     'name': f,
                     'path': f,
