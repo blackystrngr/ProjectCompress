@@ -1,23 +1,15 @@
 <div class="card">
-    <h2><i class="fas fa-spider"></i> Recursive Domain Crawler (Multi‑threaded)</h2>
-    <p>Starting from a URL, recursively fetch every page, CSS, JS, and other resources on the same domain (including subdomains) until exhausted. Extracts domains and IP addresses.</p>
+    <h2><i class="fas fa-spider"></i> Recursive Domain Crawler</h2>
+    <p>Recursively crawl a domain, fetch every page, CSS, JS, and other resources, and extract all domains and IP addresses.</p>
     <form id="crawlerForm">
         <div class="input-group">
             <input type="text" id="startUrl" placeholder="https://example.com" required>
             <input type="number" id="maxPages" placeholder="Max pages (0 = unlimited)" value="0" min="0" style="width:140px;">
             <input type="number" id="maxDepth" placeholder="Max depth" value="3" min="1" max="10" style="width:120px;">
             <input type="number" id="threads" placeholder="Threads" value="20" min="1" max="50" style="width:80px;">
-            <label style="display:flex; align-items:center; gap:0.5rem;">
-                <input type="checkbox" id="enableBruteforce"> <span style="font-size:0.8rem;">Bruteforce</span>
-            </label>
             <button type="submit" class="primary"><i class="fas fa-play"></i> Start Crawl</button>
             <button type="button" id="cancelBtn" class="danger" style="display:none;"><i class="fas fa-stop"></i> Cancel</button>
             <button type="button" id="refreshBtn" class="primary"><i class="fas fa-sync-alt"></i> Refresh</button>
-        </div>
-        <div id="bfOptions" style="display:none; margin-top:0.5rem; flex-wrap:wrap; gap:0.5rem; align-items:center;">
-            <input type="text" id="wordlist" placeholder="Custom wordlist (comma separated)" style="flex:2; min-width:200px;">
-            <input type="text" id="extensions" placeholder="Extensions" value=".php,.html,.txt,.log,.bak,.old,.zip,.tar.gz,.sql,.env,.ini,.xml,.json,.yml,.yaml,.conf,.config,.htaccess,.htpasswd,.inc,.class,.js,.css,.jpg,.png,.gif,.ico,.svg,.webp,.woff,.woff2,.ttf,.eot" style="flex:2; min-width:200px;">
-            <input type="number" id="threadsBf" placeholder="Threads" value="20" style="width:80px;">
         </div>
         <div id="crawlerStatus" class="help-text"></div>
     </form>
@@ -64,17 +56,11 @@
 
 <script>
 (function() {
-    console.log('web_crawler.js loaded');
     const form = document.getElementById('crawlerForm');
     const startUrlInput = document.getElementById('startUrl');
     const maxPagesInput = document.getElementById('maxPages');
     const maxDepthInput = document.getElementById('maxDepth');
     const threadsInput = document.getElementById('threads');
-    const enableBfCheck = document.getElementById('enableBruteforce');
-    const bfOptions = document.getElementById('bfOptions');
-    const wordlistInput = document.getElementById('wordlist');
-    const extensionsInput = document.getElementById('extensions');
-    const threadsBfInput = document.getElementById('threadsBf');
     const cancelBtn = document.getElementById('cancelBtn');
     const refreshBtn = document.getElementById('refreshBtn');
     const statusDiv = document.getElementById('crawlerStatus');
@@ -95,14 +81,10 @@
 
     let currentTaskId = null;
     let pollInterval = null;
-    const POLL_INTERVAL_MS = 30000;
+    const POLL_INTERVAL_MS = 30000; // 30 seconds
 
     let allUrls = [];
     let allDomains = [];
-
-    enableBfCheck.addEventListener('change', function() {
-        bfOptions.style.display = this.checked ? 'flex' : 'none';
-    });
 
     cancelBtn.addEventListener('click', async function() {
         if (currentTaskId) {
@@ -134,10 +116,6 @@
         const maxPages = parseInt(maxPagesInput.value) || 0;
         const maxDepth = parseInt(maxDepthInput.value) || 3;
         const threads = parseInt(threadsInput.value) || 20;
-        const enableBf = enableBfCheck.checked;
-        const wordlist = wordlistInput.value.trim() || '';
-        const extensions = extensionsInput.value.trim() || '.php,.html,.txt';
-        const threadsBf = parseInt(threadsBfInput.value) || 20;
 
         allUrls = [];
         allDomains = [];
@@ -146,7 +124,7 @@
             const resp = await fetch('/crawler/start', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                body: `start_url=${encodeURIComponent(startUrl)}&max_pages=${maxPages}&max_depth=${maxDepth}&threads=${threads}&enable_bruteforce=${enableBf}&wordlist=${encodeURIComponent(wordlist)}&extensions=${encodeURIComponent(extensions)}&threads=${threadsBf}`
+                body: `start_url=${encodeURIComponent(startUrl)}&max_pages=${maxPages}&max_depth=${maxDepth}&threads=${threads}`
             });
             const data = await resp.json();
             if (data.error) throw new Error(data.error);
