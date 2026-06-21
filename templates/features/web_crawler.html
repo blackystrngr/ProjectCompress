@@ -1,6 +1,6 @@
 <div class="card">
     <h2><i class="fas fa-spider"></i> Recursive Domain Crawler</h2>
-    <p>Real‑time domain discovery – updates every 5 seconds, low bandwidth.</p>
+    <p>Real‑time domain discovery – updates every 5 seconds, minimal bandwidth. Duplicates are automatically ignored.</p>
     <form id="crawlerForm">
         <div class="input-group">
             <input type="text" id="startUrl" placeholder="https://example.com" required>
@@ -59,27 +59,68 @@
     const savedFilesSection = document.getElementById('savedFilesSection');
     const savedFilesList = document.getElementById('savedFilesList');
 
+    // ---------- state ----------
     let currentTaskId = null;
     let eventSource = null;
-    let allDomains = [];
+    // Use a Set to automatically deduplicate domains
+    let allDomains = new Set();
 
-    function appendDomains(newDomains) {
-        if (!newDomains || newDomains.length === 0) return;
-        allDomains = allDomains.concat(newDomains);
-        allDomains = [...new Set(allDomains)];
-        let html = '';
-        allDomains.forEach(d => {
-            html += `<div style="font-size:0.8rem; padding:2px 0; border-bottom:1px solid #2a3248;">${escapeHtml(d)}</div>`;
-        });
-        domainListDiv.innerHTML = html;
-        domainCountSpan.textContent = allDomains.length;
+    // ---------- helpers ----------
+    function escapeHtml(unsafe) {
+        if (!unsafe) return '';
+        return unsafe
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
     }
 
+    function showToast(msg, isError = false) {
+        // if your app has a toast system, use it; otherwise fallback to alert
+        if (window.showToast) {
+            window.showToast(msg, isError);
+        } else {
+            alert(msg);
+        }
+    }
+
+    // ---------- render domain list ----------
+    function renderDomains() {
+        let html = '';
+        if (allDomains.size === 0) {
+            html = '<div class="empty-state">No domains/IPs yet.</div>';
+        } else {
+            allDomains.forEach(d => {
+                html += `<div style="font-size:0.8rem; padding:2px 0; border-bottom:1px solid #2a3248;">${escapeHtml(d)}</div>`;
+            });
+        }
+        domainListDiv.innerHTML = html;
+        domainCountSpan.textContent = allDomains.size;
+    }
+
+    // ---------- append new domains (deduplicated) ----------
+    function appendDomains(newDomains) {
+        if (!newDomains || newDomains.length === 0) return;
+        let added = 0;
+        newDomains.forEach(d => {
+            if (!allDomains.has(d)) {
+                allDomains.add(d);
+                added++;
+            }
+        });
+        if (added > 0) {
+            renderDomains();
+        }
+    }
+
+    // ---------- SSE connection ----------
     function connectSSE(taskId) {
         if (eventSource) {
             eventSource.close();
             eventSource = null;
         }
+        // Only connect if page is visible
         if (document.hidden) return;
 
         eventSource = new EventSource(`/crawler/stream/${taskId}`);
@@ -95,7 +136,7 @@
         });
 
         eventSource.addEventListener('done', function(event) {
-            statusDiv.innerHTML = `✅ Crawling completed. Found ${allDomains.length} domains/IPs.`;
+            statusDiv.innerHTML = `✅ Crawling completed. Found ${allDomains.size} domains/IPs.`;
             cancelBtn.style.display = 'none';
             copyDomainsBtn.style.display = 'inline-flex';
             downloadDomainsBtn.style.display = 'inline-flex';
@@ -103,9 +144,9 @@
                 window.open(`/crawler/download_domains/${currentTaskId}`, '_blank');
             };
             copyDomainsBtn.onclick = () => {
-                const text = allDomains.join('\n');
+                const text = Array.from(allDomains).join('\n');
                 navigator.clipboard.writeText(text).then(() => {
-                    showToast(`Copied ${allDomains.length} domains/IPs`);
+                    showToast(`Copied ${allDomains.size} domains/IPs`);
                 }).catch(() => {
                     const textarea = document.createElement('textarea');
                     textarea.value = text;
@@ -136,7 +177,7 @@
         });
     }
 
-    // Visibility change: pause/resume SSE
+    // ---------- visibility change: pause/resume ----------
     document.addEventListener('visibilitychange', function() {
         if (document.hidden) {
             if (eventSource) {
@@ -150,6 +191,7 @@
         }
     });
 
+    // ---------- cancel ----------
     cancelBtn.addEventListener('click', async function() {
         if (currentTaskId) {
             try {
@@ -168,6 +210,7 @@
         }
     });
 
+    // ---------- submit new crawl ----------
     form.addEventListener('submit', async function(e) {
         e.preventDefault();
         let startUrl = startUrlInput.value.trim();
@@ -176,10 +219,10 @@
         const maxPages = parseInt(maxPagesInput.value) || 0;
         const maxDepth = parseInt(maxDepthInput.value) || 3;
 
-        allDomains = [];
-        domainListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
+        // Reset state
+        allDomains = new Set();
+        renderDomains();
         pagesVisitedSpan.textContent = '0';
-        domainCountSpan.textContent = '0';
         currentPathSpan.textContent = '-';
         copyDomainsBtn.style.display = 'none';
         downloadDomainsBtn.style.display = 'none';
@@ -196,6 +239,7 @@
             if (data.error) throw new Error(data.error);
             currentTaskId = data.task_id;
 
+            // Connect if page is visible
             if (!document.hidden) {
                 connectSSE(currentTaskId);
             } else {
@@ -207,6 +251,7 @@
         }
     });
 
+    // ---------- show saved files ----------
     showSavedBtn.addEventListener('click', async function() {
         try {
             const resp = await fetch('/crawler/list_files');
@@ -229,5 +274,6 @@
             showToast('Failed to load saved files', true);
         }
     });
+
 })();
 </script>
