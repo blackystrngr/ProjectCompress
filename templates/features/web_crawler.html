@@ -6,7 +6,6 @@
             <input type="text" id="startUrl" placeholder="https://example.com" required>
             <input type="number" id="maxPages" placeholder="Max pages (0 = unlimited)" value="0" min="0" style="width:140px;">
             <input type="number" id="maxDepth" placeholder="Max depth" value="3" min="1" max="10" style="width:120px;">
-            <input type="number" id="threads" placeholder="Threads" value="20" min="1" max="50" style="width:80px;">
             <button type="submit" class="primary"><i class="fas fa-play"></i> Start Crawl</button>
             <button type="button" id="cancelBtn" class="danger" style="display:none;"><i class="fas fa-stop"></i> Cancel</button>
             <button type="button" id="refreshBtn" class="primary"><i class="fas fa-sync-alt"></i> Refresh</button>
@@ -60,7 +59,6 @@
     const startUrlInput = document.getElementById('startUrl');
     const maxPagesInput = document.getElementById('maxPages');
     const maxDepthInput = document.getElementById('maxDepth');
-    const threadsInput = document.getElementById('threads');
     const cancelBtn = document.getElementById('cancelBtn');
     const refreshBtn = document.getElementById('refreshBtn');
     const statusDiv = document.getElementById('crawlerStatus');
@@ -115,7 +113,6 @@
         if (!startUrl.startsWith('http')) startUrl = 'https://' + startUrl;
         const maxPages = parseInt(maxPagesInput.value) || 0;
         const maxDepth = parseInt(maxDepthInput.value) || 3;
-        const threads = parseInt(threadsInput.value) || 20;
 
         allUrls = [];
         allDomains = [];
@@ -124,7 +121,7 @@
             const resp = await fetch('/crawler/start', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                body: `start_url=${encodeURIComponent(startUrl)}&max_pages=${maxPages}&max_depth=${maxDepth}&threads=${threads}`
+                body: `start_url=${encodeURIComponent(startUrl)}&max_pages=${maxPages}&max_depth=${maxDepth}`
             });
             const data = await resp.json();
             if (data.error) throw new Error(data.error);
@@ -247,7 +244,7 @@
                 statusDiv.innerHTML = '⛔ Crawl cancelled.';
                 cancelBtn.style.display = 'none';
             } else {
-                let msg = status === 'crawling' ? 'Crawling...' : (status === 'bruteforcing' ? 'Bruteforcing...' : 'Processing...');
+                let msg = status === 'crawling' ? 'Crawling...' : 'Processing...';
                 statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${msg} (${progress}%) – last update: ${lastUpdateSpan.textContent}`;
             }
         } catch (err) {
