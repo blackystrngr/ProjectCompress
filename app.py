@@ -10,11 +10,19 @@ import psutil
 import threading
 import hmac
 import subprocess
+import queue  # <-- NEW for SSE client queues
 from flask import Flask, render_template, jsonify, request, send_from_directory, Response, stream_with_context
 from waitress import serve
 from werkzeug.exceptions import NotFound
 from config import SECRET_KEY, MAX_CONTENT_LENGTH, UPLOAD_FOLDER, TASKS_DIR
-from tasks import get_all_task_ids, load_task, save_task
+from tasks import (
+    get_all_task_ids,
+    load_task,
+    save_task,
+    get_active_tasks,      # <-- NEW
+    add_subscriber,        # <-- NEW
+    remove_subscriber      # <-- NEW
+)
 from features import register_all_features
 
 WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'your-super-secret-webhook-key')
@@ -30,6 +38,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ------------------------------------------------------------
+# Helper functions (unchanged)
+# ------------------------------------------------------------
 def get_file_hash(path):
     """Return SHA-256 hash of a file, or None if not exists."""
     if not os.path.exists(path):
@@ -53,7 +64,6 @@ def install_requirements():
         )
         if result.returncode == 0:
             logger.info("Dependencies installed successfully.")
-            # Save hash for future checks
             current_hash = get_file_hash(REQUIREMENTS_FILE)
             if current_hash:
                 with open(REQUIREMENTS_HASH_FILE, 'w') as f:
@@ -63,6 +73,9 @@ def install_requirements():
     except Exception as e:
         logger.exception(f"Failed to install requirements: {e}")
 
+# ------------------------------------------------------------
+# Flask app factory
+# ------------------------------------------------------------
 def create_app():
     app = Flask(__name__)
     app.config['SECRET_KEY'] = SECRET_KEY
@@ -183,29 +196,32 @@ def create_app():
             logger.error(f"Failed to list tasks: {e}")
         return jsonify(active)
 
+    # ---------- EVENT‑DRIVEN SSE ENDPOINT (NEW) ----------
     @app.route('/tasks/stream')
     def tasks_stream():
+        # Each client gets its own queue with maxsize=1 (we only need latest state)
+        q = queue.Queue(maxsize=1)
+        add_subscriber(q)
+
         def event_stream():
-            last_sent = None
-            while True:
-                active = []
-                terminal_statuses = {'done', 'error', 'cancelled', 'search_done', 'scan_done'}
-                try:
-                    for tid in get_all_task_ids():
-                        task = load_task(tid)
-                        if task and task.get('status') not in terminal_statuses:
-                            safe = {k: v for k, v in task.items() if k not in ['process_pid']}
-                            active.append(safe)
-                except Exception as e:
-                    logger.error(f"Error in SSE stream: {e}")
-                    active = []
-                current = json.dumps(active)
-                if current != last_sent:
-                    last_sent = current
-                    yield f"data: {current}\n\n"
-                time.sleep(1)
+            try:
+                # Send initial snapshot immediately
+                initial = json.dumps(get_active_tasks())
+                yield f"data: {initial}\n\n"
+
+                # Then block until a new update arrives
+                while True:
+                    data = q.get()          # blocks until broadcast puts something
+                    yield f"data: {data}\n\n"
+            except GeneratorExit:
+                # Client disconnected
+                pass
+            finally:
+                remove_subscriber(q)
+
         return Response(stream_with_context(event_stream()), mimetype="text/event-stream")
 
+    # ---------- Other endpoints (unchanged) ----------
     @app.route('/progress/<task_id>', methods=['GET'])
     def progress(task_id):
         try:
@@ -261,6 +277,9 @@ def create_app():
 
     return app
 
+# ------------------------------------------------------------
+# Main entry
+# ------------------------------------------------------------
 if __name__ == '__main__':
     for tid in get_all_task_ids():
         if not load_task(tid):
