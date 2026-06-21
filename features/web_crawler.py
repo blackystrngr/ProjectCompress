@@ -5,21 +5,19 @@ import threading
 import time
 import logging
 import json
+import queue
 import requests
 from urllib.parse import urljoin, urlparse
-from flask import request, jsonify, send_file, Response, stream_with_context
+from flask import request, jsonify, send_file, Response, stream_with_context, abort
 from bs4 import BeautifulSoup
 from tasks import save_task, load_task
 from config import UPLOAD_FOLDER
 
 logger = logging.getLogger(__name__)
 
-# ====================== GROK-STYLE LOW BANDWIDTH OPTIMIZATIONS ======================
-UPDATE_INTERVAL = 7                    # seconds
-MIN_DOMAINS_PER_UPDATE = 5
-MAX_BATCH_SIZE = 40
-
+# ====================== CONSTANTS ======================
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+MAX_BATCH_SIZE = 50   # max new domains sent per SSE update
 
 IPV4_RE = re.compile(r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b')
 IPV6_RE = re.compile(r'\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b')
@@ -40,6 +38,37 @@ SKIP_EXTENSIONS = {
     '.pem', '.key', '.crt', '.csr'
 }
 
+# ---------- SSE queues per task ----------
+_crawler_queues = {}
+_queue_lock = threading.Lock()
+
+def get_queue(task_id):
+    """Get or create a queue for a crawler task."""
+    with _queue_lock:
+        if task_id not in _crawler_queues:
+            _crawler_queues[task_id] = queue.Queue(maxsize=100)
+        return _crawler_queues[task_id]
+
+def remove_queue(task_id):
+    """Remove queue when task finishes or client disconnects."""
+    with _queue_lock:
+        if task_id in _crawler_queues:
+            del _crawler_queues[task_id]
+
+def push_update(task_id, payload):
+    """Push an update to the task's SSE queue (non‑blocking)."""
+    q = get_queue(task_id)
+    try:
+        q.put_nowait(payload)
+    except queue.Full:
+        # If queue is full, discard oldest message to keep it fresh
+        try:
+            q.get_nowait()
+            q.put_nowait(payload)
+        except:
+            pass
+
+# ---------- Helpers ----------
 def is_valid_domain(domain):
     if not domain or not isinstance(domain, str):
         return False
@@ -182,7 +211,20 @@ def extract_ips_from_text(text):
     ips.update(IPV6_RE.findall(text))
     return ips
 
-def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
+# ---------- File writing (thread‑safe) ----------
+_file_write_lock = threading.Lock()
+
+def append_to_file(filepath, lines):
+    with _file_write_lock:
+        try:
+            with open(filepath, 'a', encoding='utf-8') as f:
+                for line in lines:
+                    f.write(line.rstrip() + '\n')
+        except Exception as e:
+            logger.error(f"Error writing to {filepath}: {e}")
+
+# ---------- Crawler core ----------
+def run_crawler(task_id, start_url, max_pages, max_depth):
     logger.info(f"Crawler task {task_id} started: {start_url}")
     task = load_task(task_id)
     if not task:
@@ -193,18 +235,30 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
         logger.error(f"Could not extract domain from {start_url}")
         return
 
+    # Prepare output file (real‑time)
+    website_name = get_website_name_from_url(start_url)
+    safe_name = re.sub(r'[^a-zA-Z0-9]', '_', website_name)
+    base_filename = f"{safe_name}_{task_id[:8]}_domains.txt"
+    filepath = os.path.join(UPLOAD_FOLDER, base_filename)
+
+    # Empty the file at start
+    with open(filepath, 'w', encoding='utf-8') as f:
+        pass
+
     all_urls = set([start_url])
     domains = set()
     ip_addresses = set()
     processed = set()
     queue = [(start_url, 0)]
+
     if dom := extract_domain(start_url):
         domains.add(dom)
+        append_to_file(filepath, [dom])
 
     pages_visited = 0
-    last_update = time.time()
     last_domain_count = 0
 
+    # Initial task state
     task.update({
         'status': 'crawling',
         'progress': 0,
@@ -213,9 +267,19 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
         'max_pages': max_pages,
         'max_depth': max_depth,
         'domains': sorted(domains),
-        'current_url': start_url
+        'current_url': start_url,
+        'output_file': base_filename
     })
     save_task(task_id, task)
+
+    # Push initial update
+    push_update(task_id, {
+        'domains': sorted(domains),
+        'path': '/',
+        'progress': 0,
+        'pages': 0,
+        'urls_count': len(all_urls)
+    })
 
     session = requests.Session()
     session.headers.update({'User-Agent': USER_AGENT})
@@ -244,31 +308,49 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
                 ip_addresses.update(ips)
                 extracted_urls = extract_urls_from_html(text, url)
 
+                new_domains = []
                 for extracted_url in extracted_urls:
                     all_urls.add(extracted_url)
                     dom = extract_domain(extracted_url)
-                    if dom and dom != target_domain:
+                    if dom and dom != target_domain and dom not in domains:
                         domains.add(dom)
+                        new_domains.append(dom)
                     if is_same_domain(extracted_url, target_domain) and depth + 1 <= max_depth:
                         queue.append((extracted_url, depth + 1))
 
-            pages_visited += 1
+                # Write new domains immediately
+                if new_domains:
+                    append_to_file(filepath, new_domains)
 
-            # === LOW BANDWIDTH UPDATE ===
-            now = time.time()
-            new_count = len(domains) - last_domain_count
-            if (now - last_update > UPDATE_INTERVAL and new_count >= MIN_DOMAINS_PER_UPDATE) or pages_visited % 25 == 0:
-                batch = sorted(list(domains))[-MAX_BATCH_SIZE:]
-                task.update({
-                    'progress': int(100 * pages_visited / max_pages) if max_pages > 0 else min(98, pages_visited),
-                    'total_pages': pages_visited,
-                    'total_urls': len(all_urls),
-                    'domains': batch,
-                    'current_url': url
-                })
-                save_task(task_id, task)
-                last_update = now
-                last_domain_count = len(domains)
+                # Also write IPs if any
+                if ips:
+                    append_to_file(filepath, [f"IP: {ip}" for ip in ips])
+                    ip_addresses.update(ips)
+
+                # --- PUSH REAL‑TIME UPDATE ---
+                if new_domains or ips:
+                    # Prepare a batch of up to MAX_BATCH_SIZE new domains
+                    batch = new_domains[:MAX_BATCH_SIZE]
+                    payload = {
+                        'domains': batch,
+                        'path': urlparse(url).path or '/',
+                        'progress': int(100 * pages_visited / max_pages) if max_pages > 0 else min(98, pages_visited),
+                        'pages': pages_visited + 1,
+                        'urls_count': len(all_urls)
+                    }
+                    push_update(task_id, payload)
+
+                    # Update task for persistence (and global /progress)
+                    task = load_task(task_id)
+                    if task:
+                        task['total_pages'] = pages_visited + 1
+                        task['total_urls'] = len(all_urls)
+                        task['domains'] = sorted(domains)
+                        task['progress'] = payload['progress']
+                        task['current_url'] = url
+                        save_task(task_id, task)
+
+            pages_visited += 1
 
         except Exception as e:
             logger.debug(f"Fetch error {url}: {e}")
@@ -276,25 +358,41 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
 
     # Final save
     combined = sorted(set(domains) | set(ip_addresses))
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(combined))
+        if combined:
+            f.write('\n')
+
+    task = load_task(task_id)
     task.update({
         'status': 'done',
         'progress': 100,
         'total_pages': pages_visited,
         'total_urls': len(all_urls),
         'domains': combined,
-        'current_url': None
+        'current_url': None,
+        'output_file': base_filename
     })
     save_task(task_id, task)
 
-    # Save files
-    website_name = get_website_name_from_url(start_url)
-    domain_filename = f"{website_name}_domains.txt"
-    with open(os.path.join(UPLOAD_FOLDER, domain_filename), 'w', encoding='utf-8') as f:
-        f.write('\n'.join(combined))
+    # Push final update
+    push_update(task_id, {
+        'domains': combined[-MAX_BATCH_SIZE:],  # send last batch
+        'path': '/',
+        'progress': 100,
+        'pages': pages_visited,
+        'urls_count': len(all_urls)
+    })
 
     logger.info(f"Crawler {task_id} finished: {len(all_urls)} URLs, {len(combined)} domains/IPs")
 
+    # Clean up queue after a short delay (allow clients to receive final message)
+    time.sleep(2)
+    remove_queue(task_id)
+
+# ---------- Flask routes ----------
 def register_routes(app):
+
     @app.route('/crawler/start', methods=['POST'])
     def crawler_start():
         start_url = request.form.get('start_url', '').strip()
@@ -320,7 +418,8 @@ def register_routes(app):
             'total_pages': 0,
             'total_urls': 0,
             'domains': [],
-            'current_url': None
+            'current_url': None,
+            'output_file': None
         }
         save_task(task_id, task_data)
 
@@ -338,80 +437,107 @@ def register_routes(app):
 
     @app.route('/crawler/stream/<task_id>')
     def crawler_stream(task_id):
+        q = get_queue(task_id)
+
         def event_generator():
-            last_domain_count = 0
-            while True:
+            try:
+                # Send the current state from task file immediately (catch‑up)
                 task = load_task(task_id)
-                if not task:
-                    yield "event: error\ndata: Task not found\n\n"
-                    break
-
-                status = task.get('status')
-                domains = task.get('domains', [])
-                current_url = task.get('current_url', '')
-                current_path = urlparse(current_url).path or '/' if current_url else '/'
-
-                new_domains = domains[last_domain_count:]
-
-                if new_domains or status in ('done', 'cancelled'):
+                if task:
+                    domains = task.get('domains', [])
                     payload = {
-                        'domains': new_domains[:MAX_BATCH_SIZE],
-                        'path': current_path,
+                        'domains': domains[-MAX_BATCH_SIZE:],
+                        'path': urlparse(task.get('current_url', '')).path or '/',
                         'progress': task.get('progress', 0),
                         'pages': task.get('total_pages', 0),
                         'urls_count': task.get('total_urls', 0)
                     }
                     yield f"event: update\ndata: {json.dumps(payload)}\n\n"
-                    if new_domains:
-                        last_domain_count = len(domains)
 
-                if status in ('done', 'cancelled', 'error'):
-                    yield f"event: {status}\ndata: \n\n"
-                    break
-
-                time.sleep(6)   # relaxed interval
+                # Then listen for real‑time pushes
+                while True:
+                    try:
+                        data = q.get(timeout=10)  # timeout to allow detecting task completion
+                        yield f"event: update\ndata: {json.dumps(data)}\n\n"
+                    except queue.Empty:
+                        # Check if task is done
+                        task = load_task(task_id)
+                        if not task or task.get('status') in ('done', 'cancelled', 'error'):
+                            # Send final status and break
+                            yield f"event: {task.get('status', 'done')}\ndata: \n\n"
+                            break
+                        # Still crawling, but no new data – keep connection alive with a ping
+                        yield ": keepalive\n\n"
+            except GeneratorExit:
+                # Client disconnected – remove queue if task is done, else keep it for reconnects
+                task = load_task(task_id)
+                if task and task.get('status') in ('done', 'cancelled', 'error'):
+                    remove_queue(task_id)
+                pass
 
         return Response(stream_with_context(event_generator()), mimetype="text/event-stream")
-
-    @app.route('/crawler/download_urls/<task_id>')
-    def crawler_download_urls(task_id):
-        task = load_task(task_id)
-        if not task:
-            return jsonify({'error': 'Task not found'}), 404
-        urls = task.get('discovered_urls', [])
-        if not urls:
-            return jsonify({'error': 'No URLs discovered'}), 404
-        filename = f"crawled_urls_{task_id[:8]}.txt"
-        filepath = os.path.join(UPLOAD_FOLDER, filename)
-        if not os.path.exists(filepath):
-            with open(filepath, 'w') as f:
-                f.write('\n'.join(urls))
-        return send_file(filepath, as_attachment=True, download_name=filename)
 
     @app.route('/crawler/download_domains/<task_id>')
     def crawler_download_domains(task_id):
         task = load_task(task_id)
         if not task:
             return jsonify({'error': 'Task not found'}), 404
-        domains = task.get('domains', [])
-        if not domains:
-            return jsonify({'error': 'No domains discovered'}), 404
-        website_name = get_website_name_from_url(task.get('start_url'))
-        filename = f"{website_name}_domains.txt"
+        output_file = task.get('output_file')
+        if not output_file:
+            return jsonify({'error': 'No output file generated'}), 404
+        filepath = os.path.join(UPLOAD_FOLDER, output_file)
+        if not os.path.exists(filepath):
+            return jsonify({'error': 'File not found'}), 404
+        return send_file(filepath, as_attachment=True, download_name=output_file)
+
+    @app.route('/crawler/download_domains_by_filename')
+    def crawler_download_by_filename():
+        filename = request.args.get('filename')
+        if not filename or not filename.endswith('_domains.txt'):
+            abort(400)
+        if '..' in filename:
+            abort(403)
         filepath = os.path.join(UPLOAD_FOLDER, filename)
         if not os.path.exists(filepath):
-            with open(filepath, 'w') as f:
-                f.write('\n'.join(sorted(domains)))
+            abort(404)
         return send_file(filepath, as_attachment=True, download_name=filename)
 
     @app.route('/crawler/list_files')
     def crawler_list_files():
         files = []
         for f in os.listdir(UPLOAD_FOLDER):
-            if f.endswith(('_domains.txt', '_urls.txt')):
+            if f.endswith('_domains.txt'):
+                filepath = os.path.join(UPLOAD_FOLDER, f)
+                stat = os.stat(filepath)
                 files.append({
                     'name': f,
                     'path': f,
-                    'size': os.path.getsize(os.path.join(UPLOAD_FOLDER, f))
+                    'size': stat.st_size,
+                    'size_str': get_file_size_str(stat.st_size),
+                    'mtime': stat.st_mtime
                 })
         return jsonify(files)
+
+    @app.route('/crawler/view/<filename>')
+    def crawler_view_file(filename):
+        if '..' in filename or not filename.endswith('_domains.txt'):
+            abort(400)
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        if not os.path.exists(filepath):
+            abort(404)
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read()
+            return Response(content, mimetype='text/plain')
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+def get_file_size_str(size):
+    if size < 1024:
+        return f"{size} B"
+    elif size < 1024*1024:
+        return f"{size/1024:.1f} KB"
+    elif size < 1024*1024*1024:
+        return f"{size/(1024*1024):.1f} MB"
+    else:
+        return f"{size/(1024*1024*1024):.2f} GB"
