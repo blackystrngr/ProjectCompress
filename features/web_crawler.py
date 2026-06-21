@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 UPDATE_INTERVAL = 7                    # seconds
 MIN_DOMAINS_PER_UPDATE = 5
 MAX_BATCH_SIZE = 40
-INACTIVITY_TIMEOUT = 30                # auto-cancel if no client
 
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 
@@ -138,7 +137,6 @@ def extract_urls_from_html(html, base_url):
             abs_url = normalize_url(src, base_url)
             if abs_url and is_valid_url(abs_url):
                 urls.add(abs_url)
-    # Keep the rest of your extraction logic (srcset, data-*, meta, scripts) as-is
     for tag in soup.find_all(['img', 'source']):
         srcset = tag.get('srcset')
         if srcset:
@@ -211,11 +209,11 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
         'status': 'crawling',
         'progress': 0,
         'total_pages': 0,
+        'total_urls': len(all_urls),
         'max_pages': max_pages,
         'max_depth': max_depth,
         'domains': sorted(domains),
-        'current_url': start_url,
-        'last_client_seen': time.time()
+        'current_url': start_url
     })
     save_task(task_id, task)
 
@@ -226,11 +224,6 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
     while queue and (pages_visited < max_pages or max_pages == 0):
         task = load_task(task_id)
         if not task or task.get('cancelled', False):
-            return
-        if time.time() - task.get('last_client_seen', 0) > INACTIVITY_TIMEOUT:
-            logger.info(f"Task {task_id} auto-cancelled (client inactive)")
-            task['status'] = 'cancelled'
-            save_task(task_id, task)
             return
 
         url, depth = queue.pop(0)
@@ -269,9 +262,9 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
                 task.update({
                     'progress': int(100 * pages_visited / max_pages) if max_pages > 0 else min(98, pages_visited),
                     'total_pages': pages_visited,
+                    'total_urls': len(all_urls),
                     'domains': batch,
-                    'current_url': url,
-                    'last_client_seen': time.time()
+                    'current_url': url
                 })
                 save_task(task_id, task)
                 last_update = now
@@ -287,6 +280,7 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
         'status': 'done',
         'progress': 100,
         'total_pages': pages_visited,
+        'total_urls': len(all_urls),
         'domains': combined,
         'current_url': None
     })
@@ -324,9 +318,9 @@ def register_routes(app):
             'max_pages': max_pages,
             'max_depth': max_depth,
             'total_pages': 0,
+            'total_urls': 0,
             'domains': [],
-            'current_url': None,
-            'last_client_seen': time.time()
+            'current_url': None
         }
         save_task(task_id, task_data)
 
@@ -352,9 +346,6 @@ def register_routes(app):
                     yield "event: error\ndata: Task not found\n\n"
                     break
 
-                task['last_client_seen'] = time.time()
-                save_task(task_id, task)   # keep client alive
-
                 status = task.get('status')
                 domains = task.get('domains', [])
                 current_url = task.get('current_url', '')
@@ -367,7 +358,8 @@ def register_routes(app):
                         'domains': new_domains[:MAX_BATCH_SIZE],
                         'path': current_path,
                         'progress': task.get('progress', 0),
-                        'pages': task.get('total_pages', 0)
+                        'pages': task.get('total_pages', 0),
+                        'urls_count': task.get('total_urls', 0)
                     }
                     yield f"event: update\ndata: {json.dumps(payload)}\n\n"
                     if new_domains:
@@ -381,7 +373,6 @@ def register_routes(app):
 
         return Response(stream_with_context(event_generator()), mimetype="text/event-stream")
 
-    # Keep your download and list_files routes unchanged
     @app.route('/crawler/download_urls/<task_id>')
     def crawler_download_urls(task_id):
         task = load_task(task_id)
