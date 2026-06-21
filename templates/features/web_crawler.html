@@ -1,6 +1,6 @@
 <div class="card">
     <h2><i class="fas fa-spider"></i> Recursive Domain Crawler</h2>
-    <p>Real‑time domain discovery – uses almost no bandwidth. Updates only when you're on this tab.</p>
+    <p>Real‑time domain discovery – updates every 5 seconds, low bandwidth.</p>
     <form id="crawlerForm">
         <div class="input-group">
             <input type="text" id="startUrl" placeholder="https://example.com" required>
@@ -14,7 +14,7 @@
 
     <div id="crawlerResults">
         <div style="display:flex; gap:1rem; flex-wrap:wrap; margin-bottom:1rem;">
-            <span><strong>Current:</strong> <span id="currentUrl" style="color:#80b3ff;">-</span></span>
+            <span><strong>Current path:</strong> <span id="currentPath" style="color:#80b3ff;">-</span></span>
             <span><strong>Pages visited:</strong> <span id="pagesVisited">0</span></span>
             <span><strong>Domains / IPs:</strong> <span id="domainCount">0</span></span>
         </div>
@@ -49,7 +49,7 @@
     const maxDepthInput = document.getElementById('maxDepth');
     const cancelBtn = document.getElementById('cancelBtn');
     const statusDiv = document.getElementById('crawlerStatus');
-    const currentUrlSpan = document.getElementById('currentUrl');
+    const currentPathSpan = document.getElementById('currentPath');
     const pagesVisitedSpan = document.getElementById('pagesVisited');
     const domainCountSpan = document.getElementById('domainCount');
     const domainListDiv = document.getElementById('domainList');
@@ -80,7 +80,6 @@
             eventSource.close();
             eventSource = null;
         }
-        // Only connect if the page is visible
         if (document.hidden) return;
 
         eventSource = new EventSource(`/crawler/stream/${taskId}`);
@@ -88,6 +87,9 @@
         eventSource.addEventListener('update', function(event) {
             const payload = JSON.parse(event.data);
             appendDomains(payload.domains);
+            if (payload.path) {
+                currentPathSpan.textContent = payload.path;
+            }
             pagesVisitedSpan.textContent = payload.pages || 0;
             statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Crawling... (${payload.progress}%)`;
         });
@@ -137,13 +139,11 @@
     // Visibility change: pause/resume SSE
     document.addEventListener('visibilitychange', function() {
         if (document.hidden) {
-            // Page hidden – close SSE to save bandwidth
             if (eventSource) {
                 eventSource.close();
                 eventSource = null;
             }
         } else {
-            // Page visible – reconnect if we have a task
             if (currentTaskId) {
                 connectSSE(currentTaskId);
             }
@@ -180,7 +180,7 @@
         domainListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
         pagesVisitedSpan.textContent = '0';
         domainCountSpan.textContent = '0';
-        currentUrlSpan.textContent = '-';
+        currentPathSpan.textContent = '-';
         copyDomainsBtn.style.display = 'none';
         downloadDomainsBtn.style.display = 'none';
         cancelBtn.style.display = 'inline-flex';
@@ -196,12 +196,10 @@
             if (data.error) throw new Error(data.error);
             currentTaskId = data.task_id;
 
-            // Connect only if page is visible
             if (!document.hidden) {
                 connectSSE(currentTaskId);
             } else {
-                // Will connect when page becomes visible
-                showToast('Crawler started – reconnect when you return to this tab.');
+                showToast('Crawler started – updates will resume when you return to this tab.');
             }
 
         } catch (err) {
