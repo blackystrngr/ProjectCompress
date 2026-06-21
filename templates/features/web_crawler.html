@@ -12,9 +12,10 @@
 
     <div id="status" class="help-text"></div>
 
-    <div style="margin:15px 0; display:flex; gap:15px; font-size:0.9rem">
+    <div style="margin:15px 0; display:flex; gap:15px; font-size:0.9rem; flex-wrap:wrap;">
         <span>Pages: <b id="pages">0</b></span>
         <span>Domains: <b id="count">0</b></span>
+        <span>URLs: <b id="urlsCount">0</b></span>   <!-- new -->
         <span>Current: <span id="path" style="color:#7cc3ff">-</span></span>
     </div>
 
@@ -64,6 +65,7 @@ function connectStream() {
         
         document.getElementById('pages').textContent = p.pages;
         document.getElementById('count').textContent = domains.size;
+        document.getElementById('urlsCount').textContent = p.urls_count || 0;  // new
         document.getElementById('path').textContent = p.path;
         statusEl.textContent = `Crawling... ${p.progress}%`;
 
