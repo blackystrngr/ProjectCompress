@@ -1,6 +1,6 @@
 <div class="card">
     <h2><i class="fas fa-spider"></i> Recursive Domain Crawler</h2>
-    <p>Recursively crawl a domain, fetch every page, CSS, JS, and other resources, and extract all domains and IP addresses.</p>
+    <p>Recursively crawl a domain – real‑time updates with minimal bandwidth.</p>
     <form id="crawlerForm">
         <div class="input-group">
             <input type="text" id="startUrl" placeholder="https://example.com" required>
@@ -8,7 +8,6 @@
             <input type="number" id="maxDepth" placeholder="Max depth" value="3" min="1" max="10" style="width:120px;">
             <button type="submit" class="primary"><i class="fas fa-play"></i> Start Crawl</button>
             <button type="button" id="cancelBtn" class="danger" style="display:none;"><i class="fas fa-stop"></i> Cancel</button>
-            <button type="button" id="refreshBtn" class="primary"><i class="fas fa-sync-alt"></i> Refresh</button>
         </div>
         <div id="crawlerStatus" class="help-text"></div>
     </form>
@@ -19,7 +18,6 @@
             <span><strong>Pages visited:</strong> <span id="pagesVisited">0</span></span>
             <span><strong>Discovered URLs:</strong> <span id="urlCount">0</span></span>
             <span><strong>Domains / IPs:</strong> <span id="domainCount">0</span></span>
-            <span><strong>Last update:</strong> <span id="lastUpdate">-</span></span>
         </div>
         <div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-bottom:1rem;">
             <button id="copyDomainsBtn" class="primary" style="display:none;"><i class="fas fa-copy"></i> Copy Domains / IPs</button>
@@ -30,7 +28,7 @@
 
         <div style="display:flex; gap:2rem; flex-wrap:wrap;">
             <div style="flex:1; min-width:300px;">
-                <h4>Discovered URLs <span id="urlTotalNote" style="font-weight:normal; color:#aaa;"></span></h4>
+                <h4>Discovered URLs</h4>
                 <div id="urlList" style="max-height:400px; overflow-y:auto; background:#1e2438; border-radius:1rem; padding:0.5rem; font-family:monospace; font-size:0.8rem; white-space:pre-wrap; word-break:break-all;">
                     <div class="empty-state">No URLs yet.</div>
                 </div>
@@ -60,16 +58,13 @@
     const maxPagesInput = document.getElementById('maxPages');
     const maxDepthInput = document.getElementById('maxDepth');
     const cancelBtn = document.getElementById('cancelBtn');
-    const refreshBtn = document.getElementById('refreshBtn');
     const statusDiv = document.getElementById('crawlerStatus');
     const currentUrlSpan = document.getElementById('currentUrl');
     const pagesVisitedSpan = document.getElementById('pagesVisited');
     const urlCountSpan = document.getElementById('urlCount');
     const domainCountSpan = document.getElementById('domainCount');
-    const lastUpdateSpan = document.getElementById('lastUpdate');
     const urlListDiv = document.getElementById('urlList');
     const domainListDiv = document.getElementById('domainList');
-    const urlTotalNote = document.getElementById('urlTotalNote');
     const copyDomainsBtn = document.getElementById('copyDomainsBtn');
     const downloadDomainsBtn = document.getElementById('downloadDomainsBtn');
     const downloadUrlsBtn = document.getElementById('downloadUrlsBtn');
@@ -78,11 +73,40 @@
     const savedFilesList = document.getElementById('savedFilesList');
 
     let currentTaskId = null;
-    let pollInterval = null;
-    const POLL_INTERVAL_MS = 30000; // 30 seconds
-
+    let eventSource = null;
     let allUrls = [];
     let allDomains = [];
+
+    // Helper to append new items to the list
+    function appendUrls(newUrls) {
+        if (!newUrls || newUrls.length === 0) return;
+        allUrls = allUrls.concat(newUrls);
+        // Remove duplicates (though server sends only new ones)
+        allUrls = [...new Set(allUrls)];
+        // Render only up to 200 for performance
+        let html = '';
+        const display = allUrls.slice(0, 200);
+        display.forEach(u => {
+            html += `<div style="font-size:0.8rem; padding:2px 0; border-bottom:1px solid #2a3248; word-break:break-all;">${escapeHtml(u)}</div>`;
+        });
+        if (allUrls.length > 200) {
+            html += `<div style="color:#aaa; font-size:0.8rem;">... and ${allUrls.length - 200} more</div>`;
+        }
+        urlListDiv.innerHTML = html;
+        urlCountSpan.textContent = allUrls.length;
+    }
+
+    function appendDomains(newDomains) {
+        if (!newDomains || newDomains.length === 0) return;
+        allDomains = allDomains.concat(newDomains);
+        allDomains = [...new Set(allDomains)];
+        let html = '';
+        allDomains.forEach(d => {
+            html += `<div style="font-size:0.8rem; padding:2px 0; border-bottom:1px solid #2a3248;">${escapeHtml(d)}</div>`;
+        });
+        domainListDiv.innerHTML = html;
+        domainCountSpan.textContent = allDomains.length;
+    }
 
     cancelBtn.addEventListener('click', async function() {
         if (currentTaskId) {
@@ -92,17 +116,10 @@
                 if (data.error) throw new Error(data.error);
                 showToast('Cancelling crawl...');
                 cancelBtn.style.display = 'none';
+                if (eventSource) eventSource.close();
             } catch (err) {
                 showToast(err.message, true);
             }
-        }
-    });
-
-    refreshBtn.addEventListener('click', function() {
-        if (currentTaskId) {
-            pollCrawler();
-        } else {
-            showToast('No active crawl to refresh.', true);
         }
     });
 
@@ -116,6 +133,17 @@
 
         allUrls = [];
         allDomains = [];
+        urlListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
+        domainListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
+        pagesVisitedSpan.textContent = '0';
+        urlCountSpan.textContent = '0';
+        domainCountSpan.textContent = '0';
+        currentUrlSpan.textContent = '-';
+        copyDomainsBtn.style.display = 'none';
+        downloadDomainsBtn.style.display = 'none';
+        downloadUrlsBtn.style.display = 'none';
+        cancelBtn.style.display = 'inline-flex';
+        statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Starting...';
 
         try {
             const resp = await fetch('/crawler/start', {
@@ -126,90 +154,21 @@
             const data = await resp.json();
             if (data.error) throw new Error(data.error);
             currentTaskId = data.task_id;
-            statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Crawling started...';
-            urlListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
-            domainListDiv.innerHTML = '<div class="empty-state">Crawling...</div>';
-            pagesVisitedSpan.textContent = '0';
-            urlCountSpan.textContent = '0';
-            domainCountSpan.textContent = '0';
-            currentUrlSpan.textContent = '-';
-            lastUpdateSpan.textContent = '-';
-            urlTotalNote.textContent = '';
-            copyDomainsBtn.style.display = 'none';
-            downloadDomainsBtn.style.display = 'none';
-            downloadUrlsBtn.style.display = 'none';
-            cancelBtn.style.display = 'inline-flex';
-            if (pollInterval) clearInterval(pollInterval);
-            pollInterval = setInterval(pollCrawler, POLL_INTERVAL_MS);
-            pollCrawler();
-        } catch (err) {
-            showToast(err.message, true);
-        }
-    });
 
-    async function pollCrawler() {
-        if (!currentTaskId) return;
-        try {
-            const resp = await fetch(`/crawler/status/${currentTaskId}`);
-            const data = await resp.json();
-            if (data.error) {
-                clearInterval(pollInterval);
-                statusDiv.innerHTML = `<span style="color:#ff8a8a;">Error: ${data.error}</span>`;
-                cancelBtn.style.display = 'none';
-                return;
-            }
-            const status = data.status;
-            const progress = data.progress || 0;
-            const totalPages = data.total_pages || 0;
-            const newUrls = data.new_urls || [];
-            const newDomains = data.new_domains || [];
-            const totalUrls = data.total_urls || 0;
-            const totalDomains = data.total_domains || 0;
-            const currentUrl = data.current_url || '-';
+            // Open SSE connection
+            if (eventSource) eventSource.close();
+            eventSource = new EventSource(`/crawler/stream/${currentTaskId}`);
 
-            allUrls = allUrls.concat(newUrls);
-            allDomains = allDomains.concat(newDomains);
-            allUrls = [...new Set(allUrls)];
-            allDomains = [...new Set(allDomains)];
+            eventSource.addEventListener('update', function(event) {
+                const payload = JSON.parse(event.data);
+                appendUrls(payload.new_urls);
+                appendDomains(payload.new_domains);
+                pagesVisitedSpan.textContent = payload.pages || 0;
+                currentUrlSpan.textContent = payload.current_url || '-';
+                statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Crawling... (${payload.progress}%)`;
+            });
 
-            currentUrlSpan.textContent = currentUrl;
-            pagesVisitedSpan.textContent = totalPages;
-            urlCountSpan.textContent = allUrls.length;
-            domainCountSpan.textContent = allDomains.length;
-            lastUpdateSpan.textContent = new Date().toLocaleTimeString();
-
-            if (totalUrls > allUrls.length) {
-                urlTotalNote.textContent = `(showing ${allUrls.length} of ${totalUrls})`;
-            } else {
-                urlTotalNote.textContent = '';
-            }
-
-            if (allUrls.length > 0) {
-                let html = '';
-                const displayUrls = allUrls.slice(0, 200);
-                displayUrls.forEach(u => {
-                    html += `<div style="font-size:0.8rem; padding:2px 0; border-bottom:1px solid #2a3248; word-break:break-all;">${escapeHtml(u)}</div>`;
-                });
-                if (allUrls.length > 200) {
-                    html += `<div style="color:#aaa; font-size:0.8rem;">... and ${allUrls.length - 200} more</div>`;
-                }
-                urlListDiv.innerHTML = html;
-            } else {
-                urlListDiv.innerHTML = '<div class="empty-state">No URLs yet.</div>';
-            }
-
-            if (allDomains.length > 0) {
-                let html = '';
-                allDomains.forEach(d => {
-                    html += `<div style="font-size:0.8rem; padding:2px 0; border-bottom:1px solid #2a3248;">${escapeHtml(d)}</div>`;
-                });
-                domainListDiv.innerHTML = html;
-            } else {
-                domainListDiv.innerHTML = '<div class="empty-state">No domains/IPs yet.</div>';
-            }
-
-            if (status === 'done') {
-                clearInterval(pollInterval);
+            eventSource.addEventListener('done', function(event) {
                 statusDiv.innerHTML = `✅ Crawling completed. Found ${allUrls.length} unique URLs and ${allDomains.length} domains/IPs.`;
                 cancelBtn.style.display = 'none';
                 copyDomainsBtn.style.display = 'inline-flex';
@@ -235,24 +194,31 @@
                         showToast('Domains/IPs copied (fallback)');
                     });
                 };
-            } else if (status === 'error') {
-                clearInterval(pollInterval);
-                statusDiv.innerHTML = `<span style="color:#ff8a8a;">❌ Error: ${data.error_msg}</span>`;
-                cancelBtn.style.display = 'none';
-            } else if (status === 'cancelled') {
-                clearInterval(pollInterval);
+                eventSource.close();
+            });
+
+            eventSource.addEventListener('cancelled', function(event) {
                 statusDiv.innerHTML = '⛔ Crawl cancelled.';
                 cancelBtn.style.display = 'none';
-            } else {
-                let msg = status === 'crawling' ? 'Crawling...' : 'Processing...';
-                statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${msg} (${progress}%) – last update: ${lastUpdateSpan.textContent}`;
-            }
+                eventSource.close();
+            });
+
+            eventSource.addEventListener('error', function(event) {
+                // If the stream closes unexpectedly, try to reconnect? 
+                // But we'll just show an error.
+                if (eventSource.readyState === EventSource.CLOSED) {
+                    statusDiv.innerHTML = '❌ Connection lost. Please refresh.';
+                    cancelBtn.style.display = 'none';
+                }
+            });
+
         } catch (err) {
-            console.error(err);
+            showToast(err.message, true);
         }
-    }
+    });
 
     showSavedBtn.addEventListener('click', async function() {
+        // same as before
         try {
             const resp = await fetch('/crawler/list_files');
             const files = await resp.json();
