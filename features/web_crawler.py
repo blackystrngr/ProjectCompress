@@ -15,92 +15,55 @@ from config import UPLOAD_FOLDER
 logger = logging.getLogger(__name__)
 
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-URL_RE = re.compile(r'(https?://[^\s<>"\']+)', re.IGNORECASE)
-
-# IP regex (strict – no leading zeros)
 IPV4_RE = re.compile(r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b')
 IPV6_RE = re.compile(r'\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b')
 
-# All non‑text file extensions – we never treat these as domains
+# Media/script extensions – we never treat these as domains
 SKIP_EXTENSIONS = {
-    # images
-    '.jpg', '.jpeg', '.png', '.gif', '.svg', '.ico', '.webp', '.bmp', '.tiff',
-    # videos
-    '.mp4', '.webm', '.mkv', '.avi', '.mov', '.flv', '.wmv',
-    # audio
-    '.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma',
-    # documents (binary)
-    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.odt',
-    # archives
-    '.zip', '.gz', '.rar', '.7z', '.tar', '.bz2',
-    # fonts
-    '.ttf', '.woff', '.woff2', '.eot', '.otf',
-    # scripts & code – we don't want these as domains
+    '.jpg', '.jpeg', '.png', '.gif', '.svg', '.ico', '.webp', '.bmp',
+    '.mp4', '.webm', '.mkv', '.avi', '.mov', '.flv',
+    '.mp3', '.wav', '.flac', '.aac', '.ogg',
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.zip', '.gz', '.rar', '.7z',
+    '.ttf', '.woff', '.woff2', '.eot',
     '.js', '.css', '.xml', '.json', '.php', '.asp', '.aspx', '.jsp',
     '.do', '.action', '.cgi', '.pl', '.py', '.rb', '.go', '.java',
     '.class', '.jar', '.war', '.ear',
-    '.rss', '.atom', '.feed',
-    # config files
-    '.conf', '.cfg', '.ini', '.yaml', '.yml', '.toml',
-    '.htaccess', '.htpasswd',
-    '.sql', '.db', '.sqlite',
-    '.log', '.tmp', '.bak',
-    # others
-    '.exe', '.dll', '.so', '.dylib',
+    '.rss', '.atom', '.feed', '.conf', '.cfg', '.ini', '.yaml', '.yml',
+    '.toml', '.htaccess', '.htpasswd', '.sql', '.db', '.sqlite',
+    '.log', '.tmp', '.bak', '.exe', '.dll', '.so', '.dylib',
     '.pem', '.key', '.crt', '.csr'
 }
 
 # ---------------------------------------------------------------------
-# DOMAIN VALIDATION – extremely strict
+# STRICT DOMAIN VALIDATION – only for domains from full URLs
 # ---------------------------------------------------------------------
 
 def is_valid_domain(domain):
-    """
-    Return True only if the string looks like a real domain name.
-    Rejects:
-      - IPs (handled separately)
-      - file names / paths
-      - strings with only 1 char before the TLD (e.g., 'e.foreach')
-      - anything containing / ? = & % # ; : @
-      - any extension in SKIP_EXTENSIONS
-      - localhost / internal names
-    """
     if not domain or not isinstance(domain, str):
         return False
     domain = domain.lower().strip()
 
-    # Must contain a dot and not be an IP
     if '.' not in domain:
         return False
     if re.match(r'^\d+\.\d+\.\d+\.\d+$', domain):
         return False
-
-    # Must not contain path/query characters
     if any(c in domain for c in ['/', '?', '=', '&', '%', '#', ';', ':', '@']):
         return False
-
-    # Must not end with a skipped extension
     for ext in SKIP_EXTENSIONS:
         if domain.endswith(ext):
             return False
 
-    # Must match the basic domain pattern: at least two parts, TLD 2+ letters
-    # and the part before the TLD must be at least 2 characters
+    # Must match standard domain pattern
     pattern = re.compile(r'^([a-z0-9]([a-z0-9-]*[a-z0-9])?)\.([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)*[a-z]{2,}$')
     if not pattern.match(domain):
         return False
 
-    # Ensure the first part (before the first dot) has at least 2 chars
     parts = domain.split('.')
-    if len(parts) < 2:
+    if len(parts) < 2 or len(parts[0]) < 2:
         return False
-    if len(parts[0]) < 2:
-        return False
-
-    # Ignore common internal/local names
     if domain in ('localhost', 'local', 'internal', 'intranet', 'router', 'gateway'):
         return False
-
     return True
 
 def clean_domain(domain):
@@ -127,7 +90,7 @@ def extract_domain(url):
         return None
 
 # ---------------------------------------------------------------------
-# Helpers (unchanged)
+# HELPERS
 # ---------------------------------------------------------------------
 
 def is_valid_url(url):
@@ -170,6 +133,7 @@ def is_same_domain(url, target_domain):
     return domain == target or domain.endswith('.' + target)
 
 def extract_urls_from_html(html, base_url):
+    """Extract all absolute URLs from HTML tags – this is the only source of domains."""
     urls = set()
     soup = BeautifulSoup(html, 'html.parser')
     for tag in soup.find_all(['a', 'link', 'script', 'img', 'iframe', 'source', 'object', 'embed']):
@@ -208,6 +172,7 @@ def extract_urls_from_html(html, base_url):
                 abs_url = normalize_url(content, base_url)
                 if abs_url and is_valid_url(abs_url):
                     urls.add(abs_url)
+    # Also scan inline script tags for URLs (they may contain http://...)
     for script in soup.find_all('script'):
         if script.string:
             for match in re.finditer(r'[\'"](https?://[^\'"]+)[\'"]', script.string):
@@ -215,12 +180,6 @@ def extract_urls_from_html(html, base_url):
                 abs_url = normalize_url(url, base_url)
                 if abs_url and is_valid_url(abs_url):
                     urls.add(abs_url)
-    # regex fallback (only catches full http(s) URLs)
-    for match in URL_RE.finditer(html):
-        url = match.group(1).strip()
-        abs_url = normalize_url(url, base_url)
-        if abs_url and is_valid_url(abs_url):
-            urls.add(abs_url)
     return urls
 
 def extract_ips_from_text(text):
@@ -229,29 +188,8 @@ def extract_ips_from_text(text):
     ips.update(IPV6_RE.findall(text))
     return ips
 
-def extract_domains_from_text(text, base_domain=None):
-    domains = set()
-    # 1) From full URLs – these are reliable
-    for match in URL_RE.finditer(text):
-        url = match.group(1)
-        dom = extract_domain(url)
-        if dom and dom != base_domain:
-            domains.add(dom)
-
-    # 2) From plain domain names – use a strict pattern and additional checks
-    plain_re = re.compile(r'\b((?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,})\b')
-    for match in plain_re.finditer(text):
-        domain = match.group(1)
-        # Quick pre‑filter: must not contain any chars that indicate code
-        if any(c in domain for c in ['_', '$', '`', '~', '!', '@']):
-            continue
-        cleaned = clean_domain(domain)
-        if cleaned and cleaned != base_domain:
-            domains.add(cleaned)
-    return domains
-
 # ---------------------------------------------------------------------
-# Main crawler – checks cancellation after every page
+# MAIN CRAWLER – ONLY FETCHES HTML
 # ---------------------------------------------------------------------
 
 def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
@@ -294,7 +232,7 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
     session.timeout = (10, 20)
 
     while queue and (pages_visited < max_pages or max_pages == 0):
-        # ---- CHECK CANCELLATION ----
+        # Check cancellation
         task = load_task(task_id)
         if task and task.get('cancelled', False):
             logger.info(f"Task {task_id} cancelled by user")
@@ -308,7 +246,7 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
         processed.add(url)
         current_url = url
 
-        # Update current URL in task
+        # Update current URL
         task = load_task(task_id)
         if task:
             task['current_url'] = current_url
@@ -323,47 +261,24 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
             text = resp.text
             logger.info(f"Fetched {url} (status {resp.status_code}, type {content_type}, length {len(text)})")
 
+            # Skip non‑HTML pages (CSS, JS, images, etc.)
+            if 'text/html' not in content_type:
+                logger.info(f"Skipping non‑HTML content: {content_type}")
+                continue
+
+            # Extract IPs (optional)
             ips = extract_ips_from_text(text)
             ip_addresses.update(ips)
 
-            extracted_urls = set()
-            if 'text/html' in content_type:
-                extracted_urls = extract_urls_from_html(text, url)
-                domains.update(extract_domains_from_text(text, target_domain))
-            elif 'text/css' in content_type:
-                for match in re.finditer(r'url\([\'"]?([^\'"\)]+)[\'"]?\)', text):
-                    u = match.group(1).strip()
-                    if u and not u.startswith('data:') and not u.startswith('#'):
-                        abs_u = normalize_url(u, url)
-                        if abs_u and is_valid_url(abs_u):
-                            extracted_urls.add(abs_u)
-                domains.update(extract_domains_from_text(text, target_domain))
-            elif 'application/javascript' in content_type or 'text/javascript' in content_type:
-                for match in re.finditer(r'[\'"](https?://[^\'"]+)[\'"]', text):
-                    u = match.group(1).strip()
-                    abs_u = normalize_url(u, url)
-                    if abs_u and is_valid_url(abs_u):
-                        extracted_urls.add(abs_u)
-                domains.update(extract_domains_from_text(text, target_domain))
-            elif 'application/json' in content_type or 'text/xml' in content_type or 'application/xml' in content_type:
-                # These are text‑based but may contain URLs – extract domains
-                domains.update(extract_domains_from_text(text, target_domain))
-                extracted_urls = set()
-            elif 'text/plain' in content_type:
-                domains.update(extract_domains_from_text(text, target_domain))
-                extracted_urls = set()
-            else:
-                # For other types, just extract domain from the URL itself
-                dom = extract_domain(url)
-                if dom and dom != target_domain:
-                    domains.add(dom)
-                continue
+            # Extract URLs from HTML – this is the only source for domains
+            extracted_urls = extract_urls_from_html(text, url)
 
-            # Also extract domain from the current URL
+            # Extract domain from the current URL itself
             dom = extract_domain(url)
             if dom and dom != target_domain:
                 domains.add(dom)
 
+            # Process extracted URLs
             for extracted_url in extracted_urls:
                 if extracted_url not in processed:
                     all_urls.add(extracted_url)
@@ -419,7 +334,7 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
     logger.info(f"Crawler {task_id} finished: {len(all_urls)} URLs, {len(combined)} domains/IPs")
 
 # ---------------------------------------------------------------------
-# Flask routes – including cancellation
+# FLASK ROUTES (unchanged)
 # ---------------------------------------------------------------------
 
 def register_routes(app):
@@ -513,7 +428,6 @@ def register_routes(app):
                     yield f"event: {status}\ndata: \n\n"
                     break
 
-                # Check every 2 seconds – low traffic
                 time.sleep(2)
 
         return Response(stream_with_context(event_generator()), mimetype="text/event-stream")
