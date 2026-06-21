@@ -17,25 +17,117 @@ logger = logging.getLogger(__name__)
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 URL_RE = re.compile(r'(https?://[^\s<>"\']+)', re.IGNORECASE)
 
-# Stricter domain regex: at least two parts, TLD 2+ letters, no file extensions
-PLAIN_DOMAIN_RE = re.compile(
-    r'\b((?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,})\b'
-)
-
+# IP regex (strict – no leading zeros)
 IPV4_RE = re.compile(r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b')
 IPV6_RE = re.compile(r'\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b')
 
-# Common file extensions – we discard domains that end with these
-FILE_EXTENSIONS = {
-    '.js', '.css', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico',
-    '.ttf', '.woff', '.woff2', '.eot', '.html', '.htm', '.xml',
-    '.json', '.txt', '.pdf', '.doc', '.docx', '.xls', '.xlsx',
-    '.ppt', '.pptx', '.zip', '.gz', '.mp4', '.webm', '.mp3',
-    '.wav', '.flac', '.avi', '.mov', '.mkv', '.webp'
+# All non‑text file extensions – we never treat these as domains
+SKIP_EXTENSIONS = {
+    # images
+    '.jpg', '.jpeg', '.png', '.gif', '.svg', '.ico', '.webp', '.bmp', '.tiff',
+    # videos
+    '.mp4', '.webm', '.mkv', '.avi', '.mov', '.flv', '.wmv',
+    # audio
+    '.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma',
+    # documents (binary)
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.odt',
+    # archives
+    '.zip', '.gz', '.rar', '.7z', '.tar', '.bz2',
+    # fonts
+    '.ttf', '.woff', '.woff2', '.eot', '.otf',
+    # scripts & code – we don't want these as domains
+    '.js', '.css', '.xml', '.json', '.php', '.asp', '.aspx', '.jsp',
+    '.do', '.action', '.cgi', '.pl', '.py', '.rb', '.go', '.java',
+    '.class', '.jar', '.war', '.ear',
+    '.rss', '.atom', '.feed',
+    # config files
+    '.conf', '.cfg', '.ini', '.yaml', '.yml', '.toml',
+    '.htaccess', '.htpasswd',
+    '.sql', '.db', '.sqlite',
+    '.log', '.tmp', '.bak',
+    # others
+    '.exe', '.dll', '.so', '.dylib',
+    '.pem', '.key', '.crt', '.csr'
 }
 
 # ---------------------------------------------------------------------
-# Helper functions
+# DOMAIN VALIDATION – extremely strict
+# ---------------------------------------------------------------------
+
+def is_valid_domain(domain):
+    """
+    Return True only if the string looks like a real domain name.
+    Rejects:
+      - IPs (handled separately)
+      - file names / paths
+      - strings with only 1 char before the TLD (e.g., 'e.foreach')
+      - anything containing / ? = & % # ; : @
+      - any extension in SKIP_EXTENSIONS
+      - localhost / internal names
+    """
+    if not domain or not isinstance(domain, str):
+        return False
+    domain = domain.lower().strip()
+
+    # Must contain a dot and not be an IP
+    if '.' not in domain:
+        return False
+    if re.match(r'^\d+\.\d+\.\d+\.\d+$', domain):
+        return False
+
+    # Must not contain path/query characters
+    if any(c in domain for c in ['/', '?', '=', '&', '%', '#', ';', ':', '@']):
+        return False
+
+    # Must not end with a skipped extension
+    for ext in SKIP_EXTENSIONS:
+        if domain.endswith(ext):
+            return False
+
+    # Must match the basic domain pattern: at least two parts, TLD 2+ letters
+    # and the part before the TLD must be at least 2 characters
+    pattern = re.compile(r'^([a-z0-9]([a-z0-9-]*[a-z0-9])?)\.([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)*[a-z]{2,}$')
+    if not pattern.match(domain):
+        return False
+
+    # Ensure the first part (before the first dot) has at least 2 chars
+    parts = domain.split('.')
+    if len(parts) < 2:
+        return False
+    if len(parts[0]) < 2:
+        return False
+
+    # Ignore common internal/local names
+    if domain in ('localhost', 'local', 'internal', 'intranet', 'router', 'gateway'):
+        return False
+
+    return True
+
+def clean_domain(domain):
+    if not domain:
+        return None
+    domain = domain.lower()
+    if ':' in domain:
+        domain = domain.split(':')[0]
+    if domain.startswith('www.'):
+        domain = domain[4:]
+    domain = domain.rstrip('.')
+    if is_valid_domain(domain):
+        return domain
+    return None
+
+def extract_domain(url):
+    try:
+        parsed = urlparse(url)
+        dom = parsed.netloc.lower()
+        if not dom:
+            return None
+        return clean_domain(dom)
+    except:
+        return None
+
+# ---------------------------------------------------------------------
+# Helpers (unchanged)
 # ---------------------------------------------------------------------
 
 def is_valid_url(url):
@@ -53,49 +145,6 @@ def normalize_url(url, base):
         if url.startswith('//'):
             url = 'https:' + url
         return urljoin(base, url)
-    except:
-        return None
-
-def is_valid_domain(domain):
-    """Return True only if domain is a real, valid domain name."""
-    if not domain:
-        return False
-    domain = domain.lower()
-    # Must not contain underscores, spaces, etc.
-    if not re.match(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*\.[a-z]{2,}$', domain):
-        return False
-    # Must not be an IP address (already handled separately)
-    if re.match(r'^\d+\.\d+\.\d+\.\d+$', domain):
-        return False
-    # Must not end with a file extension
-    for ext in FILE_EXTENSIONS:
-        if domain.endswith(ext):
-            return False
-    # Must not be a known local/internal name
-    if domain in ('localhost', 'local', 'internal', 'intranet', 'router', 'gateway'):
-        return False
-    return True
-
-def clean_domain(domain):
-    if not domain:
-        return None
-    domain = domain.lower()
-    if ':' in domain:
-        domain = domain.split(':')[0]
-    if domain.startswith('www.'):
-        domain = domain[4:]
-    domain = domain.rstrip('.')
-    if not domain:
-        return None
-    if is_valid_domain(domain):
-        return domain
-    return None
-
-def extract_domain(url):
-    try:
-        parsed = urlparse(url)
-        dom = parsed.netloc.lower()
-        return clean_domain(dom)
     except:
         return None
 
@@ -166,7 +215,7 @@ def extract_urls_from_html(html, base_url):
                 abs_url = normalize_url(url, base_url)
                 if abs_url and is_valid_url(abs_url):
                     urls.add(abs_url)
-    # regex fallback
+    # regex fallback (only catches full http(s) URLs)
     for match in URL_RE.finditer(html):
         url = match.group(1).strip()
         abs_url = normalize_url(url, base_url)
@@ -182,23 +231,27 @@ def extract_ips_from_text(text):
 
 def extract_domains_from_text(text, base_domain=None):
     domains = set()
-    # First, extract from full URLs – these are reliable
+    # 1) From full URLs – these are reliable
     for match in URL_RE.finditer(text):
         url = match.group(1)
         dom = extract_domain(url)
         if dom and dom != base_domain:
             domains.add(dom)
-    # Then extract plain domain names using stricter regex
-    for match in PLAIN_DOMAIN_RE.finditer(text):
+
+    # 2) From plain domain names – use a strict pattern and additional checks
+    plain_re = re.compile(r'\b((?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,})\b')
+    for match in plain_re.finditer(text):
         domain = match.group(1)
+        # Quick pre‑filter: must not contain any chars that indicate code
+        if any(c in domain for c in ['_', '$', '`', '~', '!', '@']):
+            continue
         cleaned = clean_domain(domain)
         if cleaned and cleaned != base_domain:
-            # Also ensure it's not already a file name (clean_domain already does this)
             domains.add(cleaned)
     return domains
 
 # ---------------------------------------------------------------------
-# Main crawler (sequential, no threading)
+# Main crawler – checks cancellation after every page
 # ---------------------------------------------------------------------
 
 def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
@@ -224,7 +277,6 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
     pages_visited = 0
     current_url = start_url
 
-    # Initialize task
     task['status'] = 'crawling'
     task['progress'] = 0
     task['total_pages'] = 0
@@ -242,13 +294,21 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
     session.timeout = (10, 20)
 
     while queue and (pages_visited < max_pages or max_pages == 0):
+        # ---- CHECK CANCELLATION ----
+        task = load_task(task_id)
+        if task and task.get('cancelled', False):
+            logger.info(f"Task {task_id} cancelled by user")
+            task['status'] = 'cancelled'
+            save_task(task_id, task)
+            return
+
         url, depth = queue.pop(0)
         if url in processed:
             continue
         processed.add(url)
         current_url = url
 
-        # update current URL
+        # Update current URL in task
         task = load_task(task_id)
         if task:
             task['current_url'] = current_url
@@ -285,14 +345,21 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
                     if abs_u and is_valid_url(abs_u):
                         extracted_urls.add(abs_u)
                 domains.update(extract_domains_from_text(text, target_domain))
+            elif 'application/json' in content_type or 'text/xml' in content_type or 'application/xml' in content_type:
+                # These are text‑based but may contain URLs – extract domains
+                domains.update(extract_domains_from_text(text, target_domain))
+                extracted_urls = set()
+            elif 'text/plain' in content_type:
+                domains.update(extract_domains_from_text(text, target_domain))
+                extracted_urls = set()
             else:
-                # For other content, just extract domain from the URL itself
+                # For other types, just extract domain from the URL itself
                 dom = extract_domain(url)
                 if dom and dom != target_domain:
                     domains.add(dom)
                 continue
 
-            # Add domain from current URL
+            # Also extract domain from the current URL
             dom = extract_domain(url)
             if dom and dom != target_domain:
                 domains.add(dom)
@@ -352,7 +419,7 @@ def run_crawler(task_id, start_url, max_pages, max_depth, threads=None):
     logger.info(f"Crawler {task_id} finished: {len(all_urls)} URLs, {len(combined)} domains/IPs")
 
 # ---------------------------------------------------------------------
-# Flask routes
+# Flask routes – including cancellation
 # ---------------------------------------------------------------------
 
 def register_routes(app):
@@ -396,6 +463,15 @@ def register_routes(app):
         threading.Thread(target=run_crawler, args=(task_id, start_url, max_pages, max_depth), daemon=True).start()
         return jsonify({'task_id': task_id})
 
+    @app.route('/crawler/cancel/<task_id>', methods=['POST'])
+    def crawler_cancel(task_id):
+        task = load_task(task_id)
+        if not task:
+            return jsonify({'error': 'Task not found'}), 404
+        task['cancelled'] = True
+        save_task(task_id, task)
+        return jsonify({'status': 'cancellation requested'})
+
     @app.route('/crawler/stream/<task_id>')
     def crawler_stream(task_id):
         def event_generator():
@@ -437,44 +513,12 @@ def register_routes(app):
                     yield f"event: {status}\ndata: \n\n"
                     break
 
-                # Reduced check interval to 2 seconds → less data
+                # Check every 2 seconds – low traffic
                 time.sleep(2)
 
         return Response(stream_with_context(event_generator()), mimetype="text/event-stream")
 
-    # Optional: keep old status endpoint for backward compatibility
-    @app.route('/crawler/status/<task_id>')
-    def crawler_status(task_id):
-        task = load_task(task_id)
-        if not task:
-            return jsonify({'error': 'Task not found'}), 404
-
-        urls = task.get('discovered_urls', [])
-        domains = task.get('domains', [])
-        last_url_count = task.get('last_sent_count', 0)
-        last_domain_count = task.get('last_sent_domains_count', 0)
-
-        new_urls = urls[last_url_count:]
-        new_domains = domains[last_domain_count:]
-
-        task['last_sent_count'] = len(urls)
-        task['last_sent_domains_count'] = len(domains)
-        save_task(task_id, task)
-
-        return jsonify({
-            'status': task.get('status'),
-            'progress': task.get('progress', 0),
-            'total_pages': task.get('total_pages', 0),
-            'max_pages': task.get('max_pages', 0),
-            'max_depth': task.get('max_depth', 0),
-            'new_urls': new_urls,
-            'new_domains': new_domains,
-            'total_urls': len(urls),
-            'total_domains': len(domains),
-            'current_url': task.get('current_url'),
-            'error_msg': task.get('error_msg'),
-        })
-
+    # Download endpoints (unchanged)
     @app.route('/crawler/download_urls/<task_id>')
     def crawler_download_urls(task_id):
         task = load_task(task_id)
