@@ -64,6 +64,7 @@
 
 <script>
 (function() {
+    console.log('web_crawler.js loaded');
     const form = document.getElementById('crawlerForm');
     const startUrlInput = document.getElementById('startUrl');
     const maxPagesInput = document.getElementById('maxPages');
@@ -94,13 +95,11 @@
 
     let currentTaskId = null;
     let pollInterval = null;
-    const POLL_INTERVAL_MS = 30000; // 30 seconds
+    const POLL_INTERVAL_MS = 30000;
 
-    // Store all discovered items to append new ones
     let allUrls = [];
     let allDomains = [];
 
-    // Toggle bruteforce options
     enableBfCheck.addEventListener('change', function() {
         bfOptions.style.display = this.checked ? 'flex' : 'none';
     });
@@ -140,7 +139,6 @@
         const extensions = extensionsInput.value.trim() || '.php,.html,.txt';
         const threadsBf = parseInt(threadsBfInput.value) || 20;
 
-        // Reset stored lists for new crawl
         allUrls = [];
         allDomains = [];
 
@@ -194,11 +192,8 @@
             const totalDomains = data.total_domains || 0;
             const currentUrl = data.current_url || '-';
 
-            // Append new items
             allUrls = allUrls.concat(newUrls);
             allDomains = allDomains.concat(newDomains);
-
-            // Remove duplicates (just in case)
             allUrls = [...new Set(allUrls)];
             allDomains = [...new Set(allDomains)];
 
@@ -208,14 +203,12 @@
             domainCountSpan.textContent = allDomains.length;
             lastUpdateSpan.textContent = new Date().toLocaleTimeString();
 
-            // Show total if truncated
             if (totalUrls > allUrls.length) {
                 urlTotalNote.textContent = `(showing ${allUrls.length} of ${totalUrls})`;
             } else {
                 urlTotalNote.textContent = '';
             }
 
-            // Render URL list (show all, but limit display for performance)
             if (allUrls.length > 0) {
                 let html = '';
                 const displayUrls = allUrls.slice(0, 200);
@@ -284,7 +277,6 @@
         }
     }
 
-    // Show saved files
     showSavedBtn.addEventListener('click', async function() {
         try {
             const resp = await fetch('/crawler/list_files');
