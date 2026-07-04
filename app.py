@@ -25,6 +25,8 @@ from tasks import (
 )
 from features import register_all_features
 
+HEARTBEAT_SECONDS = 15  # max time an SSE worker thread blocks before it must check the socket is alive
+
 WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'your-super-secret-webhook-key')
 GITHUB_DEPLOY_KEY = os.path.expanduser('~/.ssh/github_deploy')
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -199,10 +201,23 @@ def create_app():
                 initial = json.dumps(get_active_tasks())
                 yield f"data: {initial}\n\n"
 
-                # Then block until a new update arrives
+                # Block until a new update arrives, but never for longer than
+                # HEARTBEAT_SECONDS. Without a timeout here, a stale/dead
+                # client (closed laptop lid, dropped wifi, phone locked,
+                # reconnecting EventSource, etc.) leaves this generator -
+                # and the waitress worker thread running it - blocked on
+                # q.get() forever. With only a handful of worker threads
+                # total, a few stuck SSE clients are enough to starve every
+                # other route on the site (this was the cause of the site
+                # "hanging"/stopping after a while). Sending a periodic
+                # comment forces a real socket write, which raises promptly
+                # if the client is actually gone, so the thread is freed.
                 while True:
-                    data = q.get()          # blocks until broadcast puts something
-                    yield f"data: {data}\n\n"
+                    try:
+                        data = q.get(timeout=HEARTBEAT_SECONDS)
+                        yield f"data: {data}\n\n"
+                    except queue.Empty:
+                        yield ": heartbeat\n\n"
             except GeneratorExit:
                 # Client disconnected
                 pass
@@ -280,4 +295,19 @@ if __name__ == '__main__':
 
     app = create_app()
     logger.info("Starting server on 0.0.0.0:5000")
-    serve(app, host='0.0.0.0', port=5000, threads=6)
+    # threads=6 was too small: this app has a long-lived SSE endpoint
+    # (/tasks/stream) where each connected client occupies a worker thread
+    # for as long as the tab is open. With only 6 threads total, a handful
+    # of open tabs/reconnects was enough to starve every other route on the
+    # site, which is why it appeared to "stop loading after some time."
+    # A bigger pool gives normal requests room to run alongside SSE
+    # clients, and channel_timeout ensures waitress itself closes any
+    # connection (SSE or otherwise) that goes fully idle at the socket
+    # level, as a second line of defense on top of the heartbeat above.
+    serve(
+        app,
+        host='0.0.0.0',
+        port=5000,
+        threads=32,
+        channel_timeout=120,
+    )
