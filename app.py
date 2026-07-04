@@ -28,7 +28,7 @@ from features import register_all_features
 
 HEARTBEAT_SECONDS = 15  # max time an SSE worker thread blocks before it must check the socket is alive
 
-WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'your-super-secret-webhook-key')
+WEBHOOK_SECRET = "atomisfake"
 GITHUB_DEPLOY_KEY = os.path.expanduser('~/.ssh/github_deploy')
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 REQUIREMENTS_FILE = os.path.join(REPO_DIR, 'requirements.txt')
