@@ -200,3 +200,4 @@ function formatSpeed(bytesPerSec) {
     window.fetchTasks = fetchTasks;
     console.log('app.js loaded with SSE (no polling)');
 })();
+
