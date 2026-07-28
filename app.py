@@ -272,6 +272,18 @@ def create_app():
         logger.info(f"Killed ffmpeg: {killed}")
         return jsonify({'status': 'killed', 'pids': killed})
 
+    # ---------- Generic result download (used by url/ocr/face_swap/clipper/app.js) ----------
+    @app.route('/download/<path:filename>')
+    def download(filename):
+        # filename is always a plain name written into UPLOAD_FOLDER by the
+        # feature modules (e.g. task['output_file']) - no subdirectories are
+        # ever placed there, so this is safe to serve directly.
+        safe_name = os.path.basename(filename)
+        full_path = os.path.join(UPLOAD_FOLDER, safe_name)
+        if not os.path.exists(full_path) or os.path.isdir(full_path):
+            return jsonify({'error': 'File not found'}), 404
+        return send_from_directory(UPLOAD_FOLDER, safe_name, as_attachment=True)
+
     @app.route('/')
     def index():
         return render_template('index.html')
