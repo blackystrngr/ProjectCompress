@@ -17,7 +17,7 @@ os.makedirs(PROXY_CACHE_DIR, exist_ok=True)
 ALLOWED_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.m4v'}
 
 # HTTP proxy (for direct URL downloads)
-PROXY_URL = os.environ.get('PROXY_URL', 'http://hib:hib@129.150.32.142:12345')
+PROXY_URL = os.environ.get('PROXY_URL', '')
 PROXY_DICT = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 
 # Google Drive
