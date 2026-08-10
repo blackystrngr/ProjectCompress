@@ -1,7 +1,7 @@
 <div class="card">
-    <h2><i class="fas fa-cut"></i> Video Clipper, Summarizer & Face Swap</h2>
+    <h2><i class="fas fa-cut"></i> Video Clipper, Summarizer, Frame Extractor & Face Swap</h2>
 
-    <!-- ========== Random Clips Section ========== -->
+    <!-- ========== Random Clips ========== -->
     <div style="margin-bottom: 2rem; padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
         <h3><i class="fas fa-random"></i> Random Clips</h3>
         <p>Divides video into segments, picks a random clip from each, and merges them.</p>
@@ -21,7 +21,7 @@
         <div id="randomResult" class="empty-state">Select a video and click Generate.</div>
     </div>
 
-    <!-- ========== AI Summarizer Section ========== -->
+    <!-- ========== AI Summarizer ========== -->
     <div style="margin-bottom: 2rem; padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
         <h3><i class="fas fa-magic"></i> AI Summarizer</h3>
         <p>Evenly spaced clips to create a summary video.</p>
@@ -41,7 +41,30 @@
         <div id="summaryResult" class="empty-state">Select a video and click Generate.</div>
     </div>
 
-    <!-- ========== Face Swap Section (NEW) ========== -->
+    <!-- ========== Frame Extractor (NEW) ========== -->
+    <div style="margin-bottom: 2rem; padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
+        <h3><i class="fas fa-images"></i> Extract Frames</h3>
+        <p>Extract one frame every N seconds from the video. All frames are saved in a ZIP file.</p>
+        <div class="input-group" style="flex-wrap: wrap;">
+            <div style="flex:2; min-width:150px;"><div style="font-size:0.7rem; color:#aaa;">Video file</div>
+                <select id="frameVideoSelect" style="width:100%;"><option>Loading videos...</option></select>
+            </div>
+            <div style="width:100px;"><div style="font-size:0.7rem; color:#aaa;">Interval (sec)</div>
+                <input type="number" id="frameInterval" value="5" min="0.1" step="0.1" style="width:100%;">
+            </div>
+            <div style="width:100px;"><div style="font-size:0.7rem; color:#aaa;">Format</div>
+                <select id="frameFormat" style="width:100%;">
+                    <option value="jpg">JPG</option>
+                    <option value="png">PNG</option>
+                </select>
+            </div>
+            <div style="align-self:flex-end;"><button id="extractFramesBtn" class="primary"><i class="fas fa-images"></i> Extract Frames</button></div>
+        </div>
+        <div id="frameStatus" class="help-text"></div>
+        <div id="frameResult" class="empty-state">Select a video and click Extract Frames.</div>
+    </div>
+
+    <!-- ========== Face Swap ========== -->
     <div style="padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
         <h3><i class="fas fa-exchange-alt"></i> Face Swap – Photo to Video</h3>
         <p>Select a video and upload a face photo. The face will be swapped onto the video.</p>
@@ -60,7 +83,7 @@
 </div>
 
 <script>
-// ========== Helper Functions (in case app.js not loaded) ==========
+// ========== Helper Functions ==========
 function escapeHtml(str) {
     if (!str) return '';
     return str.replace(/[&<>]/g, function(m) {
@@ -75,12 +98,12 @@ function showToast(msg, isErr) {
     else alert((isErr ? 'Error: ' : '') + msg);
 }
 
-// ========== Load videos for all three dropdowns ==========
+// ========== Load Videos for All Dropdowns ==========
 async function loadAllVideos() {
     try {
         const resp = await fetch('/clipper/list_videos');
         const videos = await resp.json();
-        const selects = ['randomVideoSelect', 'summaryVideoSelect', 'faceSwapVideoSelect'];
+        const selects = ['randomVideoSelect', 'summaryVideoSelect', 'faceSwapVideoSelect', 'frameVideoSelect'];
         selects.forEach(id => {
             const sel = document.getElementById(id);
             if (!sel) return;
@@ -90,13 +113,12 @@ async function loadAllVideos() {
             } else {
                 videos.forEach(v => {
                     const opt = document.createElement('option');
-                    opt.value = v.name;
+                    opt.value = v.path;
                     opt.textContent = v.name;
                     sel.appendChild(opt);
                 });
             }
         });
-        console.log('Videos loaded for all clipper sections');
     } catch (err) {
         console.error('Load videos error:', err);
         showToast('Failed to load videos', true);
@@ -104,7 +126,7 @@ async function loadAllVideos() {
 }
 loadAllVideos();
 
-// ========== Random Clips (existing) ==========
+// ========== Random Clips ==========
 let randomTaskId = null, randomTimer = null;
 document.getElementById('randomBtn').onclick = async () => {
     const video = document.getElementById('randomVideoSelect').value;
@@ -119,6 +141,12 @@ document.getElementById('randomBtn').onclick = async () => {
     const data = await resp.json();
     if (data.error) { alert(data.error); return; }
     randomTaskId = data.task_id;
+    // Store for persistence
+    if (typeof storeTaskId === 'function') {
+        storeTaskId('random_clips', randomTaskId);
+    } else {
+        localStorage.setItem('random_clips_task_id', randomTaskId);
+    }
     const st = document.getElementById('randomStatus'), res = document.getElementById('randomResult');
     st.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Processing...';
     res.innerHTML = '<div class="empty-state">Please wait...</div>';
@@ -130,17 +158,20 @@ document.getElementById('randomBtn').onclick = async () => {
             clearInterval(randomTimer);
             st.innerHTML = `✅ Done! <a href="/download/${t.output_file}" target="_blank">Download</a>`;
             res.innerHTML = `<div class="empty-state">✅ Ready: <a href="/download/${t.output_file}">${t.output_file}</a></div>`;
+            localStorage.removeItem('random_clips_task_id');
         } else if (t.status === 'error') {
             clearInterval(randomTimer);
             st.innerHTML = `❌ Error: ${t.error_msg}`;
             res.innerHTML = '<div class="empty-state">Failed.</div>';
+            localStorage.removeItem('random_clips_task_id');
         } else {
             st.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${t.status} (${t.progress||0}%)`;
+            res.innerHTML = `<div class="empty-state">Processing (${t.progress||0}%)...</div>`;
         }
     }, 2000);
 };
 
-// ========== AI Summarizer (existing) ==========
+// ========== AI Summarizer ==========
 let summaryTaskId = null, summaryTimer = null;
 document.getElementById('summaryBtn').onclick = async () => {
     const video = document.getElementById('summaryVideoSelect').value;
@@ -154,6 +185,11 @@ document.getElementById('summaryBtn').onclick = async () => {
     const data = await resp.json();
     if (data.error) { alert(data.error); return; }
     summaryTaskId = data.task_id;
+    if (typeof storeTaskId === 'function') {
+        storeTaskId('summary', summaryTaskId);
+    } else {
+        localStorage.setItem('summary_task_id', summaryTaskId);
+    }
     const st = document.getElementById('summaryStatus'), res = document.getElementById('summaryResult');
     st.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Processing...';
     res.innerHTML = '<div class="empty-state">Please wait...</div>';
@@ -165,17 +201,62 @@ document.getElementById('summaryBtn').onclick = async () => {
             clearInterval(summaryTimer);
             st.innerHTML = `✅ Done! <a href="/download/${t.output_file}" target="_blank">Download</a>`;
             res.innerHTML = `<div class="empty-state">✅ Ready: <a href="/download/${t.output_file}">${t.output_file}</a></div>`;
+            localStorage.removeItem('summary_task_id');
         } else if (t.status === 'error') {
             clearInterval(summaryTimer);
             st.innerHTML = `❌ Error: ${t.error_msg}`;
             res.innerHTML = '<div class="empty-state">Failed.</div>';
+            localStorage.removeItem('summary_task_id');
         } else {
             st.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${t.status} (${t.progress||0}%)`;
+            res.innerHTML = `<div class="empty-state">Processing (${t.progress||0}%)...</div>`;
         }
     }, 2000);
 };
 
-// ========== Face Swap (new) ==========
+// ========== Frame Extractor ==========
+let frameTaskId = null, frameTimer = null;
+document.getElementById('extractFramesBtn').onclick = async () => {
+    const video = document.getElementById('frameVideoSelect').value;
+    if (!video) { alert('Select a video'); return; }
+    const interval = parseFloat(document.getElementById('frameInterval').value);
+    const format = document.getElementById('frameFormat').value;
+    if (isNaN(interval) || interval <= 0) { alert('Interval must be > 0'); return; }
+    const body = `video_file=${encodeURIComponent(video)}&interval=${interval}&format=${format}`;
+    const resp = await fetch('/clipper/extract_frames', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body });
+    const data = await resp.json();
+    if (data.error) { alert(data.error); return; }
+    frameTaskId = data.task_id;
+    if (typeof storeTaskId === 'function') {
+        storeTaskId('frame_extract', frameTaskId);
+    } else {
+        localStorage.setItem('frame_extract_task_id', frameTaskId);
+    }
+    const st = document.getElementById('frameStatus'), res = document.getElementById('frameResult');
+    st.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Extracting frames...';
+    res.innerHTML = '<div class="empty-state">Please wait...</div>';
+    if (frameTimer) clearInterval(frameTimer);
+    frameTimer = setInterval(async () => {
+        const prog = await fetch(`/progress/${frameTaskId}`);
+        const t = await prog.json();
+        if (t.status === 'done') {
+            clearInterval(frameTimer);
+            st.innerHTML = `✅ Done! ${t.total_frames} frames extracted. <a href="/download/${t.output_file}" target="_blank">Download ZIP</a>`;
+            res.innerHTML = `<div class="empty-state">✅ Ready: <a href="/download/${t.output_file}">${t.output_file}</a></div>`;
+            localStorage.removeItem('frame_extract_task_id');
+        } else if (t.status === 'error') {
+            clearInterval(frameTimer);
+            st.innerHTML = `❌ Error: ${t.error_msg}`;
+            res.innerHTML = '<div class="empty-state">Failed.</div>';
+            localStorage.removeItem('frame_extract_task_id');
+        } else {
+            st.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Extracting (${t.progress||0}%) – frame ${t.current_frame||0}/${t.total_frames||0}`;
+            res.innerHTML = `<div class="empty-state">Extracting frames... ${t.progress}%</div>`;
+        }
+    }, 2000);
+};
+
+// ========== Face Swap ==========
 let swapTaskId = null, swapTimer = null;
 const startSwapBtn = document.getElementById('startSwapBtn');
 const faceSwapVideoSelect = document.getElementById('faceSwapVideoSelect');
@@ -209,6 +290,11 @@ startSwapBtn.onclick = async () => {
         const data = await resp.json();
         if (data.error) throw new Error(data.error);
         swapTaskId = data.task_id;
+        if (typeof storeTaskId === 'function') {
+            storeTaskId('face_swap', swapTaskId);
+        } else {
+            localStorage.setItem('face_swap_task_id', swapTaskId);
+        }
         swapStatus.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Face swap started (may take several minutes)...';
         swapResult.innerHTML = '<div class="empty-state">Processing...</div>';
         if (swapTimer) clearInterval(swapTimer);
@@ -219,12 +305,15 @@ startSwapBtn.onclick = async () => {
                 clearInterval(swapTimer);
                 swapStatus.innerHTML = `✅ Done! <a href="/download/${t.output_file}" target="_blank">Download swapped video</a>`;
                 swapResult.innerHTML = `<div class="empty-state">✅ Result ready: <a href="/download/${t.output_file}">${t.output_file}</a></div>`;
+                localStorage.removeItem('face_swap_task_id');
             } else if (t.status === 'error') {
                 clearInterval(swapTimer);
                 swapStatus.innerHTML = `❌ Error: ${t.error_msg}`;
                 swapResult.innerHTML = '<div class="empty-state">Face swap failed.</div>';
+                localStorage.removeItem('face_swap_task_id');
             } else {
                 swapStatus.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${t.status} (${t.progress || 0}%)`;
+                swapResult.innerHTML = `<div class="empty-state">Processing (${t.progress || 0}%)...</div>`;
             }
         }, 2000);
     } catch (err) { showToast(err.message, true); }
