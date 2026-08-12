@@ -8,4 +8,4 @@ cd ..
 rm -rf ffmpeg-master-latest-linux64-gpl*
 
 # install pip packages
-pip install -r requirements.txt --break-system-packages --ingore-installed
+pip install -r requirements.txt --break-system-packages --ignore-installed
