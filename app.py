@@ -4,14 +4,11 @@ import os
 import sys
 import time
 import json
-import hashlib
 import logging
 import psutil
 import threading
-import hmac
-import subprocess
 import queue
-from flask import Flask, render_template, jsonify, request, send_from_directory, Response, stream_with_context
+from flask import Flask, render_template, jsonify, request, Response, stream_with_context
 from waitress import serve
 from werkzeug.exceptions import NotFound
 from config import SECRET_KEY, MAX_CONTENT_LENGTH, UPLOAD_FOLDER, TASKS_DIR
@@ -26,10 +23,6 @@ from tasks import (
 from features import register_all_features
 
 HEARTBEAT_SECONDS = 15
-
-WEBHOOK_SECRET = "atomisfake"
-GITHUB_DEPLOY_KEY = os.path.expanduser('~/.ssh/github_deploy')
-REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,69 +48,6 @@ def create_app():
         if request.path.startswith(('/api', '/get_tasks', '/progress')):
             return jsonify({'error': 'Endpoint not found'}), 404
         return render_template('index.html'), 404
-
-    # ---------- Webhook endpoint (pull only, no install) ----------
-    @app.route('/webhook', methods=['POST'])
-    def webhook():
-        payload = request.get_data()
-        signature = request.headers.get('X-Hub-Signature-256')
-
-        if WEBHOOK_SECRET and WEBHOOK_SECRET != 'your-super-secret-webhook-key':
-            if not signature:
-                logger.warning("Webhook signature missing")
-                return jsonify({'error': 'Signature missing'}), 401
-            expected = 'sha256=' + hmac.new(WEBHOOK_SECRET.encode(), payload, hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(signature, expected):
-                logger.warning(f"Invalid webhook signature. Expected {expected}, got {signature}")
-                return jsonify({'error': 'Invalid signature'}), 401
-        else:
-            logger.info("Webhook secret not set – skipping signature verification (development mode)")
-
-        event = request.headers.get('X-GitHub-Event')
-        if event != 'push':
-            return jsonify({'message': 'Ignored event'}), 200
-
-        logger.info("Received push event – pulling latest code...")
-
-        env = os.environ.copy()
-        if os.path.exists(GITHUB_DEPLOY_KEY):
-            env['GIT_SSH_COMMAND'] = f'ssh -i {GITHUB_DEPLOY_KEY} -o StrictHostKeyChecking=no'
-        else:
-            logger.warning(f"Deploy key not found at {GITHUB_DEPLOY_KEY} – using default SSH.")
-
-        try:
-            fetch_cmd = ['git', 'fetch', 'origin', 'main']
-            fetch_result = subprocess.run(fetch_cmd, cwd=REPO_DIR, capture_output=True, text=True, env=env)
-            if fetch_result.returncode != 0:
-                logger.error(f"Git fetch failed: {fetch_result.stderr}")
-                return jsonify({'error': 'Git fetch failed', 'details': fetch_result.stderr}), 500
-
-            reset_cmd = ['git', 'reset', '--hard', 'origin/main']
-            reset_result = subprocess.run(reset_cmd, cwd=REPO_DIR, capture_output=True, text=True, env=env)
-            if reset_result.returncode != 0:
-                logger.error(f"Git reset failed: {reset_result.stderr}")
-                return jsonify({'error': 'Git reset failed', 'details': reset_result.stderr}), 500
-
-            logger.info(f"Git reset succeeded: {reset_result.stdout}")
-        except Exception as e:
-            logger.exception("Git operation exception")
-            return jsonify({'error': str(e)}), 500
-
-        # Clean up stale task files (optional)
-        for tid in get_all_task_ids():
-            if not load_task(tid):
-                try:
-                    os.remove(os.path.join(TASKS_DIR, f"{tid}.json"))
-                except:
-                    pass
-
-        def restart():
-            time.sleep(1)
-            logger.info("Restarting Flask app...")
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-
-        threading.Thread(target=restart, daemon=True).start()
-        return jsonify({'status': 'updated, restarting...'}), 200
 
     # ---------- Global error handler ----------
     @app.errorhandler(Exception)
