@@ -28,10 +28,6 @@ class DownloadCancelled(Exception):
 # M3U8 DOWNLOAD (AUTO‑HEADERS)
 # ============================================================
 def download_m3u8_with_ytdlp(url, task_id):
-    """
-    Download an m3u8 stream using yt-dlp.
-    Automatically adds User-Agent, Referer, Origin.
-    """
     task = load_task(task_id)
     if not task:
         raise Exception("Task not found")
@@ -39,7 +35,8 @@ def download_m3u8_with_ytdlp(url, task_id):
     task['progress'] = 0
     save_task(task_id, task)
 
-    # ---- Check dependencies ----
+    # ---- Check dependencies with explicit paths ----
+    FFMPEG_PATH = '/usr/local/bin/ffmpeg'   # ← change if needed
     def check_dep(cmd):
         try:
             subprocess.run([cmd, '--version'], capture_output=True, check=True)
@@ -49,12 +46,11 @@ def download_m3u8_with_ytdlp(url, task_id):
 
     if not check_dep('yt-dlp'):
         raise Exception("yt-dlp is not installed. Please run: pip install yt-dlp")
-    if not check_dep('ffmpeg'):
-        raise Exception("ffmpeg is not installed. Please run: sudo apt install ffmpeg")
+    if not check_dep(FFMPEG_PATH):
+        raise Exception(f"ffmpeg not found at {FFMPEG_PATH}. Please install or adjust path.")
 
     # ---- Build command ----
     output_template = os.path.join(UPLOAD_FOLDER, f"{task_id}_m3u8.%(ext)s")
-
     user_agent = (
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
         'AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -77,9 +73,11 @@ def download_m3u8_with_ytdlp(url, task_id):
         '--user-agent', user_agent,
         '--referer', referer,
         '--add-header', f'Origin: {origin}',
-        '--verbose',   # <-- ADD VERBOSE for detailed logs
+        '--ffmpeg-location', FFMPEG_PATH,   # ← force ffmpeg path
+        '--verbose',
         url
     ]
+
 
     logger.info(f"Downloading m3u8 with headers: Referer={referer}, Origin={origin}")
     logger.info(f"Command: {' '.join(cmd)}")
