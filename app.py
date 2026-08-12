@@ -3,6 +3,7 @@ import shutil
 import sys
 import os
 
+
 def ensure_ffmpeg():
     """Install ffmpeg if missing (static build to /usr/local/bin)."""
     if shutil.which('ffmpeg') and shutil.which('ffprobe'):
