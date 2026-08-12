@@ -28,7 +28,12 @@ class DownloadCancelled(Exception):
 # ============================================================
 # M3U8 DOWNLOAD – auto‑detect ffmpeg
 # ============================================================
-def download_m3u8_with_ytdlp(url, task_id):
+def download_m3u8_with_ytdlp(url, task_id, cookies_file=None, extra_headers=None):
+    """
+    Download an m3u8 stream using yt-dlp.
+    - cookies_file: path to a Netscape-format cookies.txt (optional)
+    - extra_headers: list of "Header: value" strings to add (optional)
+    """
     task = load_task(task_id)
     if not task:
         raise Exception("Task not found")
@@ -36,43 +41,53 @@ def download_m3u8_with_ytdlp(url, task_id):
     task['progress'] = 0
     save_task(task_id, task)
 
-    # ---- Ensure /usr/local/bin is in PATH ----
     os.environ['PATH'] = '/usr/local/bin:' + os.environ.get('PATH', '')
 
-    # ---- Find ffmpeg dynamically ----
+    # ---- find ffmpeg ----
     ffmpeg_path = shutil.which('ffmpeg')
     if not ffmpeg_path:
-        # Fallback to common locations
         common_paths = ['/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg']
         for p in common_paths:
             if os.path.exists(p) and os.access(p, os.X_OK):
                 ffmpeg_path = p
                 break
     if not ffmpeg_path:
-        raise Exception("ffmpeg not found in PATH. Please install: sudo apt install ffmpeg")
-
-    # Verify it works
+        raise Exception("ffmpeg not found. Please install: sudo apt install ffmpeg")
     try:
         subprocess.run([ffmpeg_path, '-version'], capture_output=True, check=True)
     except Exception as e:
         raise Exception(f"ffmpeg at {ffmpeg_path} is not executable: {e}")
 
-    # ---- Check yt-dlp ----
     if not shutil.which('yt-dlp'):
-        raise Exception("yt-dlp is not installed. Please run: pip install yt-dlp")
+        raise Exception("yt-dlp not installed. Run: pip install yt-dlp")
 
-    # ---- Build command ----
+    # ---- build command ----
     output_template = os.path.join(UPLOAD_FOLDER, f"{task_id}_m3u8.%(ext)s")
-    user_agent = (
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-        'AppleWebKit/537.36 (KHTML, like Gecko) '
-        'Chrome/120.0.0.0 Safari/537.36'
-    )
+
+    # Real browser headers (Chrome on Windows)
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Cache-Control': 'max-age=0',
+    }
+
+    # Parse URL for Referer/Origin
     parsed = urlparse(url)
     base_url = f"{parsed.scheme}://{parsed.netloc}"
-    referer = base_url + '/' if not parsed.path else base_url
-    origin = base_url
+    referer = base_url + '/'  # default referer is the base domain
+    # If the URL has a path, we can use the full path as referer
+    if parsed.path and parsed.path != '/':
+        referer = base_url + parsed.path
 
+    # Build yt-dlp command
     cmd = [
         'yt-dlp',
         '-o', output_template,
@@ -82,18 +97,36 @@ def download_m3u8_with_ytdlp(url, task_id):
         '--no-mtime',
         '--no-warnings',
         '--ignore-errors',
-        '--user-agent', user_agent,
-        '--referer', referer,
-        '--add-header', f'Origin: {origin}',
-        '--ffmpeg-location', ffmpeg_path,   # force the exact path
+        '--user-agent', headers['User-Agent'],
+        '--referer', 'https://cumcams.cc/video/169242630/play',
+        '--add-header', f'Accept: {headers["Accept"]}',
+        '--add-header', f'Accept-Language: {headers["Accept-Language"]}',
+        '--add-header', f'Origin: {base_url}',
+        '--add-header', f'Sec-Fetch-Dest: {headers["Sec-Fetch-Dest"]}',
+        '--add-header', f'Sec-Fetch-Mode: {headers["Sec-Fetch-Mode"]}',
+        '--add-header', f'Sec-Fetch-Site: {headers["Sec-Fetch-Site"]}',
+        '--add-header', f'Upgrade-Insecure-Requests: {headers["Upgrade-Insecure-Requests"]}',
+        '--add-header', f'Cache-Control: {headers["Cache-Control"]}',
+        '--ffmpeg-location', ffmpeg_path,
         '--verbose',
-        url
     ]
 
+    # Add cookies if provided
+    if cookies_file and os.path.exists(cookies_file):
+        cmd += ['--cookies', cookies_file]
+
+    # Add any extra headers
+    if extra_headers:
+        for h in extra_headers:
+            cmd += ['--add-header', h]
+
+    cmd.append(url)
+
     logger.info(f"Using ffmpeg at: {ffmpeg_path}")
+    logger.info(f"Referer: {referer}")
     logger.info(f"Command: {' '.join(cmd)}")
 
-    # ---- Run yt-dlp ----
+    # ---- run yt-dlp ----
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     stderr_lines = []
     while True:
@@ -110,16 +143,24 @@ def download_m3u8_with_ytdlp(url, task_id):
                     if task:
                         task['progress'] = int(pct)
                         save_task(task_id, task)
+            if '404' in line or 'Not Found' in line:
+                logger.error("URL returned 404 – the link may require cookies or a specific referer.")
             if 'ERROR' in line or 'error' in line:
                 logger.error(f"yt-dlp: {line.strip()}")
     process.wait()
 
     if process.returncode != 0:
         full_stderr = ''.join(stderr_lines)
-        logger.error(f"yt-dlp stderr:\n{full_stderr}")
+        if '404' in full_stderr or 'Not Found' in full_stderr:
+            raise Exception(
+                "The m3u8 link returned 404 Not Found in yt-dlp (but works in browser). "
+                "The CDN likely requires additional headers (like cookies). "
+                "Please export your browser cookies to a cookies.txt file and pass it, "
+                "or provide the exact Referer URL from the page where the video is embedded."
+            )
         raise Exception(f"yt-dlp failed with code {process.returncode}. Check logs for details.")
 
-    # ---- Find output ----
+    # ---- find output ----
     files = [f for f in os.listdir(UPLOAD_FOLDER) if f.startswith(f"{task_id}_m3u8.")]
     if not files:
         raise Exception("No output file found. Check yt-dlp logs.")
