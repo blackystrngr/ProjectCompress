@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import threading
 import time
@@ -10,6 +11,7 @@ from tasks import save_task, load_task
 from config import UPLOAD_FOLDER, PROXY_DICT
 
 logger = logging.getLogger(__name__)
+
 TORRENT_AVAILABLE = False
 try:
     import libtorrent as lt
@@ -18,10 +20,71 @@ except ImportError:
     logger.warning("libtorrent not installed. Torrent downloads disabled.")
 
 class DownloadCancelled(Exception):
-    """Raised when the user cancels a download - never retried."""
     pass
 
 
+# ------------------------------------------------------------
+# M3U8 download with yt‑dlp (supports HLS streams)
+# ------------------------------------------------------------
+def download_m3u8_with_ytdlp(url, task_id):
+    """
+    Download an m3u8 stream using yt-dlp, merge to mp4, and save to UPLOAD_FOLDER.
+    """
+    task = load_task(task_id)
+    if not task:
+        raise Exception("Task not found")
+    task['status'] = 'downloading_m3u8'
+    task['progress'] = 0
+    save_task(task_id, task)
+
+    output_template = os.path.join(UPLOAD_FOLDER, f"{task_id}_m3u8.%(ext)s")
+    cmd = [
+        'yt-dlp',
+        '-o', output_template,
+        '-f', 'bestvideo+bestaudio/best',
+        '--merge-output-format', 'mp4',
+        '--no-part',
+        '--no-mtime',
+        '--no-warnings',
+        '--ignore-errors',
+        url
+    ]
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    while True:
+        line = process.stderr.readline()
+        if not line and process.poll() is not None:
+            break
+        # yt-dlp progress output looks like: [download] 45.3% of ~ 50.23MiB at  2.31MiB/s ETA 00:23
+        if '[download]' in line and '%' in line:
+            match = re.search(r'(\d+(?:\.\d+)?)%', line)
+            if match:
+                pct = float(match.group(1))
+                task = load_task(task_id)
+                if task:
+                    task['progress'] = int(pct)
+                    save_task(task_id, task)
+    process.wait()
+    if process.returncode != 0:
+        raise Exception(f"yt-dlp failed with code {process.returncode}")
+
+    # Find the downloaded file
+    output_files = [f for f in os.listdir(UPLOAD_FOLDER) if f.startswith(f"{task_id}_m3u8.") and f.endswith('.mp4')]
+    if not output_files:
+        raise Exception("No output file found")
+    final_name = _get_unique_filename(output_files[0].replace(f"{task_id}_m3u8.", ""))
+    final_path = os.path.join(UPLOAD_FOLDER, final_name)
+    os.rename(os.path.join(UPLOAD_FOLDER, output_files[0]), final_path)
+
+    task = load_task(task_id)
+    task['status'] = 'done'
+    task['progress'] = 100
+    task['output_file'] = final_name
+    save_task(task_id, task)
+
+
+# ------------------------------------------------------------
+# Existing download functions (unchanged)
+# ------------------------------------------------------------
 def download_with_requests(url, output_path, task_id):
     """Download with detailed progress and safe task access."""
     session = requests.Session()
@@ -33,7 +96,6 @@ def download_with_requests(url, output_path, task_id):
         'Connection': 'keep-alive',
     })
 
-    # Get total size
     total = 0
     try:
         head_resp = session.head(url, allow_redirects=True, timeout=30)
@@ -42,7 +104,6 @@ def download_with_requests(url, output_path, task_id):
     except:
         logger.warning("Could not get content-length.")
 
-    # Initialize task stats
     task = load_task(task_id)
     if task:
         task['status'] = 'downloading'
@@ -67,7 +128,6 @@ def download_with_requests(url, output_path, task_id):
             last_update = time.time()
             with open(output_path, 'wb') as f:
                 for chunk in resp.iter_content(chunk_size=8192):
-                    # Safe cancellation check – load task and verify
                     task = load_task(task_id)
                     if task and task.get('cancelled', False):
                         raise DownloadCancelled("Cancelled by user")
@@ -77,7 +137,7 @@ def download_with_requests(url, output_path, task_id):
                         now = time.time()
                         if now - last_update >= 1:
                             elapsed = now - start_time
-                            speed = (downloaded / elapsed) / 1024  # kB/s
+                            speed = (downloaded / elapsed) / 1024
                             pct = int(100 * downloaded / total) if total > 0 else 0
                             task = load_task(task_id)
                             if task:
@@ -87,7 +147,6 @@ def download_with_requests(url, output_path, task_id):
                                 task['elapsed_time'] = int(elapsed)
                                 save_task(task_id, task)
                             last_update = now
-            # Download complete
             task = load_task(task_id)
             if task:
                 task['download_progress'] = 100
@@ -98,17 +157,8 @@ def download_with_requests(url, output_path, task_id):
             return True
 
         except DownloadCancelled:
-            # User cancelled - never retry, propagate immediately.
             raise
         except Exception as e:
-            # Anything else (timeouts, connection resets, proxy hiccups,
-            # ChunkedEncodingError/ProtocolError from a dropped stream,
-            # etc) is treated as transient and retried. Previously only
-            # requests.exceptions.Timeout/ConnectionError were retried,
-            # so a single mid-stream proxy hiccup (a very common error
-            # type that is NOT a ConnectionError) would abort the whole
-            # download immediately and mark the task as 'error' - which
-            # looked like the downloader randomly "stopping".
             last_error = e
             logger.warning(f"Download attempt {attempt}/{retries} failed: {e}")
             if attempt == retries:
@@ -119,6 +169,10 @@ def download_with_requests(url, output_path, task_id):
         raise Exception(f"Download failed: {last_error}")
     return False
 
+
+# ------------------------------------------------------------
+# URL / Magnet / Torrent main entry
+# ------------------------------------------------------------
 def process_url_download(task_id, url):
     logger.info(f"process_url_download started for {task_id}")
     task = load_task(task_id)
@@ -126,6 +180,21 @@ def process_url_download(task_id, url):
         logger.error(f"Task {task_id} not found")
         return
 
+    # ---- Detect m3u8 ----
+    if '.m3u8' in url.lower():
+        try:
+            download_m3u8_with_ytdlp(url, task_id)
+            return
+        except Exception as e:
+            logger.exception(f"M3U8 download failed for {task_id}")
+            task = load_task(task_id)
+            if task and not task.get('cancelled', False):
+                task['status'] = 'error'
+                task['error_msg'] = str(e)
+                save_task(task_id, task)
+            return
+
+    # ---- Regular HTTP download ----
     temp = os.path.join(UPLOAD_FOLDER, f"{task_id}_raw.mp4")
     try:
         download_with_requests(url, temp, task_id)
@@ -157,6 +226,10 @@ def process_url_download(task_id, url):
         if os.path.exists(temp):
             os.remove(temp)
 
+
+# ------------------------------------------------------------
+# Torrent download (unchanged)
+# ------------------------------------------------------------
 def download_torrent(torrent_input, task_id, save_path):
     if not TORRENT_AVAILABLE:
         raise Exception("libtorrent not installed")
@@ -197,7 +270,7 @@ def download_torrent(torrent_input, task_id, save_path):
         status = handle.status()
         progress = int(status.progress * 100)
         downloaded = status.total_download
-        speed = int(status.download_rate / 1024)  # kB/s
+        speed = int(status.download_rate / 1024)
         task = load_task(task_id)
         if task:
             task['progress'] = progress
@@ -226,6 +299,7 @@ def download_torrent(torrent_input, task_id, save_path):
         task['download_speed'] = 0
         save_task(task_id, task)
 
+
 def process_torrent_download(task_id, torrent_input):
     try:
         download_torrent(torrent_input, task_id, UPLOAD_FOLDER)
@@ -236,6 +310,7 @@ def process_torrent_download(task_id, torrent_input):
             task['error_msg'] = str(e)
             save_task(task_id, task)
 
+
 def _get_unique_filename(filename):
     base, ext = os.path.splitext(filename)
     counter = 1
@@ -245,6 +320,10 @@ def _get_unique_filename(filename):
         counter += 1
     return new_name
 
+
+# ------------------------------------------------------------
+# Flask routes
+# ------------------------------------------------------------
 def register_routes(app):
     @app.route('/start', methods=['POST'])
     def start():
