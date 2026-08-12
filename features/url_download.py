@@ -6,6 +6,7 @@ import time
 import logging
 import requests
 import subprocess
+import shutil  # <-- ADDED
 from urllib.parse import urlparse
 from flask import request, jsonify
 from tasks import save_task, load_task
@@ -25,7 +26,7 @@ class DownloadCancelled(Exception):
 
 
 # ============================================================
-# M3U8 DOWNLOAD (AUTO‑HEADERS)
+# M3U8 DOWNLOAD – auto‑detect ffmpeg
 # ============================================================
 def download_m3u8_with_ytdlp(url, task_id):
     task = load_task(task_id)
@@ -34,6 +35,9 @@ def download_m3u8_with_ytdlp(url, task_id):
     task['status'] = 'downloading_m3u8'
     task['progress'] = 0
     save_task(task_id, task)
+
+    # ---- Ensure /usr/local/bin is in PATH ----
+    os.environ['PATH'] = '/usr/local/bin:' + os.environ.get('PATH', '')
 
     # ---- Find ffmpeg dynamically ----
     ffmpeg_path = shutil.which('ffmpeg')
@@ -81,7 +85,7 @@ def download_m3u8_with_ytdlp(url, task_id):
         '--user-agent', user_agent,
         '--referer', referer,
         '--add-header', f'Origin: {origin}',
-        '--ffmpeg-location', ffmpeg_path,   # <-- force this path
+        '--ffmpeg-location', ffmpeg_path,   # force the exact path
         '--verbose',
         url
     ]
@@ -135,11 +139,12 @@ def download_m3u8_with_ytdlp(url, task_id):
     task['output_file'] = final_name
     save_task(task_id, task)
     logger.info(f"M3U8 download completed: {final_name}")
+
+
 # ============================================================
 # DIRECT HTTP DOWNLOAD (with progress)
 # ============================================================
 def download_with_requests(url, output_path, task_id):
-    """Download with detailed progress and safe task access."""
     session = requests.Session()
     if PROXY_DICT:
         session.proxies = PROXY_DICT
@@ -149,7 +154,6 @@ def download_with_requests(url, output_path, task_id):
         'Connection': 'keep-alive',
     })
 
-    # Get total size
     total = 0
     try:
         head_resp = session.head(url, allow_redirects=True, timeout=30)
@@ -158,7 +162,6 @@ def download_with_requests(url, output_path, task_id):
     except:
         logger.warning("Could not get content-length.")
 
-    # Init task
     task = load_task(task_id)
     if task:
         task['status'] = 'downloading'
@@ -183,7 +186,6 @@ def download_with_requests(url, output_path, task_id):
             last_update = time.time()
             with open(output_path, 'wb') as f:
                 for chunk in resp.iter_content(chunk_size=8192):
-                    # Check cancellation
                     task = load_task(task_id)
                     if task and task.get('cancelled', False):
                         raise DownloadCancelled("Cancelled by user")
@@ -193,7 +195,7 @@ def download_with_requests(url, output_path, task_id):
                         now = time.time()
                         if now - last_update >= 1:
                             elapsed = now - start_time
-                            speed = (downloaded / elapsed) / 1024  # kB/s
+                            speed = (downloaded / elapsed) / 1024
                             pct = int(100 * downloaded / total) if total > 0 else 0
                             task = load_task(task_id)
                             if task:
@@ -203,7 +205,6 @@ def download_with_requests(url, output_path, task_id):
                                 task['elapsed_time'] = int(elapsed)
                                 save_task(task_id, task)
                             last_update = now
-            # Done
             task = load_task(task_id)
             if task:
                 task['download_progress'] = 100
@@ -400,7 +401,6 @@ def register_routes(app):
         }
         save_task(task_id, task_data)
 
-        # Detect torrent
         if url.startswith('magnet:') or (url.endswith('.torrent') and url.startswith(('http://', 'https://'))):
             if not TORRENT_AVAILABLE:
                 task_data['status'] = 'error'
@@ -427,7 +427,6 @@ def register_routes(app):
                             save_task(task_id, task)
             threading.Thread(target=fetch_torrent, daemon=True).start()
         else:
-            # Regular URL or m3u8 – handled in process_url_download
             def run():
                 process_url_download(task_id, url)
             threading.Thread(target=run, daemon=True).start()
