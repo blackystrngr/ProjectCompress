@@ -30,10 +30,7 @@ class DownloadCancelled(Exception):
 def download_m3u8_with_ytdlp(url, task_id):
     """
     Download an m3u8 stream using yt-dlp.
-    Automatically adds:
-      - User-Agent (real Chrome)
-      - Referer (extracted from the URL domain)
-      - Origin (extracted from the URL domain)
+    Automatically adds User-Agent, Referer, Origin.
     """
     task = load_task(task_id)
     if not task:
@@ -42,10 +39,22 @@ def download_m3u8_with_ytdlp(url, task_id):
     task['progress'] = 0
     save_task(task_id, task)
 
-    # --- Build command ---
+    # ---- Check dependencies ----
+    def check_dep(cmd):
+        try:
+            subprocess.run([cmd, '--version'], capture_output=True, check=True)
+            return True
+        except:
+            return False
+
+    if not check_dep('yt-dlp'):
+        raise Exception("yt-dlp is not installed. Please run: pip install yt-dlp")
+    if not check_dep('ffmpeg'):
+        raise Exception("ffmpeg is not installed. Please run: sudo apt install ffmpeg")
+
+    # ---- Build command ----
     output_template = os.path.join(UPLOAD_FOLDER, f"{task_id}_m3u8.%(ext)s")
 
-    # Headers
     user_agent = (
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
         'AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -68,40 +77,50 @@ def download_m3u8_with_ytdlp(url, task_id):
         '--user-agent', user_agent,
         '--referer', referer,
         '--add-header', f'Origin: {origin}',
+        '--verbose',   # <-- ADD VERBOSE for detailed logs
         url
     ]
 
     logger.info(f"Downloading m3u8 with headers: Referer={referer}, Origin={origin}")
+    logger.info(f"Command: {' '.join(cmd)}")
 
-    # --- Run yt-dlp ---
+    # ---- Run yt-dlp with full stderr capture ----
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    stderr_lines = []
     while True:
         line = process.stderr.readline()
         if not line and process.poll() is not None:
             break
-        if '[download]' in line and '%' in line:
-            match = re.search(r'(\d+(?:\.\d+)?)%', line)
-            if match:
-                pct = float(match.group(1))
-                task = load_task(task_id)
-                if task:
-                    task['progress'] = int(pct)
-                    save_task(task_id, task)
+        if line:
+            stderr_lines.append(line)
+            if '[download]' in line and '%' in line:
+                match = re.search(r'(\d+(?:\.\d+)?)%', line)
+                if match:
+                    pct = float(match.group(1))
+                    task = load_task(task_id)
+                    if task:
+                        task['progress'] = int(pct)
+                        save_task(task_id, task)
+            # Also log errors/warnings
+            if 'ERROR' in line or 'error' in line:
+                logger.error(f"yt-dlp: {line.strip()}")
     process.wait()
-    if process.returncode != 0:
-        stderr = process.stderr.read()
-        logger.error(f"yt-dlp stderr: {stderr}")
-        raise Exception(f"yt-dlp failed with code {process.returncode}: {stderr[:200]}...")
 
-    # --- Find the downloaded file ---
+    if process.returncode != 0:
+        # Log the full stderr
+        full_stderr = ''.join(stderr_lines)
+        logger.error(f"yt-dlp stderr:\n{full_stderr}")
+        raise Exception(f"yt-dlp failed with code {process.returncode}. Check logs for details.")
+
+    # ---- Find output ----
     files = [f for f in os.listdir(UPLOAD_FOLDER) if f.startswith(f"{task_id}_m3u8.")]
     if not files:
-        raise Exception("No output file found")
+        raise Exception("No output file found. Check yt-dlp logs.")
     # Prefer .mp4
     mp4_files = [f for f in files if f.endswith('.mp4')]
     chosen = mp4_files[0] if mp4_files else files[0]
     src = os.path.join(UPLOAD_FOLDER, chosen)
-    # Rename to a clean filename
+    # Clean filename
     base_name = re.sub(r'\.m3u8.*$', '', os.path.basename(url).split('?')[0])
     if not base_name:
         base_name = 'stream'
@@ -115,8 +134,6 @@ def download_m3u8_with_ytdlp(url, task_id):
     task['output_file'] = final_name
     save_task(task_id, task)
     logger.info(f"M3U8 download completed: {final_name}")
-
-
 # ============================================================
 # DIRECT HTTP DOWNLOAD (with progress)
 # ============================================================
