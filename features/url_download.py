@@ -35,19 +35,27 @@ def download_m3u8_with_ytdlp(url, task_id):
     task['progress'] = 0
     save_task(task_id, task)
 
-    # ---- Check dependencies with explicit paths ----
-    FFMPEG_PATH = '/usr/local/bin/ffmpeg'   # ← change if needed
-    def check_dep(cmd):
-        try:
-            subprocess.run([cmd, '--version'], capture_output=True, check=True)
-            return True
-        except:
-            return False
+    # ---- Find ffmpeg dynamically ----
+    ffmpeg_path = shutil.which('ffmpeg')
+    if not ffmpeg_path:
+        # Fallback to common locations
+        common_paths = ['/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg']
+        for p in common_paths:
+            if os.path.exists(p) and os.access(p, os.X_OK):
+                ffmpeg_path = p
+                break
+    if not ffmpeg_path:
+        raise Exception("ffmpeg not found in PATH. Please install: sudo apt install ffmpeg")
 
-    if not check_dep('yt-dlp'):
+    # Verify it works
+    try:
+        subprocess.run([ffmpeg_path, '-version'], capture_output=True, check=True)
+    except Exception as e:
+        raise Exception(f"ffmpeg at {ffmpeg_path} is not executable: {e}")
+
+    # ---- Check yt-dlp ----
+    if not shutil.which('yt-dlp'):
         raise Exception("yt-dlp is not installed. Please run: pip install yt-dlp")
-    if not check_dep(FFMPEG_PATH):
-        raise Exception(f"ffmpeg not found at {FFMPEG_PATH}. Please install or adjust path.")
 
     # ---- Build command ----
     output_template = os.path.join(UPLOAD_FOLDER, f"{task_id}_m3u8.%(ext)s")
@@ -73,16 +81,15 @@ def download_m3u8_with_ytdlp(url, task_id):
         '--user-agent', user_agent,
         '--referer', referer,
         '--add-header', f'Origin: {origin}',
-        '--ffmpeg-location', FFMPEG_PATH,   # ← force ffmpeg path
+        '--ffmpeg-location', ffmpeg_path,   # <-- force this path
         '--verbose',
         url
     ]
 
-
-    logger.info(f"Downloading m3u8 with headers: Referer={referer}, Origin={origin}")
+    logger.info(f"Using ffmpeg at: {ffmpeg_path}")
     logger.info(f"Command: {' '.join(cmd)}")
 
-    # ---- Run yt-dlp with full stderr capture ----
+    # ---- Run yt-dlp ----
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     stderr_lines = []
     while True:
@@ -99,13 +106,11 @@ def download_m3u8_with_ytdlp(url, task_id):
                     if task:
                         task['progress'] = int(pct)
                         save_task(task_id, task)
-            # Also log errors/warnings
             if 'ERROR' in line or 'error' in line:
                 logger.error(f"yt-dlp: {line.strip()}")
     process.wait()
 
     if process.returncode != 0:
-        # Log the full stderr
         full_stderr = ''.join(stderr_lines)
         logger.error(f"yt-dlp stderr:\n{full_stderr}")
         raise Exception(f"yt-dlp failed with code {process.returncode}. Check logs for details.")
@@ -114,11 +119,9 @@ def download_m3u8_with_ytdlp(url, task_id):
     files = [f for f in os.listdir(UPLOAD_FOLDER) if f.startswith(f"{task_id}_m3u8.")]
     if not files:
         raise Exception("No output file found. Check yt-dlp logs.")
-    # Prefer .mp4
     mp4_files = [f for f in files if f.endswith('.mp4')]
     chosen = mp4_files[0] if mp4_files else files[0]
     src = os.path.join(UPLOAD_FOLDER, chosen)
-    # Clean filename
     base_name = re.sub(r'\.m3u8.*$', '', os.path.basename(url).split('?')[0])
     if not base_name:
         base_name = 'stream'
