@@ -1,0 +1,67 @@
+# Netscape HTTP Cookie File
+# https://curl.haxx.se/rfc/cookie_spec.html
+# This is a generated file! Do not edit.
+
+.stripchat.com	TRUE	/	FALSE	1804825852	ABTest_ab_a_109472_part_3_key	C_279
+.stripchat.com	TRUE	/	FALSE	1804825852	ABTest_ab_a_113150_v3_key	X_279
+.stripchat.com	TRUE	/	FALSE	1804825852	ABTest_ab_a_117458_key	A_279
+.stripchat.com	TRUE	/	FALSE	1804825852	ABTest_ab_a_117990_part_1_key	N_279
+.stripchat.com	TRUE	/	FALSE	1804825852	ABTest_ab_a_119647_part_2_key	B_279
+.stripchat.com	TRUE	/	FALSE	1804825852	ABTest_ab_a_121282_key	X_279
+.stripchat.com	TRUE	/	FALSE	1804825852	ABTest_ab_a_122263_key	A_279
+.stripchat.com	TRUE	/	FALSE	1804825852	ABTest_ab_test_parallel_testing_1_v9_key	B_279
+.stripchat.com	TRUE	/	FALSE	1804825852	ABTest_ab_websocket_contract_validation_v2_key	B_279
+.stripchat.com	TRUE	/	TRUE	1796980408	stripchat_com_guestId	68eafbedd90578a38bc4dccfc69136ba12fb2f09e712e8190b708d8ce65a
+.stripchat.com	TRUE	/	FALSE	1804756408	stripchat_com_firstVisit	2026-09-12T09%3A13%3A28Z
+.stripchat.com	TRUE	/	FALSE	1804825852	isRecommendationDisabled	false
+stripchat.com	FALSE	/	FALSE	1804756411	mab_featured_group	4
+.stripchat.com	TRUE	/	FALSE	1797049851	localeDomain	en
+.stripchat.com	TRUE	/	FALSE	1804756411	alreadyVisited	1
+.stripchat.com	TRUE	/	TRUE	1804756456	guestFavoriteIds	
+.stripchat.com	TRUE	/	FALSE	1804756457	guestSubscriptionIds	
+.stripchat.com	TRUE	/	FALSE	1804756486	guestWatchHistoryStartDate	2026-09-12T09%3A14%3A46.111Z
+www.1porn.tv	FALSE	/	FALSE	1804756654	campaign_data	MHxub3wwfDB8bm8%3D
+.1porn.tv	TRUE	/	FALSE	1789379610	kt_ips	158.178.243.203
+www.1porn.tv	FALSE	/	FALSE	1804756655	kt_rt_theme	dark
+www.1porn.tv	FALSE	/	FALSE	1789898010	kt_tcookie	1
+www.1porn.tv	FALSE	/	FALSE	1804845210	kt_rt_lang2	true222
+.1porn.tv	TRUE	/	FALSE	1789379611	kt_is_visited	1
+ogs.google.com	FALSE	/	TRUE	1791802818	OTZ	8781780_34_34__34_
+.1porn.tv	TRUE	/	FALSE	1789379324	kt_qparams	dir%3Drocco-and-micky-lingerie-stockings-and-anal-creampie-not-a-creampie-but-cum
+.1porn.tv	TRUE	/	FALSE	0	PHPSESSID	dtdc89gh6cpjqb9hrlbmkak2b0
+.google.com	TRUE	/	TRUE	1804845082	NID	534=mOayVptTzgCuc8qCgChJtoW6wEUu8v5nYFwWmtoGlpsd32GToWneBi-yIPa9ScNDAGgVFrdY5vOMQv_hgFlrTkV_bGswg-Dd9ExuP_zg1_LOqKOhRpxWAn335DtNBT8pyVEuE2daDLZI1W1WjRccIdYLFr-NCDDq2nVt7TqsfsGnA9eCHV8Ph-SImQKE4EKIIH3fZvKuPCouKEo
+www.1porn.tv	FALSE	/	TRUE	1789898010	vh	%5B93799604%2C93817940%5D
+www.1porn.tv	FALSE	/	FALSE	1789296811	kt_rt_videoQuality_93799604	720p
+www.1porn.tv	FALSE	/cdn-cgi/challenge-platform	TRUE	0	__cf_ob	%7B%22cb%22%3A%7B%22cC%22%3A0%2C%22xC%22%3A0%2C%22pC%22%3A0%2C%22sC%22%3A0%2C%22cL%22%3A%5B%5D%7D%2C%22f%22%3A%7B%22t%22%3A%5B%5D%7D%2C%22k%22%3A%7B%22t%22%3A%5B%5D%7D%2C%22n%22%3A%7B%22t%22%3A%5B%7B%22p%22%3A%22%2Fvideos%2Fstepfamily-orgy-kitana-kat-elisa-and-marie-in-hot-anal-and-squirt-action%2F%22%2C%22t%22%3A%22a1108b88a9b57e9c7c65608fc1a0e2a8%22%2C%22nT%22%3A%22reload%22%2C%22r%22%3A%22https%3A%2F%2Fwww.1porn.tv%2Fsites%2Frocco-siffredi%2F20%2F%22%2C%22ts%22%3A1840.7999999970198%2C%22dw%22%3A5002.29999999702%7D%5D%7D%2C%22ptr%22%3A%7B%22pt%22%3A0%2C%22l%22%3A%5B%5B0%2C1158.4000244140625%2C36.60000228881836%2C2041.7999999970198%5D%2C%5B0%2C1198.4000244140625%2C5.400001525878906%2C2073.8999999910593%5D%2C%5B7%2C0%2C0%2C2078.2000000029802%5D%2C%5B6%2C0%2C0%2C4894.29999999702%5D%2C%5B0%2C1108%2C170.1999969482422%2C4894.399999991059%5D%2C%5B7%2C0%2C0%2C5065%5D%5D%2C%22tr%22%3Afalse%7D%2C%22v%22%3A%7B%22vH%22%3A0%2C%22vV%22%3A5640.899999991059%2C%22vC%22%3A0%2C%22fO%22%3A2%2C%22fI%22%3A1%7D%2C%22_to%22%3A1789293209159.6%2C%22_ti%22%3A%223ef45697-c754-40f1-9a5a-a99bcbbbdae5%22%2C%22_tsrc%22%3A%22stored%22%7D
+.stripchat.com	TRUE	/	FALSE	1804825852	ABTest_ab_a_109472_part_3_key	C_279
+.stripchat.com	TRUE	/	FALSE	1804825852	ABTest_ab_a_113150_v3_key	X_279
+.stripchat.com	TRUE	/	FALSE	1804825852	ABTest_ab_a_117458_key	A_279
+.stripchat.com	TRUE	/	FALSE	1804825852	ABTest_ab_a_117990_part_1_key	N_279
+.stripchat.com	TRUE	/	FALSE	1804825852	ABTest_ab_a_119647_part_2_key	B_279
+.stripchat.com	TRUE	/	FALSE	1804825852	ABTest_ab_a_121282_key	X_279
+.stripchat.com	TRUE	/	FALSE	1804825852	ABTest_ab_a_122263_key	A_279
+.stripchat.com	TRUE	/	FALSE	1804825852	ABTest_ab_test_parallel_testing_1_v9_key	B_279
+.stripchat.com	TRUE	/	FALSE	1804825852	ABTest_ab_websocket_contract_validation_v2_key	B_279
+.stripchat.com	TRUE	/	TRUE	1796980408	stripchat_com_guestId	68eafbedd90578a38bc4dccfc69136ba12fb2f09e712e8190b708d8ce65a
+.stripchat.com	TRUE	/	FALSE	1804756408	stripchat_com_firstVisit	2026-09-12T09%3A13%3A28Z
+.stripchat.com	TRUE	/	FALSE	1804825852	isRecommendationDisabled	false
+stripchat.com	FALSE	/	FALSE	1804756411	mab_featured_group	4
+.stripchat.com	TRUE	/	FALSE	1797049851	localeDomain	en
+.stripchat.com	TRUE	/	FALSE	1804756411	alreadyVisited	1
+.stripchat.com	TRUE	/	TRUE	1804756456	guestFavoriteIds	
+.stripchat.com	TRUE	/	FALSE	1804756457	guestSubscriptionIds	
+.stripchat.com	TRUE	/	FALSE	1804756486	guestWatchHistoryStartDate	2026-09-12T09%3A14%3A46.111Z
+www.1porn.tv	FALSE	/	FALSE	1804756654	campaign_data	MHxub3wwfDB8bm8%3D
+.1porn.tv	TRUE	/	FALSE	1789379610	kt_ips	158.178.243.203
+www.1porn.tv	FALSE	/	FALSE	1804756655	kt_rt_theme	dark
+www.1porn.tv	FALSE	/	FALSE	1789898010	kt_tcookie	1
+www.1porn.tv	FALSE	/	FALSE	1804845210	kt_rt_lang2	true222
+.1porn.tv	TRUE	/	FALSE	1789379611	kt_is_visited	1
+ogs.google.com	FALSE	/	TRUE	1791802818	OTZ	8781780_34_34__34_
+.stripchat.com	TRUE	/	TRUE	1804825854	cf_clearance	HhES3rMEAafLTGK_WKcp9s69k7JEkbIpXv2y0knI_68-1789273853-1.2.1.1-0kf5lSJfvZEvXWttfdHhWhguj9fSj9QqzZY9u7zus5p4zi.xTesIMN1nwkjmK8rpFsQzmzwprMXxMhCO52dxIQlQpqOy45bEMPlb0jgrrca1ptPmj7BsOq6Y1V5l7n2flNL287YXMNw11EzokG56Whps4_3WX.2D_t1VXcNeqKvoqhN0F9e0.q_Sapumr5VO.C2OREHh35fq_mqR0HV2YEq_4YPuWGz1V1c59VXvZ_mn.KjYoqar5ANURf39Uk.iX8IVQpytC.0vxtaPLXHGTdBmyHnxojCbSHuhyOJ8GyLso63y_oBJZ2nZe2KIn43vCsKPN_BDCryigAw7mp0pqE3IwEIFhMQE_6.CgI1gGPs
+.1porn.tv	TRUE	/	FALSE	1789379324	kt_qparams	dir%3Drocco-and-micky-lingerie-stockings-and-anal-creampie-not-a-creampie-but-cum
+.1porn.tv	TRUE	/	FALSE	0	PHPSESSID	dtdc89gh6cpjqb9hrlbmkak2b0
+.google.com	TRUE	/	TRUE	1804845082	NID	534=mOayVptTzgCuc8qCgChJtoW6wEUu8v5nYFwWmtoGlpsd32GToWneBi-yIPa9ScNDAGgVFrdY5vOMQv_hgFlrTkV_bGswg-Dd9ExuP_zg1_LOqKOhRpxWAn335DtNBT8pyVEuE2daDLZI1W1WjRccIdYLFr-NCDDq2nVt7TqsfsGnA9eCHV8Ph-SImQKE4EKIIH3fZvKuPCouKEo
+www.1porn.tv	FALSE	/	TRUE	1789898010	vh	%5B93799604%2C93817940%5D
+.1porn.tv	TRUE	/	TRUE	1804845211	cf_clearance	U_zhvS.MVgW9s9mW57fGfOFVVjpEtN5_UF9sdzuQc8w-1789293210-1.2.1.1-ksKOxD_kYMaeIHkbb7ig3cvpPp0.om6q471Q2yf_DmFSKO2EMojfJaeKPiI1wYurQjeGqZ7kwIRyzXrhNzg8z.4OjEDfVEYTiUNx9LZTcY5h1wTPQosCQelaqrZRJksRtsk8mDOzuiU3GECBs5sUpSF_nPdv2TX7CaxEtqST8UKZerGJ_.FBv0GAz7HFwD98zVatQiVEkkqsgnBwrxNr.QJ6HoEhkc8Mj4H6xQg3AH23nFE0s62c25gotXt0NqTqlzFjlhQd4aNCrFWTrNDkoidlm4qGoi3pZOplwp0rDNNO9OPWXMk9qJgSQYvS0YcSVZw3RGWMtP_dgydRELvzAxOIF9coBosDUlFIYjbZ4lU8F64ahu7olT8ELk.hAF.KeOf8ALYC8uWOxdlJvkvj8A
+www.1porn.tv	FALSE	/	FALSE	1789296811	kt_rt_videoQuality_93799604	720p
