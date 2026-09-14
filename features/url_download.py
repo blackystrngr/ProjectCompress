@@ -38,18 +38,21 @@ def download_with_ytdlp(url, task_id, format_spec=None):
       - chrome impersonation (bypasses Cloudflare / anti-bot)
       - cookies.txt (for logged-in content)
       - auto-merge to mp4
+    Parses yt-dlp output for total size, downloaded bytes, and speed.
     """
     task = load_task(task_id)
     if not task:
         raise Exception("Task not found")
     task['status'] = 'downloading'
     task['progress'] = 0
+    task['total_size'] = 0
+    task['downloaded_size'] = 0
+    task['download_speed'] = 0
     save_task(task_id, task)
 
-    # ---- Ensure /usr/local/bin is in PATH ----
     os.environ['PATH'] = '/usr/local/bin:' + os.environ.get('PATH', '')
 
-    # ---- Find ffmpeg ----
+    # ---- find ffmpeg ----
     ffmpeg_path = shutil.which('ffmpeg')
     if not ffmpeg_path:
         for p in ['/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg']:
@@ -62,11 +65,7 @@ def download_with_ytdlp(url, task_id, format_spec=None):
     if not shutil.which('yt-dlp'):
         raise Exception("yt-dlp not installed. Run: pip install -U yt-dlp")
 
-    # ---- Build output template ----
     output_template = os.path.join(UPLOAD_FOLDER, f"{task_id}_dl.%(ext)s")
-
-    # ---- Build yt-dlp command ----
-    # Format: user-specified (e.g. "720p") or fallback to best
     format_choice = format_spec or 'bestvideo+bestaudio/best'
 
     cmd = [
@@ -78,51 +77,97 @@ def download_with_ytdlp(url, task_id, format_spec=None):
         '--no-mtime',
         '--no-warnings',
         '--ignore-errors',
-        '--impersonate', 'chrome',              # <-- bypass anti-bot
+        '--impersonate', 'chrome',
         '--ffmpeg-location', ffmpeg_path,
-        '--newline',                            # <-- so we get one line per update
+        '--newline',
+        '--progress',
+        '--no-colors',
     ]
 
-    # Add cookies if present
     if os.path.exists(COOKIES_FILE):
         cmd += ['--cookies', COOKIES_FILE]
         logger.info(f"Using cookies from {COOKIES_FILE}")
     else:
-        logger.warning(f"No cookies.txt found at {COOKIES_FILE} – downloads may fail for login-only content.")
+        logger.warning(f"No cookies.txt found – downloads may fail for login-only content.")
 
     cmd.append(url)
-
     logger.info(f"yt-dlp command: {' '.join(cmd)}")
 
     # ---- Run yt-dlp ----
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,   # merge so we can read progress from stdout
+        stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
     )
 
     output_lines = []
+    total_size = 0
+    last_update_time = 0
+
+    # Regex patterns for yt-dlp output
+    # Example: [download]  45.3% of ~ 50.23MiB at  2.31MiB/s ETA 00:23
+    RE_PERCENT = re.compile(r'\[download\]\s+(\d+(?:\.\d+)?)%')
+    RE_TOTAL   = re.compile(r'of\s+~?\s*([\d.]+)\s*([KMGT]?i?B)')
+    RE_SPEED   = re.compile(r'at\s+([\d.]+)\s*([KMGT]?i?B)/s')
+
+    def to_bytes(value, unit):
+        """Convert a size like '50.23MiB' to bytes."""
+        unit = unit.upper().replace('IB', 'B')
+        factors = {
+            'B': 1,
+            'KB': 1024,
+            'MB': 1024 ** 2,
+            'GB': 1024 ** 3,
+            'TB': 1024 ** 4,
+        }
+        return int(value * factors.get(unit, 1))
+
     while True:
         line = process.stdout.readline()
         if not line and process.poll() is not None:
             break
-        if line:
-            output_lines.append(line)
-            # Progress lines: [download]  45.3% of ~ 50.23MiB at  2.31MiB/s ETA 00:23
-            if '[download]' in line and '%' in line:
-                match = re.search(r'(\d+(?:\.\d+)?)%', line)
-                if match:
-                    pct = float(match.group(1))
-                    task = load_task(task_id)
-                    if task:
-                        task['progress'] = int(pct)
-                        task['status'] = 'downloading'
-                        save_task(task_id, task)
-            # Log errors as they come
-            if 'ERROR' in line:
-                logger.error(f"yt-dlp: {line.strip()}")
+        if not line:
+            continue
+
+        output_lines.append(line)
+
+        # Parse percentage
+        pct_match = RE_PERCENT.search(line)
+        if pct_match:
+            pct = float(pct_match.group(1))
+
+            # Parse total size (may appear in same line)
+            total_match = RE_TOTAL.search(line)
+            if total_match:
+                total_size = to_bytes(float(total_match.group(1)), total_match.group(2))
+
+            # Parse speed
+            speed_match = RE_SPEED.search(line)
+            speed_kbps = 0
+            if speed_match:
+                speed_bytes = to_bytes(float(speed_match.group(1)), speed_match.group(2))
+                speed_kbps = int(speed_bytes / 1024)  # kB/s
+
+            # Calculate downloaded bytes
+            downloaded = int(total_size * pct / 100) if total_size > 0 else 0
+
+            # Throttle saves (max every 0.5s) to reduce disk I/O
+            now = time.time()
+            if now - last_update_time >= 0.5:
+                task = load_task(task_id)
+                if task:
+                    task['progress'] = int(pct)
+                    task['download_progress'] = int(pct)
+                    task['total_size'] = total_size
+                    task['downloaded_size'] = downloaded
+                    task['download_speed'] = speed_kbps
+                    save_task(task_id, task)
+                last_update_time = now
+
+        if 'ERROR' in line:
+            logger.error(f"yt-dlp: {line.strip()}")
 
     process.wait()
 
@@ -136,25 +181,29 @@ def download_with_ytdlp(url, task_id, format_spec=None):
     if not files:
         raise Exception("No output file found. Check yt-dlp logs.")
 
-    # Prefer mp4, else use whatever yt-dlp produced
     mp4_files = [f for f in files if f.endswith('.mp4')]
     chosen = mp4_files[0] if mp4_files else files[0]
     src = os.path.join(UPLOAD_FOLDER, chosen)
 
-    # Clean filename from URL
     base_name = os.path.basename(urlparse(url).path.rstrip('/')) or 'video'
     base_name = re.sub(r'[^\w\-]', '_', base_name)[:80]
     final_name = _get_unique_filename(f"{base_name}.mp4")
     dst = os.path.join(UPLOAD_FOLDER, final_name)
     os.rename(src, dst)
 
+    # Get final file size
+    final_size = os.path.getsize(dst)
+
     task = load_task(task_id)
     task['status'] = 'done'
     task['progress'] = 100
-    task['output_file'] = final_name
     task['download_progress'] = 100
+    task['total_size'] = final_size
+    task['downloaded_size'] = final_size
+    task['download_speed'] = 0
+    task['output_file'] = final_name
     save_task(task_id, task)
-    logger.info(f"Download completed: {final_name}")
+    logger.info(f"Download completed: {final_name} ({final_size / 1024 / 1024:.1f} MB)")
 
 
 # ============================================================
