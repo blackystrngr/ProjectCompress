@@ -21,7 +21,6 @@ from tasks import (
     remove_subscriber
 )
 from features import register_all_features
-from features.url_download import kill_process
 
 HEARTBEAT_SECONDS = 15
 
@@ -35,6 +34,8 @@ logger = logging.getLogger(__name__)
 # ---- Network speed tracking ----
 _last_net_sample = None      # (timestamp, bytes_sent, bytes_recv)
 _net_sample_lock = threading.Lock()
+
+
 # ------------------------------------------------------------
 # Flask app factory
 # ------------------------------------------------------------
@@ -49,7 +50,7 @@ def create_app():
     # ---------- 404 handler ----------
     @app.errorhandler(NotFound)
     def handle_not_found(e):
-        if request.path.startswith(('/api', '/get_tasks', '/progress')):
+        if request.path.startswith(('/api', '/get_tasks', '/progress', '/system_stats')):
             return jsonify({'error': 'Endpoint not found'}), 404
         return render_template('index.html'), 404
 
@@ -68,7 +69,7 @@ def create_app():
             logger.error(f"Failed to list tasks: {e}")
             return jsonify([])
 
-    # ---------- EVENT‑DRIVEN SSE ENDPOINT ----------
+    # ---------- EVENT-DRIVEN SSE ENDPOINT ----------
     @app.route('/tasks/stream')
     def tasks_stream():
         q = queue.Queue(maxsize=1)
@@ -92,9 +93,9 @@ def create_app():
 
         return Response(stream_with_context(event_stream()), mimetype="text/event-stream")
 
-
-   @app.route('/system_stats')
-   def system_stats():
+    # ---------- System stats (CPU / RAM / Disk / Network) ----------
+    @app.route('/system_stats')
+    def system_stats():
         """Return live CPU, RAM, disk usage and network speed."""
         global _last_net_sample
         try:
@@ -102,11 +103,11 @@ def create_app():
             mem = psutil.virtual_memory()
             disk = psutil.disk_usage('/')
             net = psutil.net_io_counters()
-    
+
             now = time.time()
             up_bps = 0
             down_bps = 0
-    
+
             with _net_sample_lock:
                 if _last_net_sample is not None:
                     prev_time, prev_sent, prev_recv = _last_net_sample
@@ -115,15 +116,15 @@ def create_app():
                         up_bps = max(0, (net.bytes_sent - prev_sent) / dt)
                         down_bps = max(0, (net.bytes_recv - prev_recv) / dt)
                 _last_net_sample = (now, net.bytes_sent, net.bytes_recv)
-    
+
             return jsonify({
                 'cpu': round(cpu, 1),
                 'ram': round(mem.percent, 1),
                 'ram_used': mem.used,
                 'ram_total': mem.total,
                 'disk': round(disk.percent, 1),
-                'net_up': int(up_bps),          # bytes/sec
-                'net_down': int(down_bps),      # bytes/sec
+                'net_up': int(up_bps),
+                'net_down': int(down_bps),
                 'net_total_sent': net.bytes_sent,
                 'net_total_recv': net.bytes_recv,
             })
@@ -162,22 +163,21 @@ def create_app():
             task['cancelled'] = True
             task['status'] = 'cancelled'
             save_task(task_id, task)
-    
-            # Kill any running yt-dlp process for this task
+
             try:
                 from features.url_download import kill_process
                 kill_process(task_id)
             except Exception as e:
                 logger.warning(f"kill_process failed: {e}")
-    
-            # Also kill any orphan ffmpeg processes
+
             for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
                 try:
-                    if 'ffmpeg' in (proc.info['name'] or '') or 'ffmpeg' in ' '.join(proc.info['cmdline'] or []):
+                    if 'ffmpeg' in (proc.info['name'] or '') or \
+                       'ffmpeg' in ' '.join(proc.info['cmdline'] or []):
                         proc.terminate()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
-    
+
             logger.info(f"Task {task_id} cancelled")
             return jsonify({'status': 'cancelling'})
         except Exception as e:
@@ -189,7 +189,8 @@ def create_app():
         killed = []
         for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
             try:
-                if 'ffmpeg' in (proc.info['name'] or '') or 'ffmpeg' in ' '.join(proc.info['cmdline'] or []):
+                if 'ffmpeg' in (proc.info['name'] or '') or \
+                   'ffmpeg' in ' '.join(proc.info['cmdline'] or []):
                     proc.terminate()
                     killed.append(proc.info['pid'])
             except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -207,6 +208,7 @@ def create_app():
 
     return app
 
+
 # ------------------------------------------------------------
 # Main entry
 # ------------------------------------------------------------
@@ -215,7 +217,7 @@ if __name__ == '__main__':
         if not load_task(tid):
             try:
                 os.remove(os.path.join(TASKS_DIR, f"{tid}.json"))
-            except:
+            except Exception:
                 pass
 
     app = create_app()
