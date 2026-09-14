@@ -21,6 +21,7 @@ from tasks import (
     remove_subscriber
 )
 from features import register_all_features
+from features.url_download import kill_process
 
 HEARTBEAT_SECONDS = 15
 
