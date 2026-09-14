@@ -7,6 +7,7 @@ import logging
 import requests
 import subprocess
 import shutil
+import signal
 from urllib.parse import urlparse
 from flask import request, jsonify
 from tasks import save_task, load_task
@@ -21,7 +22,6 @@ try:
 except ImportError:
     logger.warning("libtorrent not installed. Torrent downloads disabled.")
 
-# Path to cookies file (in project root)
 COOKIES_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'cookies.txt')
 
 
@@ -30,15 +30,56 @@ class DownloadCancelled(Exception):
 
 
 # ============================================================
-# YT-DLP DOWNLOADER (chrome impersonation + cookies)
+# GLOBAL PROCESS TRACKER (for cancellation)
+# ============================================================
+_running_processes = {}     # task_id -> subprocess.Popen
+_processes_lock = threading.Lock()
+
+
+def register_process(task_id, process):
+    with _processes_lock:
+        _running_processes[task_id] = process
+
+
+def unregister_process(task_id):
+    with _processes_lock:
+        _running_processes.pop(task_id, None)
+
+
+def kill_process(task_id):
+    """Terminate the running subprocess for a task (used by /cancel)."""
+    with _processes_lock:
+        process = _running_processes.get(task_id)
+    if process and process.poll() is None:
+        try:
+            # Kill the whole process group to also terminate ffmpeg children
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            except Exception:
+                process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except Exception:
+                    process.kill()
+            logger.info(f"Killed process for task {task_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to kill process for {task_id}: {e}")
+    return False
+
+
+# ============================================================
+# YT-DLP DOWNLOADER (chrome impersonation + cookies + cancel)
 # ============================================================
 def download_with_ytdlp(url, task_id, format_spec=None):
     """
     Download any supported URL with yt-dlp, using:
-      - chrome impersonation (bypasses Cloudflare / anti-bot)
-      - cookies.txt (for logged-in content)
-      - auto-merge to mp4
-    Parses yt-dlp output for total size, downloaded bytes, and speed.
+      - chrome impersonation
+      - cookies.txt
+      - working cancellation
     """
     task = load_task(task_id)
     if not task:
@@ -52,7 +93,7 @@ def download_with_ytdlp(url, task_id, format_spec=None):
 
     os.environ['PATH'] = '/usr/local/bin:' + os.environ.get('PATH', '')
 
-    # ---- find ffmpeg ----
+    # ---- ffmpeg ----
     ffmpeg_path = shutil.which('ffmpeg')
     if not ffmpeg_path:
         for p in ['/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg']:
@@ -60,7 +101,7 @@ def download_with_ytdlp(url, task_id, format_spec=None):
                 ffmpeg_path = p
                 break
     if not ffmpeg_path:
-        raise Exception("ffmpeg not found. Please install: sudo apt install ffmpeg")
+        raise Exception("ffmpeg not found. Install: sudo apt install ffmpeg")
 
     if not shutil.which('yt-dlp'):
         raise Exception("yt-dlp not installed. Run: pip install -U yt-dlp")
@@ -88,88 +129,87 @@ def download_with_ytdlp(url, task_id, format_spec=None):
         cmd += ['--cookies', COOKIES_FILE]
         logger.info(f"Using cookies from {COOKIES_FILE}")
     else:
-        logger.warning(f"No cookies.txt found – downloads may fail for login-only content.")
+        logger.warning("No cookies.txt found – downloads may fail for login-only content.")
 
     cmd.append(url)
     logger.info(f"yt-dlp command: {' '.join(cmd)}")
 
-    # ---- Run yt-dlp ----
+    # ---- Launch process in its own process group ----
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        preexec_fn=os.setsid,   # new process group → we can kill yt-dlp AND its ffmpeg children
     )
+    register_process(task_id, process)
 
     output_lines = []
     total_size = 0
     last_update_time = 0
 
-    # Regex patterns for yt-dlp output
-    # Example: [download]  45.3% of ~ 50.23MiB at  2.31MiB/s ETA 00:23
     RE_PERCENT = re.compile(r'\[download\]\s+(\d+(?:\.\d+)?)%')
     RE_TOTAL   = re.compile(r'of\s+~?\s*([\d.]+)\s*([KMGT]?i?B)')
     RE_SPEED   = re.compile(r'at\s+([\d.]+)\s*([KMGT]?i?B)/s')
 
     def to_bytes(value, unit):
-        """Convert a size like '50.23MiB' to bytes."""
         unit = unit.upper().replace('IB', 'B')
-        factors = {
-            'B': 1,
-            'KB': 1024,
-            'MB': 1024 ** 2,
-            'GB': 1024 ** 3,
-            'TB': 1024 ** 4,
-        }
+        factors = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3, 'TB': 1024**4}
         return int(value * factors.get(unit, 1))
 
-    while True:
-        line = process.stdout.readline()
-        if not line and process.poll() is not None:
-            break
-        if not line:
-            continue
+    try:
+        while True:
+            line = process.stdout.readline()
+            if not line and process.poll() is not None:
+                break
+            if not line:
+                continue
 
-        output_lines.append(line)
+            output_lines.append(line)
 
-        # Parse percentage
-        pct_match = RE_PERCENT.search(line)
-        if pct_match:
-            pct = float(pct_match.group(1))
+            # ---- Check cancellation on every line ----
+            task = load_task(task_id)
+            if task and task.get('cancelled', False):
+                logger.info(f"Task {task_id} cancelled – killing yt-dlp")
+                kill_process(task_id)
+                raise DownloadCancelled("Cancelled by user")
 
-            # Parse total size (may appear in same line)
-            total_match = RE_TOTAL.search(line)
-            if total_match:
-                total_size = to_bytes(float(total_match.group(1)), total_match.group(2))
+            # ---- Parse progress ----
+            pct_match = RE_PERCENT.search(line)
+            if pct_match:
+                pct = float(pct_match.group(1))
+                total_match = RE_TOTAL.search(line)
+                if total_match:
+                    total_size = to_bytes(float(total_match.group(1)), total_match.group(2))
+                speed_match = RE_SPEED.search(line)
+                speed_kbps = 0
+                if speed_match:
+                    speed_bytes = to_bytes(float(speed_match.group(1)), speed_match.group(2))
+                    speed_kbps = int(speed_bytes / 1024)
+                downloaded = int(total_size * pct / 100) if total_size > 0 else 0
 
-            # Parse speed
-            speed_match = RE_SPEED.search(line)
-            speed_kbps = 0
-            if speed_match:
-                speed_bytes = to_bytes(float(speed_match.group(1)), speed_match.group(2))
-                speed_kbps = int(speed_bytes / 1024)  # kB/s
+                now = time.time()
+                if now - last_update_time >= 0.5:
+                    task = load_task(task_id)
+                    if task:
+                        task['progress'] = int(pct)
+                        task['download_progress'] = int(pct)
+                        task['total_size'] = total_size
+                        task['downloaded_size'] = downloaded
+                        task['download_speed'] = speed_kbps
+                        save_task(task_id, task)
+                    last_update_time = now
 
-            # Calculate downloaded bytes
-            downloaded = int(total_size * pct / 100) if total_size > 0 else 0
+            if 'ERROR' in line:
+                logger.error(f"yt-dlp: {line.strip()}")
 
-            # Throttle saves (max every 0.5s) to reduce disk I/O
-            now = time.time()
-            if now - last_update_time >= 0.5:
-                task = load_task(task_id)
-                if task:
-                    task['progress'] = int(pct)
-                    task['download_progress'] = int(pct)
-                    task['total_size'] = total_size
-                    task['downloaded_size'] = downloaded
-                    task['download_speed'] = speed_kbps
-                    save_task(task_id, task)
-                last_update_time = now
+        process.wait()
+    finally:
+        unregister_process(task_id)
 
-        if 'ERROR' in line:
-            logger.error(f"yt-dlp: {line.strip()}")
-
-    process.wait()
+    # ---- Handle cancellation propagation ----
+    # (reached only if loop exited normally - the raise above prevents this)
 
     if process.returncode != 0:
         full_output = ''.join(output_lines)
@@ -179,7 +219,7 @@ def download_with_ytdlp(url, task_id, format_spec=None):
     # ---- Find output file ----
     files = [f for f in os.listdir(UPLOAD_FOLDER) if f.startswith(f"{task_id}_dl.")]
     if not files:
-        raise Exception("No output file found. Check yt-dlp logs.")
+        raise Exception("No output file found.")
 
     mp4_files = [f for f in files if f.endswith('.mp4')]
     chosen = mp4_files[0] if mp4_files else files[0]
@@ -191,7 +231,6 @@ def download_with_ytdlp(url, task_id, format_spec=None):
     dst = os.path.join(UPLOAD_FOLDER, final_name)
     os.rename(src, dst)
 
-    # Get final file size
     final_size = os.path.getsize(dst)
 
     task = load_task(task_id)
@@ -207,17 +246,22 @@ def download_with_ytdlp(url, task_id, format_spec=None):
 
 
 # ============================================================
-# ROUTE HANDLER – dispatch based on URL type
+# MAIN ENTRY
 # ============================================================
 def process_url_download(task_id, url, format_spec=None):
     logger.info(f"process_url_download started for {task_id}: {url}")
     task = load_task(task_id)
     if not task:
         return
-
     try:
-        # Use yt-dlp for everything (handles m3u8, video pages, direct URLs)
         download_with_ytdlp(url, task_id, format_spec)
+    except DownloadCancelled:
+        logger.info(f"Download cancelled for {task_id}")
+        task = load_task(task_id)
+        if task:
+            task['status'] = 'cancelled'
+            task['error_msg'] = 'Cancelled by user'
+            save_task(task_id, task)
     except Exception as e:
         logger.exception(f"Download failed for {task_id}")
         task = load_task(task_id)
@@ -228,7 +272,7 @@ def process_url_download(task_id, url, format_spec=None):
 
 
 # ============================================================
-# TORRENT SUPPORT (unchanged)
+# TORRENT SUPPORT (with cancellation)
 # ============================================================
 def download_torrent(torrent_input, task_id, save_path):
     if not TORRENT_AVAILABLE:
@@ -248,7 +292,11 @@ def download_torrent(torrent_input, task_id, save_path):
         save_task(task_id, task)
 
     while not handle.has_metadata():
+        if load_task(task_id).get('cancelled', False):
+            ses.remove_torrent(handle)
+            raise DownloadCancelled("Cancelled")
         time.sleep(1)
+
     torrent_name = handle.name()
     files = handle.get_torrent_info().files()
     total_size = sum(f.size for f in files)
@@ -266,7 +314,7 @@ def download_torrent(torrent_input, task_id, save_path):
     while not handle.is_seed():
         if load_task(task_id).get('cancelled', False):
             ses.remove_torrent(handle)
-            raise Exception("Cancelled")
+            raise DownloadCancelled("Cancelled")
         status = handle.status()
         progress = int(status.progress * 100)
         downloaded = status.total_download
@@ -303,6 +351,11 @@ def download_torrent(torrent_input, task_id, save_path):
 def process_torrent_download(task_id, torrent_input):
     try:
         download_torrent(torrent_input, task_id, UPLOAD_FOLDER)
+    except DownloadCancelled:
+        task = load_task(task_id)
+        if task:
+            task['status'] = 'cancelled'
+            save_task(task_id, task)
     except Exception as e:
         task = load_task(task_id)
         if task:
@@ -334,7 +387,6 @@ def register_routes(app):
         if not url:
             return jsonify({'error': 'URL required'}), 400
 
-        # Optional format (e.g. "720p", "1080p", "best")
         format_spec = request.form.get('format', '').strip() or None
 
         task_id = str(uuid.uuid4())
@@ -342,6 +394,10 @@ def register_routes(app):
             'task_id': task_id,
             'status': 'queued',
             'download_progress': 0,
+            'progress': 0,
+            'total_size': 0,
+            'downloaded_size': 0,
+            'download_speed': 0,
             'created_at': time.time(),
             'cancelled': False,
             'url': url,
@@ -349,7 +405,6 @@ def register_routes(app):
         }
         save_task(task_id, task_data)
 
-        # Torrent handling
         if url.startswith('magnet:') or (url.endswith('.torrent') and url.startswith(('http://', 'https://'))):
             if not TORRENT_AVAILABLE:
                 task_data['status'] = 'error'
@@ -377,12 +432,25 @@ def register_routes(app):
                             save_task(task_id, task)
             threading.Thread(target=fetch_torrent, daemon=True).start()
         else:
-            # Everything else (m3u8, video pages, direct URLs) → yt-dlp
             def run():
                 process_url_download(task_id, url, format_spec)
             threading.Thread(target=run, daemon=True).start()
 
         return jsonify({'task_id': task_id})
+
+    # ---- Cancel endpoint: kills yt-dlp process ----
+    @app.route('/cancel_download/<task_id>', methods=['POST'])
+    def cancel_download(task_id):
+        """Cancel a download by killing its subprocess."""
+        task = load_task(task_id)
+        if not task:
+            return jsonify({'error': 'Task not found'}), 404
+        task['cancelled'] = True
+        task['status'] = 'cancelled'
+        save_task(task_id, task)
+        killed = kill_process(task_id)
+        logger.info(f"Cancel requested for {task_id} – killed={killed}")
+        return jsonify({'status': 'cancelling', 'killed': killed})
 
     @app.route('/start_upload_torrent', methods=['POST'])
     def start_upload_torrent():
