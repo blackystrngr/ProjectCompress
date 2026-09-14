@@ -396,3 +396,89 @@ button.danger:hover {
     background: #2c3e66;
     border-radius: 3px;
 }
+
+/* ========== System Stats Meter ========== */
+.sys-stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem;
+    align-items: center;
+    background: rgba(20, 25, 40, 0.85);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(95, 143, 224, 0.35);
+    border-radius: 2rem;
+    padding: 0.6rem 1.2rem;
+    margin-bottom: 1rem;
+    position: sticky;
+    top: 0.5rem;
+    z-index: 90;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+    font-size: 0.8rem;
+}
+
+.sys-stat {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex: 1;
+    min-width: 160px;
+}
+
+.sys-stat i {
+    color: #5f8fe0;
+    font-size: 0.9rem;
+    width: 1rem;
+    text-align: center;
+}
+
+.sys-label {
+    font-weight: 600;
+    color: #b0c4ff;
+    min-width: 2.6rem;
+    letter-spacing: 0.02em;
+}
+
+.sys-bar {
+    flex: 1;
+    height: 0.45rem;
+    background: #1e2438;
+    border-radius: 1rem;
+    overflow: hidden;
+    min-width: 60px;
+    border: 1px solid rgba(95, 143, 224, 0.2);
+}
+
+.sys-fill {
+    height: 100%;
+    width: 0%;
+    border-radius: 1rem;
+    transition: width 0.4s ease, background 0.4s ease;
+}
+
+.sys-value {
+    font-family: monospace;
+    font-size: 0.75rem;
+    color: #eef2ff;
+    min-width: 3rem;
+    text-align: right;
+    font-weight: 500;
+}
+
+/* Responsive: stack on small screens */
+@media (max-width: 700px) {
+    .sys-stats {
+        padding: 0.5rem 0.8rem;
+        gap: 0.6rem;
+    }
+    .sys-stat {
+        min-width: 120px;
+    }
+    .sys-label {
+        min-width: 2rem;
+        font-size: 0.7rem;
+    }
+    .sys-value {
+        font-size: 0.7rem;
+        min-width: 2.4rem;
+    }
+}
