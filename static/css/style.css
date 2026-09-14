@@ -464,6 +464,34 @@ button.danger:hover {
     font-weight: 500;
 }
 
+/* ===== Network speed stats ===== */
+.sys-stat.sys-net {
+    flex: 0 0 auto;
+    min-width: 100px;
+    justify-content: flex-start;
+}
+
+.sys-value-net {
+    font-family: monospace;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: #d1fae5;
+    min-width: 5.2rem;
+    text-align: right;
+    transition: color 0.3s ease;
+}
+
+/* On mobile, stack network items too */
+@media (max-width: 700px) {
+    .sys-stat.sys-net {
+        min-width: 80px;
+    }
+    .sys-value-net {
+        font-size: 0.7rem;
+        min-width: 4.2rem;
+    }
+}
+
 /* Responsive: stack on small screens */
 @media (max-width: 700px) {
     .sys-stats {
