@@ -5,6 +5,11 @@ import shutil
 import logging
 from flask import request, jsonify, send_file, abort, Response
 from config import UPLOAD_FOLDER
+try:
+    from features.thumbnails import delete_thumbnail
+except ImportError:
+    def delete_thumbnail(_):
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -99,13 +104,100 @@ def register_routes(app):
                 breadcrumbs.append({
                     'name': part,
                     'path': current,
-                    'is_last': i == len(parts)-1
+                    'is_last': i == len(parts) - 1
                 })
         return jsonify({
             'current_path': subpath,
             'breadcrumbs': breadcrumbs,
             'items': items
         })
+
+    @app.route('/download_file', methods=['GET'])
+    def download_file():
+        file_path = request.args.get('path', '')
+        if '..' in file_path or file_path.startswith('/'):
+            abort(403)
+        full = os.path.join(UPLOAD_FOLDER, file_path)
+        if not os.path.exists(full) or os.path.isdir(full):
+            abort(404)
+        return send_file(full, as_attachment=True, download_name=os.path.basename(full))
+
+    @app.route('/delete_file', methods=['DELETE'])
+    def delete_file():
+        file_path = request.args.get('path', '')
+        if '..' in file_path or file_path.startswith('/'):
+            return jsonify({'error': 'Invalid path'}), 400
+        full = os.path.join(UPLOAD_FOLDER, file_path)
+        if not os.path.exists(full):
+            return jsonify({'error': 'Not found'}), 404
+        try:
+            if os.path.isdir(full):
+                if not os.listdir(full):
+                    os.rmdir(full)
+                else:
+                    return jsonify({'error': 'Directory not empty'}), 400
+            else:
+                # Remove cached thumbnail
+                try:
+                    from features.thumbnails import delete_thumbnail
+                    delete_thumbnail(full)
+                except Exception:
+                    pass
+                os.remove(full)
+            return jsonify({'success': True})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/delete_folder', methods=['DELETE'])
+    def delete_folder():
+        folder_path = request.args.get('path', '')
+        if '..' in folder_path or folder_path.startswith('/'):
+            return jsonify({'error': 'Invalid path'}), 400
+        full = os.path.join(UPLOAD_FOLDER, folder_path)
+        if not os.path.exists(full) or not os.path.isdir(full):
+            return jsonify({'error': 'Folder not found'}), 404
+        try:
+            # Delete thumbnails for all videos inside the folder first
+            try:
+                from features.thumbnails import delete_thumbnail
+                for root, _, files in os.walk(full):
+                    for name in files:
+                        if name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.m4v')):
+                            delete_thumbnail(os.path.join(root, name))
+            except Exception:
+                pass
+            shutil.rmtree(full)
+            return jsonify({'success': True})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/stream_file', methods=['GET'])
+    def stream_file():
+        file_path = request.args.get('path', '')
+        if '..' in file_path or file_path.startswith('/'):
+            abort(403)
+        full = os.path.join(UPLOAD_FOLDER, file_path)
+        if not os.path.exists(full) or os.path.isdir(full):
+            abort(404)
+        range_header = request.headers.get('Range')
+        if range_header:
+            return get_range_response(full, range_header)
+        # Choose MIME based on extension
+        ext = os.path.splitext(full)[1].lower()
+        mimetype = {
+            '.mp4': 'video/mp4',
+            '.webm': 'video/webm',
+            '.mkv': 'video/x-matroska',
+            '.avi': 'video/x-msvideo',
+            '.mov': 'video/quicktime',
+            '.mp3': 'audio/mpeg',
+            '.wav': 'audio/wav',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+        }.get(ext, 'application/octet-stream')
+        return send_file(full, mimetype=mimetype)
 
     @app.route('/download_file', methods=['GET'])
     def download_file():
