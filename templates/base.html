@@ -12,26 +12,37 @@
 <div class="container">
 
     <!-- ========== System Stats Meter ========== -->
-    <div class="sys-stats" id="sysStats">
-        <div class="sys-stat" title="CPU usage">
-            <i class="fas fa-microchip"></i>
-            <span class="sys-label">CPU</span>
-            <div class="sys-bar"><div class="sys-fill sys-cpu" id="cpuFill"></div></div>
-            <span class="sys-value" id="cpuValue">–</span>
-        </div>
-        <div class="sys-stat" title="RAM usage">
-            <i class="fas fa-memory"></i>
-            <span class="sys-label">RAM</span>
-            <div class="sys-bar"><div class="sys-fill sys-ram" id="ramFill"></div></div>
-            <span class="sys-value" id="ramValue">–</span>
-        </div>
-        <div class="sys-stat" title="Disk usage">
-            <i class="fas fa-hdd"></i>
-            <span class="sys-label">Disk</span>
-            <div class="sys-bar"><div class="sys-fill sys-disk" id="diskFill"></div></div>
-            <span class="sys-value" id="diskValue">–</span>
-        </div>
+    <!-- ========== System Stats Meter ========== -->
+<div class="sys-stats" id="sysStats">
+    <div class="sys-stat" title="CPU usage">
+        <i class="fas fa-microchip"></i>
+        <span class="sys-label">CPU</span>
+        <div class="sys-bar"><div class="sys-fill sys-cpu" id="cpuFill"></div></div>
+        <span class="sys-value" id="cpuValue">–</span>
     </div>
+    <div class="sys-stat" title="RAM usage">
+        <i class="fas fa-memory"></i>
+        <span class="sys-label">RAM</span>
+        <div class="sys-bar"><div class="sys-fill sys-ram" id="ramFill"></div></div>
+        <span class="sys-value" id="ramValue">–</span>
+    </div>
+    <div class="sys-stat" title="Disk usage">
+        <i class="fas fa-hdd"></i>
+        <span class="sys-label">Disk</span>
+        <div class="sys-bar"><div class="sys-fill sys-disk" id="diskFill"></div></div>
+        <span class="sys-value" id="diskValue">–</span>
+    </div>
+    <div class="sys-stat sys-net" title="Download speed">
+        <i class="fas fa-arrow-down" style="color:#4ade80;"></i>
+        <span class="sys-label">Down</span>
+        <span class="sys-value-net" id="downValue">0 B/s</span>
+    </div>
+    <div class="sys-stat sys-net" title="Upload speed">
+        <i class="fas fa-arrow-up" style="color:#f59e0b;"></i>
+        <span class="sys-label">Up</span>
+        <span class="sys-value-net" id="upValue">0 B/s</span>
+    </div>
+</div>
 
     <!-- ========== Header ========== -->
     <div class="card" style="margin-bottom: 1.5rem;">
@@ -54,19 +65,22 @@
 <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 
 <!-- ========== System Stats Script ========== -->
+<!-- ========== System Stats Script ========== -->
 <script>
 (function() {
-    const cpuFill = document.getElementById('cpuFill');
-    const ramFill = document.getElementById('ramFill');
+    const cpuFill  = document.getElementById('cpuFill');
+    const ramFill  = document.getElementById('ramFill');
     const diskFill = document.getElementById('diskFill');
     const cpuValue = document.getElementById('cpuValue');
     const ramValue = document.getElementById('ramValue');
-    const diskValue = document.getElementById('diskValue');
+    const diskValue= document.getElementById('diskValue');
+    const downValue= document.getElementById('downValue');
+    const upValue  = document.getElementById('upValue');
 
     function colorFor(pct) {
-        if (pct < 50) return 'linear-gradient(90deg, #4ade80, #86efac)';   // green
-        if (pct < 80) return 'linear-gradient(90deg, #facc15, #fde68a)';   // yellow
-        return 'linear-gradient(90deg, #ef4444, #fca5a5)';                  // red
+        if (pct < 50) return 'linear-gradient(90deg, #4ade80, #86efac)';
+        if (pct < 80) return 'linear-gradient(90deg, #facc15, #fde68a)';
+        return 'linear-gradient(90deg, #ef4444, #fca5a5)';
     }
 
     function formatBytes(bytes) {
@@ -76,33 +90,51 @@
         return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
     }
 
+    function formatSpeed(bps) {
+        // bps is bytes per second
+        if (bps < 1024) return bps + ' B/s';
+        if (bps < 1024 * 1024) return (bps / 1024).toFixed(1) + ' KB/s';
+        if (bps < 1024 * 1024 * 1024) return (bps / (1024 * 1024)).toFixed(1) + ' MB/s';
+        return (bps / (1024 * 1024 * 1024)).toFixed(2) + ' GB/s';
+    }
+
     async function updateStats() {
         try {
             const resp = await fetch('/system_stats');
             const data = await resp.json();
 
+            // CPU
             cpuFill.style.width = data.cpu + '%';
             cpuFill.style.background = colorFor(data.cpu);
             cpuValue.textContent = data.cpu + '%';
 
+            // RAM
             ramFill.style.width = data.ram + '%';
             ramFill.style.background = colorFor(data.ram);
             ramValue.textContent = data.ram + '%';
+            if (data.ram_used && data.ram_total) {
+                ramValue.title = `${formatBytes(data.ram_used)} / ${formatBytes(data.ram_total)}`;
+            }
 
+            // Disk
             diskFill.style.width = data.disk + '%';
             diskFill.style.background = colorFor(data.disk);
             diskValue.textContent = data.disk + '%';
 
-            // Optional: tooltip with actual RAM
-            if (data.ram_used && data.ram_total) {
-                ramValue.title = `${formatBytes(data.ram_used)} / ${formatBytes(data.ram_total)}`;
-            }
+            // Network
+            downValue.textContent = formatSpeed(data.net_down || 0);
+            upValue.textContent = formatSpeed(data.net_up || 0);
+
+            // Colour-code network speed text
+            downValue.style.color = (data.net_down > 1024 * 1024) ? '#86efac'
+                                   : (data.net_down > 0) ? '#d1fae5' : '#8a9bc0';
+            upValue.style.color = (data.net_up > 1024 * 1024) ? '#fde68a'
+                                 : (data.net_up > 0) ? '#fef3c7' : '#8a9bc0';
         } catch (e) {
             console.error('system_stats error:', e);
         }
     }
 
-    // Update every 2 seconds
     updateStats();
     setInterval(updateStats, 2000);
 })();
