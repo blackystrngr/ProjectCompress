@@ -94,7 +94,7 @@ def create_app():
 
 
    @app.route('/system_stats')
-    def system_stats():
+   def system_stats():
         """Return live CPU, RAM, disk usage and network speed."""
         global _last_net_sample
         try:
