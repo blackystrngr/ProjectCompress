@@ -89,6 +89,25 @@ def create_app():
 
         return Response(stream_with_context(event_stream()), mimetype="text/event-stream")
 
+
+    @app.route('/system_stats')
+    def system_stats():
+        """Return live CPU and RAM usage (low bandwidth, lightweight)."""
+        try:
+            cpu = psutil.cpu_percent(interval=None)          # non-blocking, uses last call
+            mem = psutil.virtual_memory()
+            disk = psutil.disk_usage('/')
+            return jsonify({
+                'cpu': round(cpu, 1),
+                'ram': round(mem.percent, 1),
+                'ram_used': mem.used,
+                'ram_total': mem.total,
+                'disk': round(disk.percent, 1),
+            })
+        except Exception as e:
+            logger.error(f"system_stats error: {e}")
+            return jsonify({'cpu': 0, 'ram': 0, 'disk': 0})
+
     # ---------- Progress and cancel endpoints ----------
     @app.route('/progress/<task_id>', methods=['GET'])
     def progress(task_id):
