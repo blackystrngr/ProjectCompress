@@ -65,12 +65,39 @@ function renderBreadcrumbs(bc) {
 }
 
 function renderFileList(items) {
-    if (!items.length) { document.getElementById('fileList').innerHTML = '<div class="empty-state">Empty folder.</div>'; updateActionBar(); return; }
+    if (!items.length) {
+        document.getElementById('fileList').innerHTML = '<div class="empty-state">Empty folder.</div>';
+        updateActionBar();
+        return;
+    }
     let html = '';
     items.forEach(item => {
         const isSel = selectedPaths.has(item.path);
+        const isVideo = item.type === 'file' &&
+            /\.(mp4|mkv|avi|mov|webm|flv|m4v)$/i.test(item.name);
+        const isImage = item.type === 'file' &&
+            /\.(jpg|jpeg|png|gif|webp|bmp)$/i.test(item.name);
+
+        let thumbHtml = '';
+        if (isVideo) {
+            const thumbUrl = `/thumbnail?path=${encodeURIComponent(item.path)}`;
+            thumbHtml = `<div class="file-thumb">
+                            <img src="${thumbUrl}" alt=""
+                                 loading="lazy"
+                                 onerror="this.style.display='none'; this.parentElement.classList.add('thumb-failed');"
+                                 onclick="openPreview('${escapeHtml(item.path)}', '${escapeHtml(item.name)}')">
+                         </div>`;
+        } else if (isImage) {
+            thumbHtml = `<div class="file-thumb">
+                            <img src="/stream_file?path=${encodeURIComponent(item.path)}"
+                                 alt="" loading="lazy"
+                                 onclick="openPreview('${escapeHtml(item.path)}', '${escapeHtml(item.name)}')">
+                         </div>`;
+        }
+
         html += `<div class="file-card ${isSel ? 'selected' : ''}" data-path="${escapeHtml(item.path)}" data-type="${item.type}">
                     <input type="checkbox" class="file-checkbox" data-path="${escapeHtml(item.path)}" ${isSel ? 'checked' : ''}>
+                    ${thumbHtml}
                     <div class="file-name"><i class="${item.icon}"></i> ${escapeHtml(item.name)}</div>
                     ${item.type === 'file' ? `<div class="file-size">${item.size_str}</div>` : '<div class="file-size">Folder</div>'}
                     <div class="file-actions">
@@ -90,7 +117,7 @@ function renderFileList(items) {
     attachEvents();
     updateActionBar();
 }
-
+    
 function attachEvents() {
     document.querySelectorAll('.file-checkbox').forEach(cb => {
         cb.onchange = () => {
@@ -227,4 +254,32 @@ loadDirectory();
 <style>
 .file-card.selected { border-color: #5f8fe0; background: rgba(45,65,100,0.6); }
 #actionBar { display: inline-flex; gap: 0.5rem; background: rgba(20,25,40,0.95); border-radius: 2rem; padding: 0.2rem 1rem; margin-left: 1rem; }
+
+.file-thumb {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background: #0d1220;
+    border-radius: 0.8rem;
+    overflow: hidden;
+    margin-bottom: 0.5rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    border: 1px solid rgba(95, 143, 224, 0.15);
+}
+.file-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+.file-thumb.thumb-failed::after {
+    content: '\f03d';
+    font-family: 'Font Awesome 6 Free';
+    font-weight: 900;
+    font-size: 1.4rem;
+    color: #2c3e66;
+}
+    
 </style>
