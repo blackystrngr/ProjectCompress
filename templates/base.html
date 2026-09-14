@@ -10,8 +10,32 @@
 </head>
 <body>
 <div class="container">
+
+    <!-- ========== System Stats Meter ========== -->
+    <div class="sys-stats" id="sysStats">
+        <div class="sys-stat" title="CPU usage">
+            <i class="fas fa-microchip"></i>
+            <span class="sys-label">CPU</span>
+            <div class="sys-bar"><div class="sys-fill sys-cpu" id="cpuFill"></div></div>
+            <span class="sys-value" id="cpuValue">–</span>
+        </div>
+        <div class="sys-stat" title="RAM usage">
+            <i class="fas fa-memory"></i>
+            <span class="sys-label">RAM</span>
+            <div class="sys-bar"><div class="sys-fill sys-ram" id="ramFill"></div></div>
+            <span class="sys-value" id="ramValue">–</span>
+        </div>
+        <div class="sys-stat" title="Disk usage">
+            <i class="fas fa-hdd"></i>
+            <span class="sys-label">Disk</span>
+            <div class="sys-bar"><div class="sys-fill sys-disk" id="diskFill"></div></div>
+            <span class="sys-value" id="diskValue">–</span>
+        </div>
+    </div>
+
+    <!-- ========== Header ========== -->
     <div class="card" style="margin-bottom: 1.5rem;">
-        <h1><i class="fas fa-video"></i> Media Compressor & Manager</h1>
+        <h1><i class="fas fa-video"></i> Media Compressor &amp; Manager</h1>
         <div style="margin-top: 0.5rem; opacity: 0.7;">Bulk download, encode, and organize your media</div>
     </div>
 
@@ -28,6 +52,60 @@
 </div>
 
 <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+
+<!-- ========== System Stats Script ========== -->
+<script>
+(function() {
+    const cpuFill = document.getElementById('cpuFill');
+    const ramFill = document.getElementById('ramFill');
+    const diskFill = document.getElementById('diskFill');
+    const cpuValue = document.getElementById('cpuValue');
+    const ramValue = document.getElementById('ramValue');
+    const diskValue = document.getElementById('diskValue');
+
+    function colorFor(pct) {
+        if (pct < 50) return 'linear-gradient(90deg, #4ade80, #86efac)';   // green
+        if (pct < 80) return 'linear-gradient(90deg, #facc15, #fde68a)';   // yellow
+        return 'linear-gradient(90deg, #ef4444, #fca5a5)';                  // red
+    }
+
+    function formatBytes(bytes) {
+        if (bytes === 0) return '0 B';
+        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(1024));
+        return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
+    }
+
+    async function updateStats() {
+        try {
+            const resp = await fetch('/system_stats');
+            const data = await resp.json();
+
+            cpuFill.style.width = data.cpu + '%';
+            cpuFill.style.background = colorFor(data.cpu);
+            cpuValue.textContent = data.cpu + '%';
+
+            ramFill.style.width = data.ram + '%';
+            ramFill.style.background = colorFor(data.ram);
+            ramValue.textContent = data.ram + '%';
+
+            diskFill.style.width = data.disk + '%';
+            diskFill.style.background = colorFor(data.disk);
+            diskValue.textContent = data.disk + '%';
+
+            // Optional: tooltip with actual RAM
+            if (data.ram_used && data.ram_total) {
+                ramValue.title = `${formatBytes(data.ram_used)} / ${formatBytes(data.ram_total)}`;
+            }
+        } catch (e) {
+            console.error('system_stats error:', e);
+        }
+    }
+
+    // Update every 2 seconds
+    updateStats();
+    setInterval(updateStats, 2000);
+})();
+</script>
 </body>
 </html>
-
