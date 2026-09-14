@@ -32,6 +32,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ---- Network speed tracking ----
+_last_net_sample = None      # (timestamp, bytes_sent, bytes_recv)
+_net_sample_lock = threading.Lock()
 # ------------------------------------------------------------
 # Flask app factory
 # ------------------------------------------------------------
@@ -90,23 +93,47 @@ def create_app():
         return Response(stream_with_context(event_stream()), mimetype="text/event-stream")
 
 
-    @app.route('/system_stats')
+   @app.route('/system_stats')
     def system_stats():
-        """Return live CPU and RAM usage (low bandwidth, lightweight)."""
+        """Return live CPU, RAM, disk usage and network speed."""
+        global _last_net_sample
         try:
-            cpu = psutil.cpu_percent(interval=None)          # non-blocking, uses last call
+            cpu = psutil.cpu_percent(interval=None)
             mem = psutil.virtual_memory()
             disk = psutil.disk_usage('/')
+            net = psutil.net_io_counters()
+    
+            now = time.time()
+            up_bps = 0
+            down_bps = 0
+    
+            with _net_sample_lock:
+                if _last_net_sample is not None:
+                    prev_time, prev_sent, prev_recv = _last_net_sample
+                    dt = now - prev_time
+                    if dt > 0.1:
+                        up_bps = max(0, (net.bytes_sent - prev_sent) / dt)
+                        down_bps = max(0, (net.bytes_recv - prev_recv) / dt)
+                _last_net_sample = (now, net.bytes_sent, net.bytes_recv)
+    
             return jsonify({
                 'cpu': round(cpu, 1),
                 'ram': round(mem.percent, 1),
                 'ram_used': mem.used,
                 'ram_total': mem.total,
                 'disk': round(disk.percent, 1),
+                'net_up': int(up_bps),          # bytes/sec
+                'net_down': int(down_bps),      # bytes/sec
+                'net_total_sent': net.bytes_sent,
+                'net_total_recv': net.bytes_recv,
             })
         except Exception as e:
             logger.error(f"system_stats error: {e}")
-            return jsonify({'cpu': 0, 'ram': 0, 'disk': 0})
+            return jsonify({
+                'cpu': 0, 'ram': 0, 'disk': 0,
+                'net_up': 0, 'net_down': 0,
+                'ram_used': 0, 'ram_total': 1,
+            })
 
     # ---------- Progress and cancel endpoints ----------
     @app.route('/progress/<task_id>', methods=['GET'])
