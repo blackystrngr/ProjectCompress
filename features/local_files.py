@@ -80,8 +80,17 @@ def get_range_response(file_path, range_header):
     with open(file_path, 'rb') as f:
         f.seek(start)
         data = f.read(length)
-    return Response(data, 206, mimetype='video/mp4',
+    ext = os.path.splitext(file_path)[1].lower()
+    mimetype = {
+        '.mp4': 'video/mp4',
+        '.webm': 'video/webm',
+        '.mkv': 'video/x-matroska',
+        '.avi': 'video/x-msvideo',
+        '.mov': 'video/quicktime',
+    }.get(ext, 'application/octet-stream')
+    return Response(data, 206, mimetype=mimetype,
                     headers={'Content-Range': f'bytes {start}-{end}/{file_size}'})
+
 
 def register_routes(app):
     @app.route('/browse', methods=['GET'])
