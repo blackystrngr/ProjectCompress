@@ -11,6 +11,7 @@ from . import torrent_search
 from . import face_swap
 from . import ocr
 from . import web_crawler
+from . import thumbnails  
 
 logger = logging.getLogger(__name__)
 
@@ -29,4 +30,5 @@ def register_all_features(app):
     face_swap.register_routes(app)
     ocr.register_routes(app)
     web_crawler.register_routes(app)
+    thumbnails.register_routes(app)
     logger.info("All features registered")
