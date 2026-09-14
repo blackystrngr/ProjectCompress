@@ -116,6 +116,22 @@ def create_app():
             task['cancelled'] = True
             task['status'] = 'cancelled'
             save_task(task_id, task)
+    
+            # Kill any running yt-dlp process for this task
+            try:
+                from features.url_download import kill_process
+                kill_process(task_id)
+            except Exception as e:
+                logger.warning(f"kill_process failed: {e}")
+    
+            # Also kill any orphan ffmpeg processes
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    if 'ffmpeg' in (proc.info['name'] or '') or 'ffmpeg' in ' '.join(proc.info['cmdline'] or []):
+                        proc.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+    
             logger.info(f"Task {task_id} cancelled")
             return jsonify({'status': 'cancelling'})
         except Exception as e:
