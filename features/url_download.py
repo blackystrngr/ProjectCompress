@@ -6,7 +6,7 @@ import time
 import logging
 import requests
 import subprocess
-import shutil  # <-- ADDED
+import shutil
 from urllib.parse import urlparse
 from flask import request, jsonify
 from tasks import save_task, load_task
@@ -21,120 +21,96 @@ try:
 except ImportError:
     logger.warning("libtorrent not installed. Torrent downloads disabled.")
 
+# Path to cookies file (in project root)
+COOKIES_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'cookies.txt')
+
+
 class DownloadCancelled(Exception):
     pass
 
 
 # ============================================================
-# M3U8 DOWNLOAD – auto‑detect ffmpeg
+# YT-DLP DOWNLOADER (chrome impersonation + cookies)
 # ============================================================
-def download_m3u8_with_ytdlp(url, task_id, cookies_file=None, extra_headers=None):
+def download_with_ytdlp(url, task_id, format_spec=None):
     """
-    Download an m3u8 stream using yt-dlp.
-    - cookies_file: path to a Netscape-format cookies.txt (optional)
-    - extra_headers: list of "Header: value" strings to add (optional)
+    Download any supported URL with yt-dlp, using:
+      - chrome impersonation (bypasses Cloudflare / anti-bot)
+      - cookies.txt (for logged-in content)
+      - auto-merge to mp4
     """
     task = load_task(task_id)
     if not task:
         raise Exception("Task not found")
-    task['status'] = 'downloading_m3u8'
+    task['status'] = 'downloading'
     task['progress'] = 0
     save_task(task_id, task)
 
+    # ---- Ensure /usr/local/bin is in PATH ----
     os.environ['PATH'] = '/usr/local/bin:' + os.environ.get('PATH', '')
 
-    # ---- find ffmpeg ----
+    # ---- Find ffmpeg ----
     ffmpeg_path = shutil.which('ffmpeg')
     if not ffmpeg_path:
-        common_paths = ['/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg']
-        for p in common_paths:
+        for p in ['/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg']:
             if os.path.exists(p) and os.access(p, os.X_OK):
                 ffmpeg_path = p
                 break
     if not ffmpeg_path:
         raise Exception("ffmpeg not found. Please install: sudo apt install ffmpeg")
-    try:
-        subprocess.run([ffmpeg_path, '-version'], capture_output=True, check=True)
-    except Exception as e:
-        raise Exception(f"ffmpeg at {ffmpeg_path} is not executable: {e}")
 
     if not shutil.which('yt-dlp'):
-        raise Exception("yt-dlp not installed. Run: pip install yt-dlp")
+        raise Exception("yt-dlp not installed. Run: pip install -U yt-dlp")
 
-    # ---- build command ----
-    output_template = os.path.join(UPLOAD_FOLDER, f"{task_id}_m3u8.%(ext)s")
+    # ---- Build output template ----
+    output_template = os.path.join(UPLOAD_FOLDER, f"{task_id}_dl.%(ext)s")
 
-    # Real browser headers (Chrome on Windows)
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
-        'Cache-Control': 'max-age=0',
-    }
+    # ---- Build yt-dlp command ----
+    # Format: user-specified (e.g. "720p") or fallback to best
+    format_choice = format_spec or 'bestvideo+bestaudio/best'
 
-    # Parse URL for Referer/Origin
-    parsed = urlparse(url)
-    base_url = f"{parsed.scheme}://{parsed.netloc}"
-    referer = base_url + '/'  # default referer is the base domain
-    # If the URL has a path, we can use the full path as referer
-    if parsed.path and parsed.path != '/':
-        referer = base_url + parsed.path
-
-    # Build yt-dlp command
     cmd = [
         'yt-dlp',
         '-o', output_template,
-        '-f', 'bestvideo+bestaudio/best',
+        '-f', format_choice,
         '--merge-output-format', 'mp4',
         '--no-part',
         '--no-mtime',
         '--no-warnings',
         '--ignore-errors',
-        '--user-agent', headers['User-Agent'],
-        '--referer', 'https://cumcams.cc/video/169242630/play',
-        '--add-header', f'Accept: {headers["Accept"]}',
-        '--add-header', f'Accept-Language: {headers["Accept-Language"]}',
-        '--add-header', f'Origin: {base_url}',
-        '--add-header', f'Sec-Fetch-Dest: {headers["Sec-Fetch-Dest"]}',
-        '--add-header', f'Sec-Fetch-Mode: {headers["Sec-Fetch-Mode"]}',
-        '--add-header', f'Sec-Fetch-Site: {headers["Sec-Fetch-Site"]}',
-        '--add-header', f'Upgrade-Insecure-Requests: {headers["Upgrade-Insecure-Requests"]}',
-        '--add-header', f'Cache-Control: {headers["Cache-Control"]}',
+        '--impersonate', 'chrome',              # <-- bypass anti-bot
         '--ffmpeg-location', ffmpeg_path,
-        '--verbose',
+        '--newline',                            # <-- so we get one line per update
     ]
 
-    # Add cookies if provided
-    if cookies_file and os.path.exists(cookies_file):
-        cmd += ['--cookies', cookies_file]
-
-    # Add any extra headers
-    if extra_headers:
-        for h in extra_headers:
-            cmd += ['--add-header', h]
+    # Add cookies if present
+    if os.path.exists(COOKIES_FILE):
+        cmd += ['--cookies', COOKIES_FILE]
+        logger.info(f"Using cookies from {COOKIES_FILE}")
+    else:
+        logger.warning(f"No cookies.txt found at {COOKIES_FILE} – downloads may fail for login-only content.")
 
     cmd.append(url)
 
-    logger.info(f"Using ffmpeg at: {ffmpeg_path}")
-    logger.info(f"Referer: {referer}")
-    logger.info(f"Command: {' '.join(cmd)}")
+    logger.info(f"yt-dlp command: {' '.join(cmd)}")
 
-    # ---- run yt-dlp ----
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    stderr_lines = []
+    # ---- Run yt-dlp ----
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,   # merge so we can read progress from stdout
+        text=True,
+        bufsize=1,
+    )
+
+    output_lines = []
     while True:
-        line = process.stderr.readline()
+        line = process.stdout.readline()
         if not line and process.poll() is not None:
             break
         if line:
-            stderr_lines.append(line)
+            output_lines.append(line)
+            # Progress lines: [download]  45.3% of ~ 50.23MiB at  2.31MiB/s ETA 00:23
             if '[download]' in line and '%' in line:
                 match = re.search(r'(\d+(?:\.\d+)?)%', line)
                 if match:
@@ -142,34 +118,32 @@ def download_m3u8_with_ytdlp(url, task_id, cookies_file=None, extra_headers=None
                     task = load_task(task_id)
                     if task:
                         task['progress'] = int(pct)
+                        task['status'] = 'downloading'
                         save_task(task_id, task)
-            if '404' in line or 'Not Found' in line:
-                logger.error("URL returned 404 – the link may require cookies or a specific referer.")
-            if 'ERROR' in line or 'error' in line:
+            # Log errors as they come
+            if 'ERROR' in line:
                 logger.error(f"yt-dlp: {line.strip()}")
+
     process.wait()
 
     if process.returncode != 0:
-        full_stderr = ''.join(stderr_lines)
-        if '404' in full_stderr or 'Not Found' in full_stderr:
-            raise Exception(
-                "The m3u8 link returned 404 Not Found in yt-dlp (but works in browser). "
-                "The CDN likely requires additional headers (like cookies). "
-                "Please export your browser cookies to a cookies.txt file and pass it, "
-                "or provide the exact Referer URL from the page where the video is embedded."
-            )
-        raise Exception(f"yt-dlp failed with code {process.returncode}. Check logs for details.")
+        full_output = ''.join(output_lines)
+        logger.error(f"yt-dlp failed (code {process.returncode}):\n{full_output[-2000:]}")
+        raise Exception(f"yt-dlp failed: {full_output[-500:]}")
 
-    # ---- find output ----
-    files = [f for f in os.listdir(UPLOAD_FOLDER) if f.startswith(f"{task_id}_m3u8.")]
+    # ---- Find output file ----
+    files = [f for f in os.listdir(UPLOAD_FOLDER) if f.startswith(f"{task_id}_dl.")]
     if not files:
         raise Exception("No output file found. Check yt-dlp logs.")
+
+    # Prefer mp4, else use whatever yt-dlp produced
     mp4_files = [f for f in files if f.endswith('.mp4')]
     chosen = mp4_files[0] if mp4_files else files[0]
     src = os.path.join(UPLOAD_FOLDER, chosen)
-    base_name = re.sub(r'\.m3u8.*$', '', os.path.basename(url).split('?')[0])
-    if not base_name:
-        base_name = 'stream'
+
+    # Clean filename from URL
+    base_name = os.path.basename(urlparse(url).path.rstrip('/')) or 'video'
+    base_name = re.sub(r'[^\w\-]', '_', base_name)[:80]
     final_name = _get_unique_filename(f"{base_name}.mp4")
     dst = os.path.join(UPLOAD_FOLDER, final_name)
     os.rename(src, dst)
@@ -178,143 +152,23 @@ def download_m3u8_with_ytdlp(url, task_id, cookies_file=None, extra_headers=None
     task['status'] = 'done'
     task['progress'] = 100
     task['output_file'] = final_name
+    task['download_progress'] = 100
     save_task(task_id, task)
-    logger.info(f"M3U8 download completed: {final_name}")
+    logger.info(f"Download completed: {final_name}")
 
 
 # ============================================================
-# DIRECT HTTP DOWNLOAD (with progress)
+# ROUTE HANDLER – dispatch based on URL type
 # ============================================================
-def download_with_requests(url, output_path, task_id):
-    session = requests.Session()
-    if PROXY_DICT:
-        session.proxies = PROXY_DICT
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'video/*,*/*;q=0.9',
-        'Connection': 'keep-alive',
-    })
-
-    total = 0
-    try:
-        head_resp = session.head(url, allow_redirects=True, timeout=30)
-        total = int(head_resp.headers.get('content-length', 0))
-        logger.info(f"Content-Length: {total} bytes")
-    except:
-        logger.warning("Could not get content-length.")
-
-    task = load_task(task_id)
-    if task:
-        task['status'] = 'downloading'
-        task['download_progress'] = 0
-        task['total_size'] = total
-        task['downloaded_size'] = 0
-        task['download_speed'] = 0
-        task['elapsed_time'] = 0
-        save_task(task_id, task)
-    else:
-        logger.error(f"Task {task_id} not found at start")
-        return False
-
-    retries = 3
-    last_error = None
-    for attempt in range(1, retries + 1):
-        try:
-            resp = session.get(url, stream=True, timeout=60)
-            resp.raise_for_status()
-            downloaded = 0
-            start_time = time.time()
-            last_update = time.time()
-            with open(output_path, 'wb') as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    task = load_task(task_id)
-                    if task and task.get('cancelled', False):
-                        raise DownloadCancelled("Cancelled by user")
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        now = time.time()
-                        if now - last_update >= 1:
-                            elapsed = now - start_time
-                            speed = (downloaded / elapsed) / 1024
-                            pct = int(100 * downloaded / total) if total > 0 else 0
-                            task = load_task(task_id)
-                            if task:
-                                task['download_progress'] = pct
-                                task['downloaded_size'] = downloaded
-                                task['download_speed'] = int(speed)
-                                task['elapsed_time'] = int(elapsed)
-                                save_task(task_id, task)
-                            last_update = now
-            task = load_task(task_id)
-            if task:
-                task['download_progress'] = 100
-                task['downloaded_size'] = downloaded
-                task['download_speed'] = 0
-                task['elapsed_time'] = int(time.time() - start_time)
-                save_task(task_id, task)
-            return True
-
-        except DownloadCancelled:
-            raise
-        except Exception as e:
-            last_error = e
-            logger.warning(f"Download attempt {attempt}/{retries} failed: {e}")
-            if attempt == retries:
-                raise Exception(f"Download failed after {retries} attempts: {e}")
-            time.sleep(2 ** attempt)
-
-    if last_error:
-        raise Exception(f"Download failed: {last_error}")
-    return False
-
-
-# ============================================================
-# MAIN ENTRY POINT
-# ============================================================
-def process_url_download(task_id, url):
-    logger.info(f"process_url_download started for {task_id}")
+def process_url_download(task_id, url, format_spec=None):
+    logger.info(f"process_url_download started for {task_id}: {url}")
     task = load_task(task_id)
     if not task:
-        logger.error(f"Task {task_id} not found")
         return
 
-    # ---- Detect m3u8 ----
-    if '.m3u8' in url.lower():
-        try:
-            download_m3u8_with_ytdlp(url, task_id)
-            return
-        except Exception as e:
-            logger.exception(f"M3U8 download failed for {task_id}")
-            task = load_task(task_id)
-            if task and not task.get('cancelled', False):
-                task['status'] = 'error'
-                task['error_msg'] = str(e)
-                save_task(task_id, task)
-            return
-
-    # ---- Regular HTTP download ----
-    temp = os.path.join(UPLOAD_FOLDER, f"{task_id}_raw.mp4")
     try:
-        download_with_requests(url, temp, task_id)
-        if load_task(task_id).get('cancelled', False):
-            if os.path.exists(temp):
-                os.remove(temp)
-            return
-
-        final_name = _get_unique_filename("downloaded_video.mp4")
-        final_path = os.path.join(UPLOAD_FOLDER, final_name)
-        os.rename(temp, final_path)
-
-        task = load_task(task_id)
-        if task:
-            task['status'] = 'done'
-            task['output_file'] = final_name
-            task['download_progress'] = 100
-            task['download_speed'] = 0
-            save_task(task_id, task)
-        logger.info(f"Download completed: {final_name}")
-
+        # Use yt-dlp for everything (handles m3u8, video pages, direct URLs)
+        download_with_ytdlp(url, task_id, format_spec)
     except Exception as e:
         logger.exception(f"Download failed for {task_id}")
         task = load_task(task_id)
@@ -322,8 +176,6 @@ def process_url_download(task_id, url):
             task['status'] = 'error'
             task['error_msg'] = str(e)
             save_task(task_id, task)
-        if os.path.exists(temp):
-            os.remove(temp)
 
 
 # ============================================================
@@ -432,6 +284,10 @@ def register_routes(app):
         url = request.form.get('url', '').strip()
         if not url:
             return jsonify({'error': 'URL required'}), 400
+
+        # Optional format (e.g. "720p", "1080p", "best")
+        format_spec = request.form.get('format', '').strip() or None
+
         task_id = str(uuid.uuid4())
         task_data = {
             'task_id': task_id,
@@ -439,15 +295,19 @@ def register_routes(app):
             'download_progress': 0,
             'created_at': time.time(),
             'cancelled': False,
+            'url': url,
+            'format': format_spec or 'best',
         }
         save_task(task_id, task_data)
 
+        # Torrent handling
         if url.startswith('magnet:') or (url.endswith('.torrent') and url.startswith(('http://', 'https://'))):
             if not TORRENT_AVAILABLE:
                 task_data['status'] = 'error'
                 task_data['error_msg'] = 'libtorrent not installed'
                 save_task(task_id, task_data)
                 return jsonify({'task_id': task_id, 'error': 'libtorrent missing'}), 500
+
             def fetch_torrent():
                 if url.startswith('magnet:'):
                     process_torrent_download(task_id, url)
@@ -468,9 +328,11 @@ def register_routes(app):
                             save_task(task_id, task)
             threading.Thread(target=fetch_torrent, daemon=True).start()
         else:
+            # Everything else (m3u8, video pages, direct URLs) → yt-dlp
             def run():
-                process_url_download(task_id, url)
+                process_url_download(task_id, url, format_spec)
             threading.Thread(target=run, daemon=True).start()
+
         return jsonify({'task_id': task_id})
 
     @app.route('/start_upload_torrent', methods=['POST'])
