@@ -28,15 +28,15 @@ COOKIES_FILE = os.path.join(
 )
 
 QUALITY_MAP = {
-    'best':    'bestvideo+bestaudio/best',
-    '2160p':   'bestvideo[height<=2160]+bestaudio/best[height<=2160]',
-    '4k':      'bestvideo[height<=2160]+bestaudio/best[height<=2160]',
-    '1440p':   'bestvideo[height<=1440]+bestaudio/best[height<=1440]',
-    '1080p':   'bestvideo[height<=1080]+bestaudio/best[height<=1080]',
-    '720p':    'bestvideo[height<=720]+bestaudio/best[height<=720]',
-    '480p':    'bestvideo[height<=480]+bestaudio/best[height<=480]',
-    '360p':    'bestvideo[height<=360]+bestaudio/best[height<=360]',
-    'audio':   'bestaudio/best',
+    'best':  'bv*+ba/b',
+    '2160p': 'bv*[height<=2160]+ba/b[height<=2160]/b',
+    '4k':    'bv*[height<=2160]+ba/b[height<=2160]/b',
+    '1440p': 'bv*[height<=1440]+ba/b[height<=1440]/b',
+    '1080p': 'bv*[height<=1080]+ba/b[height<=1080]/b',
+    '720p':  'bv*[height<=720]+ba/b[height<=720]/b',
+    '480p':  'bv*[height<=480]+ba/b[height<=480]/b',
+    '360p':  'bv*[height<=360]+ba/b[height<=360]/b',
+    'audio': 'ba/b',
 }
 
 
