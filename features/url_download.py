@@ -22,13 +22,11 @@ try:
 except ImportError:
     logger.warning("libtorrent not installed. Torrent downloads disabled.")
 
-# Path to cookies file (project root)
 COOKIES_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     'cookies.txt'
 )
 
-# Quality → yt-dlp format string
 QUALITY_MAP = {
     'best':    'bestvideo+bestaudio/best',
     '2160p':   'bestvideo[height<=2160]+bestaudio/best[height<=2160]',
@@ -47,9 +45,9 @@ class DownloadCancelled(Exception):
 
 
 # ============================================================
-# GLOBAL PROCESS TRACKER (for cancellation)
+# PROCESS TRACKER
 # ============================================================
-_running_processes = {}     # task_id -> subprocess.Popen
+_running_processes = {}
 _processes_lock = threading.Lock()
 
 
@@ -64,7 +62,6 @@ def unregister_process(task_id):
 
 
 def kill_process(task_id):
-    """Terminate the running subprocess for a task (used by /cancel)."""
     with _processes_lock:
         process = _running_processes.get(task_id)
     if process and process.poll() is None:
@@ -88,16 +85,16 @@ def kill_process(task_id):
 
 
 # ============================================================
-# YT-DLP DOWNLOADER
+# YT-DLP DOWNLOADER (with PO Token support)
 # ============================================================
 def download_with_ytdlp(url, task_id, quality='best'):
     """
     Download any supported URL with yt-dlp:
-      - chrome impersonation (bypass Cloudflare / anti-bot)
-      - cookies.txt (logged-in content)
+      - chrome impersonation
+      - cookies.txt
+      - PO Token provider (bypasses YouTube bot check)
       - extractor-args for YouTube player clients
       - up to 4K quality
-      - working cancellation
     """
     task = load_task(task_id)
     if not task:
@@ -111,7 +108,6 @@ def download_with_ytdlp(url, task_id, quality='best'):
 
     os.environ['PATH'] = '/usr/local/bin:' + os.environ.get('PATH', '')
 
-    # ---- find ffmpeg ----
     ffmpeg_path = shutil.which('ffmpeg')
     if not ffmpeg_path:
         for p in ['/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg']:
@@ -124,12 +120,10 @@ def download_with_ytdlp(url, task_id, quality='best'):
     if not shutil.which('yt-dlp'):
         raise Exception("yt-dlp not installed. Run: pip install -U yt-dlp")
 
-    # ---- resolve format ----
     format_choice = QUALITY_MAP.get(quality, QUALITY_MAP['best'])
-
     output_template = os.path.join(UPLOAD_FOLDER, f"{task_id}_dl.%(ext)s")
 
-    # ---- build yt-dlp command ----
+    # ---- Build yt-dlp command ----
     cmd = [
         'yt-dlp',
         '-o', output_template,
@@ -140,17 +134,17 @@ def download_with_ytdlp(url, task_id, quality='best'):
         '--no-warnings',
         '--ignore-errors',
         '--impersonate', 'chrome',
-        '--extractor-args', 'youtube:player_client=android,web,web_embedded',
+        '--extractor-args',
+        'youtube:player_client=android,web,web_embedded',
         '--ffmpeg-location', ffmpeg_path,
         '--newline',
         '--progress',
         '--no-colors',
-        '--concurrent-fragments', '4',      # speed up HLS/DASH
+        '--concurrent-fragments', '4',
         '--retries', '5',
         '--fragment-retries', '5',
     ]
 
-    # Add cookies if present
     if os.path.exists(COOKIES_FILE):
         cmd += ['--cookies', COOKIES_FILE]
         logger.info(f"Using cookies from {COOKIES_FILE}")
@@ -161,7 +155,7 @@ def download_with_ytdlp(url, task_id, quality='best'):
 
     logger.info(f"yt-dlp command: {' '.join(cmd)}")
 
-    # ---- Launch process in its own process group (for cancellation) ----
+    # ---- Launch process ----
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -195,14 +189,12 @@ def download_with_ytdlp(url, task_id, quality='best'):
 
             output_lines.append(line)
 
-            # ---- Check cancellation ----
             task = load_task(task_id)
             if task and task.get('cancelled', False):
                 logger.info(f"Task {task_id} cancelled – killing yt-dlp")
                 kill_process(task_id)
                 raise DownloadCancelled("Cancelled by user")
 
-            # ---- Parse progress ----
             pct_match = RE_PERCENT.search(line)
             if pct_match:
                 pct = float(pct_match.group(1))
@@ -240,7 +232,7 @@ def download_with_ytdlp(url, task_id, quality='best'):
         logger.error(f"yt-dlp failed (code {process.returncode}):\n{full_output[-3000:]}")
         raise Exception(f"yt-dlp failed: {full_output[-500:]}")
 
-    # ---- Find output file ----
+    # ---- Find output ----
     files = [f for f in os.listdir(UPLOAD_FOLDER) if f.startswith(f"{task_id}_dl.")]
     if not files:
         raise Exception("No output file found.")
@@ -249,7 +241,6 @@ def download_with_ytdlp(url, task_id, quality='best'):
     chosen = mp4_files[0] if mp4_files else files[0]
     src = os.path.join(UPLOAD_FOLDER, chosen)
 
-    # Clean filename from URL
     base_name = os.path.basename(urlparse(url).path.rstrip('/')) or 'video'
     base_name = re.sub(r'[^\w\-]', '_', base_name)[:80]
     if quality not in ('best', 'audio'):
@@ -299,7 +290,7 @@ def process_url_download(task_id, url, quality='best'):
 
 
 # ============================================================
-# TORRENT SUPPORT (with cancellation)
+# TORRENT SUPPORT
 # ============================================================
 def download_torrent(torrent_input, task_id, save_path):
     if not TORRENT_AVAILABLE:
@@ -434,7 +425,6 @@ def register_routes(app):
         }
         save_task(task_id, task_data)
 
-        # Torrent handling
         if url.startswith('magnet:') or (url.endswith('.torrent') and url.startswith(('http://', 'https://'))):
             if not TORRENT_AVAILABLE:
                 task_data['status'] = 'error'
