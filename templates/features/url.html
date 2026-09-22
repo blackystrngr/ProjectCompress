@@ -6,13 +6,15 @@
         <input type="text" id="directUrl"
                placeholder="https://example.com/video.mp4 OR .m3u8 OR magnet:?xt=... OR video page URL"
                autocomplete="off" style="flex:1; min-width:250px;">
-        <select id="videoFormat" style="width:160px;">
-            <option value="best">Best quality</option>
-            <option value="1080p">1080p</option>
-            <option value="720p" selected>720p</option>
-            <option value="480p">480p</option>
-            <option value="360p">360p</option>
-            <option value="bestvideo+bestaudio/best">Best (merge)</option>
+       <select id="videoFormat" style="width:150px;">
+    <option value="best">Best available</option>
+    <option value="2160p">4K (2160p)</option>
+    <option value="1440p">1440p</option>
+    <option value="1080p" selected>1080p</option>
+    <option value="720p">720p</option>
+    <option value="480p">480p</option>
+    <option value="360p">360p</option>
+    <option value="audio">Audio only</option>
         </select>
         <button id="downloadUrlBtn" class="primary">
             <i class="fas fa-cloud-download-alt"></i> Download
@@ -169,11 +171,12 @@ function startPollingForTask(taskId) {
     }, 2000);
 }
 
-async function startDownload(url, format) {
+async function startDownload(url, quality) {
     try {
         const formData = new URLSearchParams();
         formData.append('url', url);
-        if (format) formData.append('format', format);
+        if (quality) formData.append('quality', quality);
+        
 
         const resp = await fetch('/start', {
             method: 'POST',
@@ -202,8 +205,8 @@ downloadBtn.onclick = () => {
         showToast('Enter a URL, magnet link, or torrent file URL', true);
         return;
     }
-    const format = formatSelect ? formatSelect.value : '720p';
-    startDownload(url, format);
+    const quality = formatSelect ? formatSelect.value : '1080p';
+    startDownload(url, quality);
 };
 
 // Enter key triggers download
