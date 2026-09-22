@@ -22,7 +22,24 @@ try:
 except ImportError:
     logger.warning("libtorrent not installed. Torrent downloads disabled.")
 
-COOKIES_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'cookies.txt')
+# Path to cookies file (project root)
+COOKIES_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'cookies.txt'
+)
+
+# Quality → yt-dlp format string
+QUALITY_MAP = {
+    'best':    'bestvideo+bestaudio/best',
+    '2160p':   'bestvideo[height<=2160]+bestaudio/best[height<=2160]',
+    '4k':      'bestvideo[height<=2160]+bestaudio/best[height<=2160]',
+    '1440p':   'bestvideo[height<=1440]+bestaudio/best[height<=1440]',
+    '1080p':   'bestvideo[height<=1080]+bestaudio/best[height<=1080]',
+    '720p':    'bestvideo[height<=720]+bestaudio/best[height<=720]',
+    '480p':    'bestvideo[height<=480]+bestaudio/best[height<=480]',
+    '360p':    'bestvideo[height<=360]+bestaudio/best[height<=360]',
+    'audio':   'bestaudio/best',
+}
 
 
 class DownloadCancelled(Exception):
@@ -52,7 +69,6 @@ def kill_process(task_id):
         process = _running_processes.get(task_id)
     if process and process.poll() is None:
         try:
-            # Kill the whole process group to also terminate ffmpeg children
             try:
                 os.killpg(os.getpgid(process.pid), signal.SIGTERM)
             except Exception:
@@ -72,13 +88,15 @@ def kill_process(task_id):
 
 
 # ============================================================
-# YT-DLP DOWNLOADER (chrome impersonation + cookies + cancel)
+# YT-DLP DOWNLOADER
 # ============================================================
-def download_with_ytdlp(url, task_id, format_spec=None):
+def download_with_ytdlp(url, task_id, quality='best'):
     """
-    Download any supported URL with yt-dlp, using:
-      - chrome impersonation
-      - cookies.txt
+    Download any supported URL with yt-dlp:
+      - chrome impersonation (bypass Cloudflare / anti-bot)
+      - cookies.txt (logged-in content)
+      - extractor-args for YouTube player clients
+      - up to 4K quality
       - working cancellation
     """
     task = load_task(task_id)
@@ -93,7 +111,7 @@ def download_with_ytdlp(url, task_id, format_spec=None):
 
     os.environ['PATH'] = '/usr/local/bin:' + os.environ.get('PATH', '')
 
-    # ---- ffmpeg ----
+    # ---- find ffmpeg ----
     ffmpeg_path = shutil.which('ffmpeg')
     if not ffmpeg_path:
         for p in ['/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg']:
@@ -106,9 +124,12 @@ def download_with_ytdlp(url, task_id, format_spec=None):
     if not shutil.which('yt-dlp'):
         raise Exception("yt-dlp not installed. Run: pip install -U yt-dlp")
 
-    output_template = os.path.join(UPLOAD_FOLDER, f"{task_id}_dl.%(ext)s")
-    format_choice = format_spec or 'bestvideo+bestaudio/best'
+    # ---- resolve format ----
+    format_choice = QUALITY_MAP.get(quality, QUALITY_MAP['best'])
 
+    output_template = os.path.join(UPLOAD_FOLDER, f"{task_id}_dl.%(ext)s")
+
+    # ---- build yt-dlp command ----
     cmd = [
         'yt-dlp',
         '-o', output_template,
@@ -119,29 +140,35 @@ def download_with_ytdlp(url, task_id, format_spec=None):
         '--no-warnings',
         '--ignore-errors',
         '--impersonate', 'chrome',
+        '--extractor-args', 'youtube:player_client=android,web,web_embedded',
         '--ffmpeg-location', ffmpeg_path,
         '--newline',
         '--progress',
         '--no-colors',
+        '--concurrent-fragments', '4',      # speed up HLS/DASH
+        '--retries', '5',
+        '--fragment-retries', '5',
     ]
 
+    # Add cookies if present
     if os.path.exists(COOKIES_FILE):
         cmd += ['--cookies', COOKIES_FILE]
         logger.info(f"Using cookies from {COOKIES_FILE}")
     else:
-        logger.warning("No cookies.txt found – downloads may fail for login-only content.")
+        logger.warning(f"No cookies.txt found at {COOKIES_FILE}")
 
     cmd.append(url)
+
     logger.info(f"yt-dlp command: {' '.join(cmd)}")
 
-    # ---- Launch process in its own process group ----
+    # ---- Launch process in its own process group (for cancellation) ----
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
-        preexec_fn=os.setsid,   # new process group → we can kill yt-dlp AND its ffmpeg children
+        preexec_fn=os.setsid,
     )
     register_process(task_id, process)
 
@@ -168,7 +195,7 @@ def download_with_ytdlp(url, task_id, format_spec=None):
 
             output_lines.append(line)
 
-            # ---- Check cancellation on every line ----
+            # ---- Check cancellation ----
             task = load_task(task_id)
             if task and task.get('cancelled', False):
                 logger.info(f"Task {task_id} cancelled – killing yt-dlp")
@@ -208,12 +235,9 @@ def download_with_ytdlp(url, task_id, format_spec=None):
     finally:
         unregister_process(task_id)
 
-    # ---- Handle cancellation propagation ----
-    # (reached only if loop exited normally - the raise above prevents this)
-
     if process.returncode != 0:
         full_output = ''.join(output_lines)
-        logger.error(f"yt-dlp failed (code {process.returncode}):\n{full_output[-2000:]}")
+        logger.error(f"yt-dlp failed (code {process.returncode}):\n{full_output[-3000:]}")
         raise Exception(f"yt-dlp failed: {full_output[-500:]}")
 
     # ---- Find output file ----
@@ -225,8 +249,11 @@ def download_with_ytdlp(url, task_id, format_spec=None):
     chosen = mp4_files[0] if mp4_files else files[0]
     src = os.path.join(UPLOAD_FOLDER, chosen)
 
+    # Clean filename from URL
     base_name = os.path.basename(urlparse(url).path.rstrip('/')) or 'video'
     base_name = re.sub(r'[^\w\-]', '_', base_name)[:80]
+    if quality not in ('best', 'audio'):
+        base_name = f"{base_name}_{quality}"
     final_name = _get_unique_filename(f"{base_name}.mp4")
     dst = os.path.join(UPLOAD_FOLDER, final_name)
     os.rename(src, dst)
@@ -248,13 +275,13 @@ def download_with_ytdlp(url, task_id, format_spec=None):
 # ============================================================
 # MAIN ENTRY
 # ============================================================
-def process_url_download(task_id, url, format_spec=None):
-    logger.info(f"process_url_download started for {task_id}: {url}")
+def process_url_download(task_id, url, quality='best'):
+    logger.info(f"process_url_download started for {task_id}: {url} (quality={quality})")
     task = load_task(task_id)
     if not task:
         return
     try:
-        download_with_ytdlp(url, task_id, format_spec)
+        download_with_ytdlp(url, task_id, quality)
     except DownloadCancelled:
         logger.info(f"Download cancelled for {task_id}")
         task = load_task(task_id)
@@ -387,7 +414,9 @@ def register_routes(app):
         if not url:
             return jsonify({'error': 'URL required'}), 400
 
-        format_spec = request.form.get('format', '').strip() or None
+        quality = request.form.get('quality', 'best').strip().lower()
+        if quality not in QUALITY_MAP:
+            quality = 'best'
 
         task_id = str(uuid.uuid4())
         task_data = {
@@ -401,10 +430,11 @@ def register_routes(app):
             'created_at': time.time(),
             'cancelled': False,
             'url': url,
-            'format': format_spec or 'best',
+            'quality': quality,
         }
         save_task(task_id, task_data)
 
+        # Torrent handling
         if url.startswith('magnet:') or (url.endswith('.torrent') and url.startswith(('http://', 'https://'))):
             if not TORRENT_AVAILABLE:
                 task_data['status'] = 'error'
@@ -433,24 +463,10 @@ def register_routes(app):
             threading.Thread(target=fetch_torrent, daemon=True).start()
         else:
             def run():
-                process_url_download(task_id, url, format_spec)
+                process_url_download(task_id, url, quality)
             threading.Thread(target=run, daemon=True).start()
 
         return jsonify({'task_id': task_id})
-
-    # ---- Cancel endpoint: kills yt-dlp process ----
-    @app.route('/cancel_download/<task_id>', methods=['POST'])
-    def cancel_download(task_id):
-        """Cancel a download by killing its subprocess."""
-        task = load_task(task_id)
-        if not task:
-            return jsonify({'error': 'Task not found'}), 404
-        task['cancelled'] = True
-        task['status'] = 'cancelled'
-        save_task(task_id, task)
-        killed = kill_process(task_id)
-        logger.info(f"Cancel requested for {task_id} – killed={killed}")
-        return jsonify({'status': 'cancelling', 'killed': killed})
 
     @app.route('/start_upload_torrent', methods=['POST'])
     def start_upload_torrent():
