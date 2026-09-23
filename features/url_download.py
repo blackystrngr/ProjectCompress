@@ -8,7 +8,7 @@ import requests
 import subprocess
 import shutil
 import signal
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from flask import request, jsonify
 from tasks import save_task, load_task
 from config import UPLOAD_FOLDER, PROXY_DICT
@@ -27,6 +27,7 @@ COOKIES_FILE = os.path.join(
     'cookies.txt'
 )
 
+# ---- Format selectors for yt-dlp ----
 QUALITY_MAP = {
     'best':  'bv*+ba/b',
     '2160p': 'bv*[height<=2160]+ba/b[height<=2160]/b',
@@ -39,13 +40,40 @@ QUALITY_MAP = {
     'audio': 'ba/b',
 }
 
+# ---- Video extensions (use yt-dlp) ----
+VIDEO_EXTS = {
+    '.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.m4v',
+    '.m3u8', '.ts', '.mpd', '.mpg', '.mpeg', '.wmv', '.3gp'
+}
+
+# ---- Direct file extensions (use requests) ----
+# Everything that isn't a video OR audio gets downloaded as-is
+AUDIO_EXTS = {'.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a', '.wma', '.opus'}
+
+# Common direct-download extensions (for fast detection without HEAD request)
+DIRECT_EXTS = {
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.odt', '.ods', '.odp',
+    '.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz',
+    '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg', '.ico', '.tiff',
+    '.exe', '.msi', '.deb', '.rpm', '.dmg', '.pkg',
+    '.apk', '.ipa', '.appimage',
+    '.iso', '.img',
+    '.txt', '.csv', '.json', '.xml', '.yaml', '.yml', '.md', '.log',
+    '.py', '.js', '.sh', '.c', '.cpp', '.h', '.java', '.go', '.rs',
+    '.epub', '.mobi', '.azw3',
+    '.ttf', '.otf', '.woff', '.woff2',
+    '.sqlite', '.db',
+}
+
+CHUNK_SIZE = 64 * 1024   # 64 KB chunks
+
 
 class DownloadCancelled(Exception):
     pass
 
 
 # ============================================================
-# PROCESS TRACKER
+# GLOBAL PROCESS TRACKER (for yt-dlp cancellation)
 # ============================================================
 _running_processes = {}
 _processes_lock = threading.Lock()
@@ -85,17 +113,194 @@ def kill_process(task_id):
 
 
 # ============================================================
-# YT-DLP DOWNLOADER (with PO Token support)
+# DETECT URL TYPE
+# ============================================================
+def _get_extension_from_url(url):
+    """Try to guess the file extension from the URL path."""
+    try:
+        path = urlparse(url).path
+        name = os.path.basename(path)
+        ext = os.path.splitext(name)[1].lower()
+        return ext
+    except Exception:
+        return ''
+
+
+def _guess_filename_from_url(url):
+    """Return a clean filename from the URL path."""
+    try:
+        path = urlparse(url).path
+        name = os.path.basename(path)
+        if name:
+            # URL-decode (handles %20 etc.)
+            name = unquote(name)
+            # Strip query-like tail if any
+            name = re.sub(r'[?&].*$', '', name)
+            return name
+    except Exception:
+        pass
+    return 'download'
+
+
+def is_direct_file_url(url):
+    """
+    Return True if the URL looks like a direct file (not a video page or stream).
+    Uses URL extension as the primary hint.
+    """
+    ext = _get_extension_from_url(url)
+
+    # Video URLs → use yt-dlp (handles m3u8, YouTube, etc.)
+    if ext in VIDEO_EXTS:
+        return False
+
+    # Audio files → direct download (faster than yt-dlp)
+    if ext in AUDIO_EXTS:
+        return True
+
+    # Known non-video extensions → direct
+    if ext in DIRECT_EXTS:
+        return True
+
+    # Unknown extension with no extension → let yt-dlp try first
+    # (it'll quickly fail for real files and we fall back)
+    return False
+
+
+# ============================================================
+# DIRECT FILE DOWNLOAD (requests)
+# ============================================================
+def download_direct_file(url, task_id):
+    """
+    Download a direct file (PDF, ZIP, image, audio, etc.) with requests.
+    Reports progress, size, and speed. Supports cancellation.
+    """
+    task = load_task(task_id)
+    if not task:
+        raise Exception("Task not found")
+
+    filename = _guess_filename_from_url(url) or f"{task_id}_file"
+    final_name = _get_unique_filename(filename)
+    output_path = os.path.join(UPLOAD_FOLDER, final_name)
+
+    session = requests.Session()
+    if PROXY_DICT:
+        session.proxies = PROXY_DICT
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Connection': 'keep-alive',
+    })
+
+    # ---- Get total size ----
+    total = 0
+    try:
+        head = session.head(url, allow_redirects=True, timeout=30)
+        total = int(head.headers.get('content-length', 0))
+        # Get real filename from Content-Disposition if present
+        cd = head.headers.get('content-disposition', '')
+        if cd and 'filename=' in cd:
+            fn_match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^\";]+)"?', cd)
+            if fn_match:
+                suggested = unquote(fn_match.group(1)).strip()
+                if suggested:
+                    final_name = _get_unique_filename(suggested)
+                    output_path = os.path.join(UPLOAD_FOLDER, final_name)
+    except Exception as e:
+        logger.warning(f"HEAD request failed for {url}: {e}")
+
+    # ---- Update task ----
+    task = load_task(task_id)
+    task['status'] = 'downloading'
+    task['download_progress'] = 0
+    task['progress'] = 0
+    task['total_size'] = total
+    task['downloaded_size'] = 0
+    task['download_speed'] = 0
+    task['elapsed_time'] = 0
+    save_task(task_id, task)
+
+    # ---- Stream download ----
+    start_time = time.time()
+    last_update = 0
+    downloaded = 0
+    temp_path = output_path + '.part'
+
+    try:
+        resp = session.get(url, stream=True, timeout=(15, 120), allow_redirects=True)
+        resp.raise_for_status()
+
+        # Re-check content-length from GET (HEAD might have failed)
+        if total == 0:
+            total = int(resp.headers.get('content-length', 0))
+            task = load_task(task_id)
+            if task:
+                task['total_size'] = total
+                save_task(task_id, task)
+
+        with open(temp_path, 'wb') as f:
+            for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
+                # ---- Cancellation check ----
+                task = load_task(task_id)
+                if task and task.get('cancelled', False):
+                    raise DownloadCancelled("Cancelled by user")
+
+                if not chunk:
+                    continue
+
+                f.write(chunk)
+                downloaded += len(chunk)
+
+                now = time.time()
+                if now - last_update >= 0.5:
+                    elapsed = now - start_time
+                    speed_kbps = int((downloaded / elapsed) / 1024) if elapsed > 0 else 0
+                    pct = int(100 * downloaded / total) if total > 0 else 0
+                    task = load_task(task_id)
+                    if task:
+                        task['download_progress'] = pct
+                        task['progress'] = pct
+                        task['downloaded_size'] = downloaded
+                        task['download_speed'] = speed_kbps
+                        task['elapsed_time'] = int(elapsed)
+                        save_task(task_id, task)
+                    last_update = now
+
+        # ---- Move .part → final ----
+        os.rename(temp_path, output_path)
+
+        final_size = os.path.getsize(output_path)
+        elapsed = time.time() - start_time
+
+        task = load_task(task_id)
+        task['status'] = 'done'
+        task['download_progress'] = 100
+        task['progress'] = 100
+        task['total_size'] = final_size
+        task['downloaded_size'] = final_size
+        task['download_speed'] = 0
+        task['elapsed_time'] = int(elapsed)
+        task['output_file'] = final_name
+        save_task(task_id, task)
+
+        logger.info(f"Direct file download complete: {final_name} "
+                    f"({final_size / 1024 / 1024:.1f} MB in {elapsed:.1f}s)")
+
+    except DownloadCancelled:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
+    except Exception as e:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
+
+
+# ============================================================
+# YT-DLP DOWNLOADER (videos)
 # ============================================================
 def download_with_ytdlp(url, task_id, quality='best'):
-    """
-    Download any supported URL with yt-dlp:
-      - chrome impersonation
-      - cookies.txt
-      - PO Token provider (bypasses YouTube bot check)
-      - extractor-args for YouTube player clients
-      - up to 4K quality
-    """
     task = load_task(task_id)
     if not task:
         raise Exception("Task not found")
@@ -123,7 +328,6 @@ def download_with_ytdlp(url, task_id, quality='best'):
     format_choice = QUALITY_MAP.get(quality, QUALITY_MAP['best'])
     output_template = os.path.join(UPLOAD_FOLDER, f"{task_id}_dl.%(ext)s")
 
-    # ---- Build yt-dlp command ----
     cmd = [
         'yt-dlp',
         '-o', output_template,
@@ -151,10 +355,8 @@ def download_with_ytdlp(url, task_id, quality='best'):
         logger.warning(f"No cookies.txt found at {COOKIES_FILE}")
 
     cmd.append(url)
-
     logger.info(f"yt-dlp command: {' '.join(cmd)}")
 
-    # ---- Launch process ----
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -175,7 +377,7 @@ def download_with_ytdlp(url, task_id, quality='best'):
 
     def to_bytes(value, unit):
         unit = unit.upper().replace('IB', 'B')
-        factors = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3, 'TB': 1024**4}
+        factors = {'B': 1, 'KB': 1024, 'MB': 1024 ** 2, 'GB': 1024 ** 3, 'TB': 1024 ** 4}
         return int(value * factors.get(unit, 1))
 
     try:
@@ -231,7 +433,6 @@ def download_with_ytdlp(url, task_id, quality='best'):
         logger.error(f"yt-dlp failed (code {process.returncode}):\n{full_output[-3000:]}")
         raise Exception(f"yt-dlp failed: {full_output[-500:]}")
 
-    # ---- Find output ----
     files = [f for f in os.listdir(UPLOAD_FOLDER) if f.startswith(f"{task_id}_dl.")]
     if not files:
         raise Exception("No output file found.")
@@ -263,15 +464,35 @@ def download_with_ytdlp(url, task_id, quality='best'):
 
 
 # ============================================================
-# MAIN ENTRY
+# MAIN ENTRY (chooses direct vs yt-dlp)
 # ============================================================
 def process_url_download(task_id, url, quality='best'):
     logger.info(f"process_url_download started for {task_id}: {url} (quality={quality})")
     task = load_task(task_id)
     if not task:
         return
+
     try:
-        download_with_ytdlp(url, task_id, quality)
+        # ---- Route to the right downloader ----
+        if is_direct_file_url(url):
+            logger.info(f"Detected direct file → using requests downloader")
+            download_direct_file(url, task_id)
+        else:
+            logger.info(f"Detected video/stream → using yt-dlp")
+            try:
+                download_with_ytdlp(url, task_id, quality)
+            except Exception as ytdlp_err:
+                # Fallback: yt-dlp can't handle it, try direct download
+                err_text = str(ytdlp_err).lower()
+                non_video_errors = [
+                    'unsupported url', 'no video formats', 'requested format is not available',
+                    'not a valid url', 'is not a valid url', 'no suitable'
+                ]
+                if any(e in err_text for e in non_video_errors):
+                    logger.warning(f"yt-dlp rejected URL, falling back to direct download")
+                    download_direct_file(url, task_id)
+                else:
+                    raise
     except DownloadCancelled:
         logger.info(f"Download cancelled for {task_id}")
         task = load_task(task_id)
@@ -289,7 +510,7 @@ def process_url_download(task_id, url, quality='best'):
 
 
 # ============================================================
-# TORRENT SUPPORT
+# TORRENT SUPPORT (unchanged)
 # ============================================================
 def download_torrent(torrent_input, task_id, save_path):
     if not TORRENT_AVAILABLE:
