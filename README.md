@@ -1,107 +1,136 @@
-📁 ProjectCompress
-A self‑hosted media downloader, compressor, and organizer built with Flask. Download from any URL, extract video frames, swap faces, scrape subtitles, crawl domains, and more – all from a single web dashboard with live system stats.
+<div align="center">
 
-✨ Features
-📥 Downloads
-Universal URL downloader – videos, PDFs, ZIPs, images, audio, executables, and any direct file link
+# 🎬 ProjectCompress
 
-Video/stream support via yt-dlp – YouTube, Vimeo, TikTok, m3u8/HLS, DASH, and 1000+ sites
+**A self-hosted media downloader, compressor, and organizer built with Flask.**
 
-Quality selection – 360p, 480p, 720p, 1080p, 1440p, 4K (2160p), or best available
+Download from any URL · Extract frames · Swap faces · Scrape subtitles · Crawl domains · Monitor system stats — all from one dashboard.
 
-Torrent support – magnet links and .torrent files (via libtorrent)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![Flask](https://img.shields.io/badge/Flask-3.0-000000?style=for-the-badge&logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
+[![FFmpeg](https://img.shields.io/badge/FFmpeg-latest-007808?style=for-the-badge&logo=ffmpeg&logoColor=white)](https://ffmpeg.org/)
+[![yt-dlp](https://img.shields.io/badge/yt--dlp-latest-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://github.com/yt-dlp/yt-dlp)
+[![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](LICENSE)
 
-Torrent search – integrated 1337x / PirateBay / Zooqle search
+</div>
 
-YouTube bot bypass – uses --impersonate chrome, cookies, and the bgutil POT provider
+---
 
-🎬 Video Tools
-Random clip generator – divide video into segments, pick random clips, merge into one
+## 📖 Table of Contents
 
-AI summarizer – evenly spaced clips into a short summary video
+- [Features](#-features)
+- [Screenshots](#-screenshots)
+- [Quick Start](#-quick-start)
+- [Configuration](#%EF%B8%8F-configuration)
+- [Running the App](#-running-the-app)
+- [Project Structure](#-project-structure)
+- [Usage Examples](#-usage-examples)
+- [Troubleshooting](#-troubleshooting)
+- [Security](#-security)
+- [Tech Stack](#-tech-stack)
+- [Contributing](#-contributing)
+- [License](#-license)
 
-Frame extractor – extract one frame every N seconds into a ZIP file
+---
 
-Face swap – photo → video face replacement (via Colab integration)
+## ✨ Features
 
-📤 Uploads & Storage
-Telegram – scan chats for videos, download selected, send files to chats
+### 📥 Universal Downloads
+| Feature | Description |
+|---------|-------------|
+| **Any file type** | Download videos, PDFs, ZIPs, images, audio, executables, APKs, and any direct URL |
+| **Video & streams** | YouTube, Vimeo, TikTok, m3u8/HLS, DASH via `yt-dlp` |
+| **Quality control** | 360p → **4K (2160p)** + audio-only |
+| **Torrents** | Magnet links & `.torrent` files via `libtorrent` |
+| **Torrent search** | Built-in 1337x / PirateBay / Zooqle search |
+| **Bot bypass** | Chrome impersonation + cookies + [bgutil POT provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) |
 
-Google Drive – list, download, upload, delete files (uses OAuth)
+### 🎬 Video Tools
+- **Random clip generator** – split video, pick random clips, merge into one
+- **AI summarizer** – evenly spaced clips into a short summary
+- **Frame extractor** – extract one frame every N seconds into a ZIP
+- **Face swap** – photo → video face replacement (via Colab)
 
-Local file manager – browse, preview, download, delete, send to Telegram/Colab
+### 📤 Uploads & Storage
+- **Telegram** – scan chats, download videos, send files
+- **Google Drive** – list, download, upload, delete
+- **Local file manager** – browse, preview, download, delete files
 
-🛠 Utilities
-OCR – extract text from images and PDFs (Tesseract, 20+ languages)
+### 🛠 Utilities
+- **OCR** – extract text from images/PDFs (Tesseract, 20+ languages)
+- **Subtitles** – search & download from OpenSubtitles
+- **Proxy fetcher** – scrape and test HTTP/SOCKS proxies
+- **Web crawler** – recursive domain/URL discovery with live streaming
 
-Subtitle finder – search and download subtitles from OpenSubtitles
+### 📊 Monitoring
+- **Live stats bar** – CPU, RAM, Disk, Upload/Download speed (2s refresh)
+- **Real-time tasks** – Server-Sent Events (no polling)
+- **Auto thumbnails** – generated from the last 30s of each video
 
-Proxy fetcher – scrape and test live HTTP/SOCKS proxies
+---
 
-Web crawler – recursive domain/URL discovery with live streaming results
+## 📸 Screenshots
 
-📊 Monitoring
-Live system stats bar – CPU, RAM, Disk usage + Upload/Download speed (updates every 2 seconds)
+> Add your screenshots here — recommended: 1200×700 PNG files in `docs/`.
 
-Real‑time task panel – Server‑Sent Events (SSE) push updates instantly (no polling)
+| Dashboard | Video Clipper |
+|-----------|---------------|
+| ![Dashboard](docs/dashboard.png) | ![Clipper](docs/clipper.png) |
 
-Thumbnail previews – auto‑generated from the last 30 seconds of each video
+---
 
-🚀 Installation
-Prerequisites
-Debian 12 / Ubuntu 22.04+ (or similar)
+## 🚀 Quick Start
 
-Root access for installing system packages
+### One-command install (Ubuntu / Debian)
 
-~2 GB free disk space (for ffmpeg + Node.js + Python packages)
-
-One‑command install
-bash
+```bash
 git clone https://github.com/blackystrngr/ProjectCompress.git
 cd ProjectCompress
 chmod +x install.sh
 sudo ./install.sh
-The script installs and configures:
+```
 
-ffmpeg (static build from BtbN)
+The installer sets up:
+- ✅ ffmpeg (static build)
+- ✅ Node.js 20.x
+- ✅ Deno (for yt-dlp challenges)
+- ✅ yt-dlp + yt-dlp-ejs + curl_cffi
+- ✅ bgutil POT provider (as systemd service)
+- ✅ All Python dependencies
 
-Node.js 20.x (for the POT provider)
+### Manual install
 
-Deno (JavaScript runtime for yt‑dlp challenges)
-
-yt-dlp + yt-dlp-ejs + curl_cffi
-
-bgutil-ytdlp-pot-provider (as a systemd service)
-
-All Python dependencies from requirements.txt
-
-Manual install
-bash
-# System packages
+```bash
+# System dependencies
 sudo apt update
 sudo apt install -y python3-pip ffmpeg wget curl git nodejs npm
 
-# Python packages
+# Python dependencies
 pip install --break-system-packages -r requirements.txt
 pip install --break-system-packages yt-dlp yt-dlp-ejs curl_cffi bgutil-ytdlp-pot-provider
 
 # Optional: torrent support
 sudo apt install -y python3-libtorrent
-⚙️ Configuration
-1. YouTube cookies (cookies.txt)
-For age‑restricted or login‑only videos:
+```
 
-Install the "Get cookies.txt LOCALLY" extension in Chrome/Firefox
+---
 
-Log in to YouTube
+## ⚙️ Configuration
 
-Export cookies for youtube.com → save as cookies.txt in the project root
+### 1️⃣ YouTube cookies — `cookies.txt`
 
-2. Google Drive (token.json)
+For age-restricted or login-only videos:
+
+1. Install the **[Get cookies.txt LOCALLY](https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)** extension
+2. Log in to YouTube
+3. Export cookies for `youtube.com`
+4. Save as `cookies.txt` in the project root
+
+### 2️⃣ Google Drive — `token.json`
+
 Only needed for Drive features:
 
-bash
-# Place credentials.json (OAuth client) in project root, then:
+```bash
 python3 -c "
 from google_auth_oauthlib.flow import InstalledAppFlow
 flow = InstalledAppFlow.from_client_secrets_file('credentials.json',
@@ -109,32 +138,42 @@ flow = InstalledAppFlow.from_client_secrets_file('credentials.json',
 creds = flow.run_console()
 open('token.json', 'w').write(creds.to_json())
 "
-3. Telegram (telegram_creds.json)
-json
+```
+
+### 3️⃣ Telegram — `telegram_creds.json`
+
+```json
 {
   "api_id": 12345678,
   "api_hash": "your_api_hash_here"
 }
-Get these from https://my.telegram.org/apps
+```
 
-4. Environment variables (optional)
-Create a .env file:
+Get credentials from [my.telegram.org](https://my.telegram.org/apps).
 
-env
-SECRET_KEY=change-me-to-something-random
+### 4️⃣ Environment variables — `.env` (optional)
+
+```env
+SECRET_KEY=change-me-to-a-long-random-string
 PROXY_URL=http://user:pass@proxy.example.com:8080
 DRIVE_FOLDER_ID=1abc...xyz
-🏃 Running
-bash
+```
+
+---
+
+## 🏃 Running the App
+
+```bash
 python3 app.py
-Open http://YOUR_SERVER_IP:5000 in a browser.
+```
 
-The app runs on port 5000 using Waitress (production WSGI server).
+Open **http://YOUR_SERVER_IP:5000** in a browser.
 
-Run as a systemd service (recommended)
-Create /etc/systemd/system/projectcompress.service:
+### Run as a systemd service (recommended)
 
-ini
+Create `/etc/systemd/system/projectcompress.service`:
+
+```ini
 [Unit]
 Description=ProjectCompress
 After=network.target bgutil-provider.service
@@ -149,30 +188,33 @@ User=root
 
 [Install]
 WantedBy=multi-user.target
-Enable and start:
+```
 
-bash
+```bash
 sudo systemctl daemon-reload
-sudo systemctl enable projectcompress
-sudo systemctl start projectcompress
+sudo systemctl enable --now projectcompress
 sudo systemctl status projectcompress
-📁 Project Structure
-text
+```
+
+---
+
+## 📁 Project Structure
+
+```
 ProjectCompress/
-├── app.py                    # Flask entry point + SSE + system stats
+├── app.py                    # Flask entry · SSE · system stats
 ├── config.py                 # Paths, secrets, folder IDs
 ├── tasks.py                  # Task state + SSE broadcaster
 ├── install.sh                # Full installation script
 ├── requirements.txt
 ├── cookies.txt               # YouTube cookies (you provide)
 ├── token.json                # Google Drive OAuth (generated)
-├── telegram_creds.json       # Telegram API credentials (you provide)
+├── telegram_creds.json       # Telegram credentials (you provide)
 │
 ├── features/
-│   ├── __init__.py
 │   ├── url_download.py       # Universal downloader (videos + files + torrents)
 │   ├── video_extractor.py    # Scrape video links from webpages
-│   ├── video_clipper.py      # Random clips, summarizer, frame extractor
+│   ├── video_clipper.py      # Random clips · summarizer · frame extractor
 │   ├── face_swap.py          # Face swap via Colab
 │   ├── ocr.py                # Tesseract OCR
 │   ├── subtitle_finder.py    # OpenSubtitles search
@@ -184,150 +226,173 @@ ProjectCompress/
 │   ├── web_crawler.py        # Domain crawler
 │   └── thumbnails.py         # Video thumbnail generator
 │
-├── templates/
+├── templates/                # Jinja2 templates
 │   ├── base.html
 │   ├── index.html
 │   ├── _features_macro.html
 │   └── features/
-│       ├── url.html
-│       ├── telegram.html
-│       ├── drive.html
-│       ├── local.html
-│       ├── video_clipper.html
-│       ├── proxy_fetcher.html
-│       ├── subtitle_finder.html
-│       ├── ocr.html
-│       └── web_crawler.html
 │
 ├── static/
 │   ├── css/style.css
 │   └── js/app.js
 │
 ├── downloads/                # All downloaded/processed files
-│   ├── .thumbnails/          # Cached video thumbnails (auto)
-│   ├── clips_<task_id>/      # Temp folder for clip fragments (auto-cleanup)
-│   └── frames_<task_id>/     # Temp folder for extracted frames (auto-cleanup)
+│   ├── .thumbnails/          # Cached thumbnails (auto)
+│   ├── clips_<task_id>/      # Temp clip fragments (auto-cleanup)
+│   └── frames_<task_id>/     # Temp extracted frames (auto-cleanup)
 │
-├── tasks/                    # Task state JSON files (auto)
+├── tasks/                    # Task state JSON (auto)
 └── proxy_cache/              # Cached proxy results (auto)
-🎯 Usage Examples
-Download a YouTube video at 1080p
-Paste the URL into URL Download
+```
 
-Select 1080p from the quality dropdown
+---
 
-Click Download – live progress, speed, and size shown
+## 🎯 Usage Examples
 
-Final file appears in My Files
+<details>
+<summary><b>Download a YouTube video at 1080p</b></summary>
 
-Download any file (PDF, ZIP, EXE, etc.)
-Paste the direct URL
+1. Paste URL into **URL Download**
+2. Select **1080p** from the quality dropdown
+3. Click **Download** – live progress, speed, and size shown
+4. Final file appears in **My Files**
 
-Click Download – it auto‑detects and uses the correct method
+</details>
 
-Done
+<details>
+<summary><b>Download any file (PDF, ZIP, EXE)</b></summary>
 
-Extract frames from a video
-Open Video Clipper → Extract Frames
+1. Paste the direct file URL
+2. Click **Download** – auto-detects and uses the right method
+3. Done
 
-Choose video, set interval (e.g. 5 seconds), pick JPG/PNG
+</details>
 
-Click Extract – a ZIP file is created when done
+<details>
+<summary><b>Extract frames from a video</b></summary>
 
-Search and download a torrent
-Enter query in Torrent Searcher
+1. Open **Video Clipper** → **Extract Frames**
+2. Choose video, set interval (e.g. 5s), pick JPG/PNG
+3. Click **Extract** – a ZIP is created when done
 
-Click Download on any result → magnet link is queued
+</details>
 
-Send files to Telegram
-Open My Files
+<details>
+<summary><b>Search and download a torrent</b></summary>
 
-Select files → click Send to Telegram
+1. Enter query in **Torrent Searcher**
+2. Click **Download** on any result → magnet link is queued
 
-Enter chat link → files are uploaded
+</details>
 
-🔧 Troubleshooting
-Issue	Fix
-Sign in to confirm you're not a bot	Export fresh cookies.txt from a logged‑in YouTube session
-ffmpeg not found	Run install.sh or sudo apt install ffmpeg
-POT provider not responding	sudo systemctl restart bgutil-provider
-Telegram event loop errors	Already fixed in latest telegram.py (single persistent loop)
-Token expired (Google Drive)	Delete token.json and re‑authorise
-Port 5000 already in use	sudo fuser -k 5000/tcp then restart
-Thumbnails not showing	Ensure ffprobe is in PATH
-🔐 Security Notes
-⚠️ This app has no authentication by default. If exposing to the internet:
+<details>
+<summary><b>Send files to Telegram</b></summary>
 
-Put it behind Nginx with HTTP Basic Auth or Authelia
+1. Open **My Files**
+2. Select files → click **Send to Telegram**
+3. Enter chat link → files uploaded
 
-Use HTTPS (Let's Encrypt)
+</details>
 
-Restrict access via firewall/VPN
+---
 
-Never commit cookies.txt, token.json, or telegram_creds.json
+## 🔧 Troubleshooting
 
-Add a .gitignore for secrets and runtime folders
+| Issue | Fix |
+|-------|-----|
+| `Sign in to confirm you're not a bot` | Export fresh `cookies.txt` from a logged-in YouTube session |
+| `ffmpeg not found` | Run `install.sh` or `sudo apt install ffmpeg` |
+| `POT provider not responding` | `sudo systemctl restart bgutil-provider` |
+| Telegram `Event loop is closed` | Fixed in latest `telegram.py` (single persistent loop) |
+| Google Drive token expired | Delete `token.json` and re-authorize |
+| Port 5000 already in use | `sudo fuser -k 5000/tcp` then restart |
+| Thumbnails not showing | Ensure `ffprobe` is in `PATH` |
+| `Requested format is not available` | Update yt-dlp: `pip install -U yt-dlp` |
 
-Example .gitignore:
+---
 
-gitignore
+## 🔐 Security
+
+⚠️ **This app has no authentication by default.** If exposing to the internet:
+
+1. **Put it behind Nginx with HTTP Basic Auth** or **Authelia**
+2. **Use HTTPS** (Let's Encrypt / Caddy)
+3. **Restrict access** via firewall or VPN
+4. **Never commit** `cookies.txt`, `token.json`, or `telegram_creds.json`
+
+### Recommended `.gitignore`
+
+```gitignore
+# Secrets
 cookies.txt
 token.json
 credentials.json
 telegram_creds.json
 telegram_session*
+.env
+
+# Runtime
 tasks/
 downloads/
 proxy_cache/
+venv/
+
+# Python
 __pycache__/
 *.pyc
-.env
-venv/
-📜 Dependencies
-Python (from requirements.txt):
+*.pyo
+.pytest_cache/
+```
 
-flask, waitress – web framework
+---
 
-requests, beautifulsoup4 – HTTP & HTML parsing
+## 🧰 Tech Stack
 
-yt-dlp, yt-dlp-ejs, curl_cffi – video downloads + Chrome impersonation
+| Layer | Technology |
+|-------|-----------|
+| **Backend** | Flask, Waitress |
+| **Frontend** | Vanilla JS, SSE, CSS |
+| **Media** | FFmpeg, yt-dlp, Deno |
+| **Downloads** | requests, libtorrent |
+| **Storage** | Google Drive API, Telegram (Telethon) |
+| **OCR** | Tesseract, pdf2image |
+| **Monitoring** | psutil |
+| **POT Provider** | bgutil-ytdlp-pot-provider (Node.js) |
 
-google-api-python-client, google-auth-oauthlib – Drive
+---
 
-telethon – Telegram
+## 🤝 Contributing
 
-psutil – system stats
+1. Fork the repo
+2. Create a branch: `git checkout -b feature/my-feature`
+3. Commit: `git commit -m 'Add my feature'`
+4. Push: `git push origin feature/my-feature`
+5. Open a Pull Request
 
-Pillow, pytesseract, pdf2image – OCR
+---
 
-System:
+## 📄 License
 
-ffmpeg, ffprobe – video processing
+This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
 
-node (≥18), deno – POT provider + JS challenges
+---
 
-tesseract-ocr, poppler-utils – OCR
+## 🙏 Credits
 
-🤝 Contributing
-Fork the repo
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — Video downloader
+- [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) — YouTube PO Token provider
+- [Telethon](https://github.com/LonamiWebs/Telethon) — Telegram client
+- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract)
+- [BtbN FFmpeg Builds](https://github.com/BtbN/FFmpeg-Builds)
 
-Create a feature branch
+---
 
-Commit your changes
+<div align="center">
 
-Push and open a Pull Request
+**⭐ Star this repo if you find it useful!**
 
-📄 License
-MIT License – see LICENSE file for details.
+Made with ❤️ for personal media management.
 
-🙏 Credits
-yt-dlp – video downloader
+*Use responsibly and respect copyright laws in your jurisdiction.*
 
-bgutil-ytdlp-pot-provider – YouTube PO Token provider
-
-Telethon – Telegram client
-
-Tesseract OCR
-
-BtbN FFmpeg Builds
-
+</div>
