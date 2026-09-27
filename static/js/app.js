@@ -40,6 +40,9 @@ function formatSpeed(bytesPerSec) {
     let reconnectAttempts = 0;
     const MAX_RECONNECT_ATTEMPTS = 5;
 
+    // ------------------------------------------------------------
+    // SSE connection
+    // ------------------------------------------------------------
     function connectSSE() {
         if (eventSource) {
             eventSource.close();
@@ -72,6 +75,9 @@ function formatSpeed(bytesPerSec) {
         };
     }
 
+    // ------------------------------------------------------------
+    // Render task cards
+    // ------------------------------------------------------------
     function renderTasks(tasks) {
         const container = document.getElementById('tasksContainer');
         if (!container) return;
@@ -113,7 +119,12 @@ function formatSpeed(bytesPerSec) {
                 const tot = task.total_items || 0;
                 const title = task.current_title ? ` "${task.current_title}"` : '';
                 const speedDisplay = speed > 0 ? ` (${formatSpeed(speed * 1024)})` : '';
-                statusText = `📺 Playlist ${cur}/${tot}${title}${speedDisplay}`;
+                const vSize = task.current_video_size || 0;
+                const vDone = task.current_video_downloaded || 0;
+                const vSizeDisplay = vSize > 0
+                    ? ` ${formatBytes(vDone)} / ${formatBytes(vSize)}`
+                    : '';
+                statusText = `📺 Playlist ${cur}/${tot}${title}${vSizeDisplay}${speedDisplay}`;
             } else if (task.status === 'done') {
                 statusText = `✅ Done`;
             } else if (task.status === 'error') {
@@ -184,6 +195,9 @@ function formatSpeed(bytesPerSec) {
         });
     }
 
+    // ------------------------------------------------------------
+    // Cancel task
+    // ------------------------------------------------------------
     async function cancelTask(taskId) {
         if (!taskId) return showToast('No task ID', true);
         try {
@@ -196,7 +210,9 @@ function formatSpeed(bytesPerSec) {
         }
     }
 
-    // ==================== Tab Switching ====================
+    // ------------------------------------------------------------
+    // Tab switching
+    // ------------------------------------------------------------
     function initTabs() {
         const tabBtns = document.querySelectorAll('.tab-btn');
         const panes = document.querySelectorAll('.tab-pane');
@@ -232,13 +248,17 @@ function formatSpeed(bytesPerSec) {
         else if (tabBtns.length) switchTab(tabBtns[0].getAttribute('data-tab'));
     }
 
-    // ==================== Initialization ====================
+    // ------------------------------------------------------------
+    // Initialization
+    // ------------------------------------------------------------
     document.addEventListener('DOMContentLoaded', function() {
         initTabs();
         connectSSE();
     });
 
-    // fetchTasks() – used by feature pages to refresh the task list
+    // ------------------------------------------------------------
+    // fetchTasks – used by feature pages to refresh the task list
+    // ------------------------------------------------------------
     async function fetchTasks() {
         try {
             const resp = await fetch('/get_tasks');
@@ -250,7 +270,9 @@ function formatSpeed(bytesPerSec) {
     }
     window.fetchTasks = fetchTasks;
 
-    // ==================== Persistent Task Polling ====================
+    // ------------------------------------------------------------
+    // Persistent Task Polling (per-feature)
+    // ------------------------------------------------------------
     function startPollingForTask(taskId, statusElementId, resultElementId, progressKey = 'progress') {
         if (!taskId) return;
 
@@ -273,8 +295,8 @@ function formatSpeed(bytesPerSec) {
 
                 if (task.status === 'done') {
                     clearInterval(interval);
-                    statusEl.innerHTML = `✅ Done! <a href="/download/${task.output_file}" target="_blank">Download</a>`;
-                    resultEl.innerHTML = `<div class="empty-state">✅ Ready: <a href="/download/${task.output_file}">${escapeHtml(task.output_file)}</a></div>`;
+                    statusEl.innerHTML = `✅ Done! <a href="/download_file?path=${encodeURIComponent(task.output_file)}" target="_blank">Download</a>`;
+                    resultEl.innerHTML = `<div class="empty-state">✅ Ready: <a href="/download_file?path=${encodeURIComponent(task.output_file)}">${escapeHtml(task.output_file)}</a></div>`;
                     localStorage.removeItem(`task_${taskId}`);
                 } else if (task.status === 'error') {
                     clearInterval(interval);
@@ -306,7 +328,9 @@ function formatSpeed(bytesPerSec) {
     window.startPollingForTask = startPollingForTask;
     window.storeTaskId = storeTaskId;
 
-    // ==================== Resume polling on page load ====================
+    // ------------------------------------------------------------
+    // Resume polling on page load
+    // ------------------------------------------------------------
     document.addEventListener('DOMContentLoaded', function() {
         const features = ['url', 'random_clips', 'summary', 'frame_extract', 'face_swap', 'ocr'];
 
@@ -320,12 +344,12 @@ function formatSpeed(bytesPerSec) {
                     if (task.status && !['done', 'error', 'cancelled'].includes(task.status)) {
                         // Map feature → status/result element IDs
                         const mapping = {
-                            'url':           { status: 'urlStatus',    result: 'urlResult',    progress: 'download_progress' },
-                            'random_clips':  { status: 'randomStatus', result: 'randomResult', progress: 'progress' },
+                            'url':           { status: 'urlStatus',     result: 'urlResult',     progress: 'download_progress' },
+                            'random_clips':  { status: 'randomStatus',  result: 'randomResult',  progress: 'progress' },
                             'summary':       { status: 'summaryStatus', result: 'summaryResult', progress: 'progress' },
-                            'frame_extract': { status: 'frameStatus',  result: 'frameResult',  progress: 'progress' },
-                            'face_swap':     { status: 'swapStatus',   result: 'swapResult',   progress: 'progress' },
-                            'ocr':           { status: 'ocrStatus',    result: 'ocrResult',    progress: 'progress' }
+                            'frame_extract': { status: 'frameStatus',   result: 'frameResult',   progress: 'progress' },
+                            'face_swap':     { status: 'swapStatus',    result: 'swapResult',    progress: 'progress' },
+                            'ocr':           { status: 'ocrStatus',     result: 'ocrResult',     progress: 'progress' }
                         };
                         const map = mapping[feature];
                         if (map) {
