@@ -42,7 +42,6 @@
             <span class="sys-value-net" id="upValue">0 B/s</span>
         </div>
 
-        <!-- Thumbnail pause toggle -->
         <label class="sys-stat sys-toggle" title="Pause thumbnail generation (saves CPU)">
             <input type="checkbox" id="pauseThumbnails" style="accent-color: #ef4444;">
             <i class="fas fa-images" id="thumbIcon"></i>
@@ -70,8 +69,10 @@
 
 <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 
-<!-- ========== System Stats Script ========== -->
+<!-- ========== System Stats + Thumbnail Toggle ========== -->
 <script>
+window.thumbnailsEnabled = true;
+
 (function() {
     const cpuFill  = document.getElementById('cpuFill');
     const ramFill  = document.getElementById('ramFill');
@@ -87,14 +88,12 @@
         if (pct < 80) return 'linear-gradient(90deg, #facc15, #fde68a)';
         return 'linear-gradient(90deg, #ef4444, #fca5a5)';
     }
-
     function formatBytes(bytes) {
         if (bytes === 0) return '0 B';
         const units = ['B', 'KB', 'MB', 'GB', 'TB'];
         const i = Math.floor(Math.log(bytes) / Math.log(1024));
         return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
     }
-
     function formatSpeed(bps) {
         if (bps < 1024) return bps + ' B/s';
         if (bps < 1024 * 1024) return (bps / 1024).toFixed(1) + ' KB/s';
@@ -106,25 +105,20 @@
         try {
             const resp = await fetch('/system_stats');
             const data = await resp.json();
-
             cpuFill.style.width = data.cpu + '%';
             cpuFill.style.background = colorFor(data.cpu);
             cpuValue.textContent = data.cpu + '%';
-
             ramFill.style.width = data.ram + '%';
             ramFill.style.background = colorFor(data.ram);
             ramValue.textContent = data.ram + '%';
             if (data.ram_used && data.ram_total) {
                 ramValue.title = `${formatBytes(data.ram_used)} / ${formatBytes(data.ram_total)}`;
             }
-
             diskFill.style.width = data.disk + '%';
             diskFill.style.background = colorFor(data.disk);
             diskValue.textContent = data.disk + '%';
-
             downValue.textContent = formatSpeed(data.net_down || 0);
             upValue.textContent = formatSpeed(data.net_up || 0);
-
             downValue.style.color = (data.net_down > 1024 * 1024) ? '#86efac'
                                    : (data.net_down > 0) ? '#d1fae5' : '#8a9bc0';
             upValue.style.color = (data.net_up > 1024 * 1024) ? '#fde68a'
@@ -133,7 +127,6 @@
             console.error('system_stats error:', e);
         }
     }
-
     updateStats();
     setInterval(updateStats, 2000);
 })();
@@ -152,17 +145,16 @@
         icon.title = paused ? 'Thumbnails paused' : 'Thumbnails enabled';
     }
 
-    // Load current setting
     fetch('/thumbnail/settings')
         .then(r => r.json())
         .then(data => {
-            // checkbox ticked = paused → enabled == false
             cb.checked = !data.enabled;
             setIcon(!data.enabled);
+            window.thumbnailsEnabled = data.enabled;
+            window.dispatchEvent(new Event('thumbnailsToggled'));
         })
         .catch(err => console.warn('Could not load thumbnail settings:', err));
 
-    // Handle toggle
     cb.addEventListener('change', async function() {
         const enabled = !cb.checked;
         try {
@@ -173,12 +165,13 @@
             });
             const data = await resp.json();
             setIcon(!data.enabled);
+            window.thumbnailsEnabled = data.enabled;
+            window.dispatchEvent(new Event('thumbnailsToggled'));
             if (typeof showToast === 'function') {
                 showToast(data.enabled ? 'Thumbnails enabled' : 'Thumbnails paused');
             }
         } catch (err) {
             console.error('Failed to update thumbnail setting:', err);
-            // Revert on failure
             cb.checked = !cb.checked;
             setIcon(cb.checked);
         }
