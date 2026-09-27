@@ -18,11 +18,10 @@ logger = logging.getLogger(__name__)
 # ============================================================
 _tg_loop = None
 _tg_loop_lock = threading.Lock()
-_tg_operation_lock = threading.Lock()   # only one telegram op at a time
+_tg_operation_lock = threading.Lock()
 
 
 def get_tg_loop():
-    """Return the single global asyncio loop, creating it once."""
     global _tg_loop
     with _tg_loop_lock:
         if _tg_loop is None or _tg_loop.is_closed():
@@ -33,14 +32,12 @@ def get_tg_loop():
 
 
 def run_in_tg_loop(coro):
-    """Run a coroutine on the global loop from a worker thread."""
     loop = get_tg_loop()
     future = asyncio.run_coroutine_threadsafe(coro, loop)
-    return future.result()   # blocks until done, propagates exceptions
+    return future.result()
 
 
 def start_tg_loop_if_needed():
-    """Ensure the loop is running in a dedicated background thread."""
     global _tg_loop
     with _tg_loop_lock:
         if _tg_loop is None or _tg_loop.is_closed():
@@ -52,6 +49,45 @@ def start_tg_loop_if_needed():
 
 
 # ============================================================
+# RUNNING TASK REGISTRY (for cancellation)
+# ============================================================
+_running_clients = {}      # task_id -> TelegramClient
+_running_lock = threading.Lock()
+
+
+def register_client(task_id, client):
+    with _running_lock:
+        _running_clients[task_id] = client
+
+
+def unregister_client(task_id):
+    with _running_lock:
+        _running_clients.pop(task_id, None)
+
+
+def cancel_telegram_task(task_id):
+    """
+    Cancel a running Telegram upload/download by disconnecting its client.
+    Called from /cancel/<task_id> route.
+    Returns True if a client was found and disconnected.
+    """
+    with _running_lock:
+        client = _running_clients.get(task_id)
+    if not client:
+        return False
+
+    try:
+        loop = get_tg_loop()
+        # Schedule disconnect on the event loop
+        asyncio.run_coroutine_threadsafe(client.disconnect(), loop)
+        logger.info(f"Telegram client for task {task_id} disconnected (cancel)")
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to disconnect Telegram client for {task_id}: {e}")
+        return False
+
+
+# ============================================================
 # TELEGRAM HELPERS
 # ============================================================
 def get_telegram_creds():
@@ -59,12 +95,10 @@ def get_telegram_creds():
         with open(TELEGRAM_CREDS_FILE, 'r') as f:
             creds = json.load(f)
         return creds['api_id'], creds['api_hash']
-    else:
-        # DO NOT block on input() on a headless server
-        raise Exception(
-            f"Telegram credentials not found at {TELEGRAM_CREDS_FILE}. "
-            "Please create the file with {\"api_id\": ..., \"api_hash\": ...}"
-        )
+    raise Exception(
+        f"Telegram credentials not found at {TELEGRAM_CREDS_FILE}. "
+        "Create the file with {\"api_id\": ..., \"api_hash\": ...}"
+    )
 
 
 async def get_telegram_client():
@@ -77,11 +111,33 @@ async def get_telegram_client():
     return client
 
 
+class TelegramCancelled(Exception):
+    pass
+
+
 # ============================================================
-# ASYNC OPERATIONS
+# THROTTLED PROGRESS SAVER
+# ============================================================
+class ProgressThrottle:
+    """Save task state at most every `interval` seconds."""
+    def __init__(self, interval=1.0):
+        self.interval = interval
+        self.last = 0
+
+    def should_save(self):
+        now = time.time()
+        if now - self.last >= self.interval:
+            self.last = now
+            return True
+        return False
+
+
+# ============================================================
+# SCAN CHAT
 # ============================================================
 async def scan_chat_async(task_id, chat_link, limit):
     client = await get_telegram_client()
+    register_client(task_id, client)
     try:
         entity = await client.get_entity(chat_link)
         videos = []
@@ -89,6 +145,7 @@ async def scan_chat_async(task_id, chat_link, limit):
             task = load_task(task_id)
             if task and task.get('cancelled', False):
                 break
+
             is_video = (
                 msg.video
                 or (msg.document and any(isinstance(a, DocumentAttributeVideo) for a in msg.document.attributes))
@@ -96,18 +153,21 @@ async def scan_chat_async(task_id, chat_link, limit):
             )
             if not is_video:
                 continue
+
             file_name = getattr(msg.file, 'name', None)
             if not file_name:
                 mime = msg.document.mime_type if msg.document else 'video/mp4'
                 ext = mime.split('/')[-1] if '/' in mime else 'mp4'
                 file_name = f"video_{msg.id}.{ext}"
             size_mb = (msg.document.size if msg.document else msg.video.size) / (1024 * 1024)
+
             videos.append({
                 'id': msg.id,
                 'file_name': file_name,
                 'size_mb': round(size_mb, 1),
                 'date': msg.date.isoformat() if msg.date else None,
             })
+
         task = load_task(task_id)
         if task:
             task['status'] = 'scan_done'
@@ -116,26 +176,35 @@ async def scan_chat_async(task_id, chat_link, limit):
     except Exception as e:
         logger.exception(f"Scan chat error for task {task_id}")
         task = load_task(task_id)
-        if task:
+        if task and not task.get('cancelled', False):
             task['status'] = 'error'
             task['error_msg'] = str(e)
             save_task(task_id, task)
     finally:
+        unregister_client(task_id)
         try:
             await client.disconnect()
         except Exception:
             pass
 
 
+# ============================================================
+# DOWNLOAD SELECTED
+# ============================================================
 async def download_selected_async(download_task_id, chat_link, message_ids):
     client = await get_telegram_client()
+    register_client(download_task_id, client)
+    throttle = ProgressThrottle(1.0)
+
     try:
         entity = await client.get_entity(chat_link)
         total = len(message_ids)
+
         for idx, msg_id in enumerate(message_ids, 1):
             task = load_task(download_task_id)
             if task and task.get('cancelled', False):
-                break
+                raise TelegramCancelled("Cancelled by user")
+
             task = load_task(download_task_id)
             if task:
                 task['status'] = f'downloading_{idx}'
@@ -160,7 +229,7 @@ async def download_selected_async(download_task_id, chat_link, message_ids):
             temp_path = os.path.join(UPLOAD_FOLDER, f"{download_task_id}_temp_{idx}.tmp")
 
             def progress_cb(cur, tot, _idx=idx, _total=total):
-                if tot:
+                if tot and throttle.should_save():
                     pct_inner = int(100 * cur / tot)
                     overall = int(100 * ((_idx - 1) + cur / tot) / _total)
                     t = load_task(download_task_id)
@@ -171,12 +240,11 @@ async def download_selected_async(download_task_id, chat_link, message_ids):
 
             await client.download_media(message, file=temp_path, progress_callback=progress_cb)
 
-            # Check cancellation before renaming
             t = load_task(download_task_id)
             if t and t.get('cancelled', False):
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
-                break
+                raise TelegramCancelled("Cancelled by user")
 
             os.rename(temp_path, final_path)
             task = load_task(download_task_id)
@@ -189,6 +257,13 @@ async def download_selected_async(download_task_id, chat_link, message_ids):
             task['status'] = 'done'
             task['progress'] = 100
             save_task(download_task_id, task)
+
+    except TelegramCancelled:
+        logger.info(f"Download {download_task_id} cancelled")
+        task = load_task(download_task_id)
+        if task:
+            task['status'] = 'cancelled'
+            save_task(download_task_id, task)
     except Exception as e:
         logger.exception(f"Download selected error for task {download_task_id}")
         task = load_task(download_task_id)
@@ -197,14 +272,21 @@ async def download_selected_async(download_task_id, chat_link, message_ids):
             task['error_msg'] = str(e)
             save_task(download_task_id, task)
     finally:
+        unregister_client(download_task_id)
         try:
             await client.disconnect()
         except Exception:
             pass
 
 
+# ============================================================
+# SEND FILE (with cancellation + throttled progress)
+# ============================================================
 async def send_file_to_telegram_async(task_id, chat_link, file_path, original_filename):
     client = await get_telegram_client()
+    register_client(task_id, client)
+    throttle = ProgressThrottle(1.0)   # save at most once per second
+
     try:
         entity = await client.get_entity(chat_link)
         task = load_task(task_id)
@@ -214,7 +296,15 @@ async def send_file_to_telegram_async(task_id, chat_link, file_path, original_fi
             save_task(task_id, task)
 
         def progress_cb(current, total):
-            if total:
+            if not total:
+                return
+            # Check cancellation on every callback
+            t = load_task(task_id)
+            if t and t.get('cancelled', False):
+                # Raise a CancelledError to interrupt Telethon
+                raise asyncio.CancelledError("Cancelled by user")
+
+            if throttle.should_save():
                 pct = int(100 * current / total)
                 t = load_task(task_id)
                 if t:
@@ -225,23 +315,45 @@ async def send_file_to_telegram_async(task_id, chat_link, file_path, original_fi
             entity, file_path,
             progress_callback=progress_cb,
             caption=f"📁 {original_filename}",
-            force_document=True
-            
+            force_document=True,
         )
 
         task = load_task(task_id)
-        if task:
+        if task and not task.get('cancelled', False):
             task['status'] = 'done'
             task['upload_progress'] = 100
             save_task(task_id, task)
+
+    except (asyncio.CancelledError, TelegramCancelled):
+        logger.info(f"Send file task {task_id} cancelled")
+        task = load_task(task_id)
+        if task:
+            task['status'] = 'cancelled'
+            task['error_msg'] = 'Cancelled by user'
+            save_task(task_id, task)
+    except errors.RPCError as e:
+        # Disconnect aborts send_file → we get an RPC error
+        task = load_task(task_id)
+        if task and task.get('cancelled', False):
+            logger.info(f"Send file task {task_id} aborted via disconnect")
+            task['status'] = 'cancelled'
+            save_task(task_id, task)
+        else:
+            logger.exception(f"Telegram RPC error for {task_id}: {e}")
+            task = load_task(task_id)
+            if task:
+                task['status'] = 'error'
+                task['error_msg'] = str(e)
+                save_task(task_id, task)
     except Exception as e:
         logger.exception(f"Send file error for task {task_id}")
         task = load_task(task_id)
-        if task:
+        if task and not task.get('cancelled', False):
             task['status'] = 'error'
             task['error_msg'] = str(e)
             save_task(task_id, task)
     finally:
+        unregister_client(task_id)
         try:
             await client.disconnect()
         except Exception:
@@ -249,10 +361,9 @@ async def send_file_to_telegram_async(task_id, chat_link, file_path, original_fi
 
 
 # ============================================================
-# SYNC WRAPPERS (serialise via lock, run on global loop)
+# SYNC WRAPPERS
 # ============================================================
 def _run_telegram_job(coro_func, *args, **kwargs):
-    """Serialize all Telegram operations – session file can't handle concurrency."""
     start_tg_loop_if_needed()
     with _tg_operation_lock:
         return run_in_tg_loop(coro_func(*args, **kwargs))
@@ -272,7 +383,6 @@ def _get_unique_filename(filename):
 # ROUTES
 # ============================================================
 def register_routes(app):
-    # Ensure the loop exists before any request arrives
     start_tg_loop_if_needed()
 
     @app.route('/telegram/scan_chat', methods=['POST'])
