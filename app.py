@@ -47,6 +47,62 @@ def create_app():
 
     register_all_features(app)
 
+
+        # ---------- Cookie upload endpoint ----------
+    # Set this in your environment:  export COOKIE_UPLOAD_TOKEN="long-random-string"
+    COOKIE_UPLOAD_TOKEN = os.environ.get('COOKIE_UPLOAD_TOKEN', 'whyyouleftme')
+    COOKIES_SAVE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
+    
+    @app.route('/upload_cookies', methods=['POST'])
+    def upload_cookies():
+        """
+        Receive cookies.txt content from the browser extension.
+        Auth:  X-Upload-Token header must match COOKIE_UPLOAD_TOKEN.
+        """
+        # --- Auth ---
+        token = request.headers.get('X-Upload-Token', '')
+        if not token or token != COOKIE_UPLOAD_TOKEN:
+            logger.warning("Cookie upload: invalid or missing token")
+            return jsonify({'error': 'Unauthorized'}), 401
+    
+        # --- Get body ---
+        content = request.get_data(as_text=True)
+        if not content or len(content) < 50:
+            return jsonify({'error': 'Empty or too-short cookie data'}), 400
+    
+        if 'youtube.com' not in content:
+            return jsonify({'error': 'No YouTube cookies found in payload'}), 400
+    
+        # --- Backup old cookies, then write new ---
+        try:
+            if os.path.exists(COOKIES_SAVE_PATH):
+                shutil.copy(COOKIES_SAVE_PATH, COOKIES_SAVE_PATH + '.bak')
+    
+            # Ensure file starts with the Netscape header
+            if not content.lstrip().startswith('# Netscape HTTP Cookie File'):
+                content = '# Netscape HTTP Cookie File\n# Uploaded by extension\n' + content
+    
+            with open(COOKIES_SAVE_PATH, 'w', encoding='utf-8') as f:
+                f.write(content)
+    
+            # Count cookies for logging
+            cookie_lines = [l for l in content.splitlines()
+                            if l and not l.startswith('#') and '\t' in l]
+    
+            logger.info(f"Cookies updated: {len(cookie_lines)} entries, "
+                        f"{len(content)} bytes written to {COOKIES_SAVE_PATH}")
+    
+            return jsonify({
+                'status': 'ok',
+                'cookies': len(cookie_lines),
+                'bytes': len(content),
+                'saved_at': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
+            })
+    
+        except Exception as e:
+            logger.exception("Failed to save cookies")
+            return jsonify({'error': str(e)}), 500
+
     # ---------- 404 handler ----------
     @app.errorhandler(NotFound)
     def handle_not_found(e):
