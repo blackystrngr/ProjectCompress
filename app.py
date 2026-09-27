@@ -19,7 +19,8 @@ from tasks import (
     save_task,
     get_active_tasks,
     add_subscriber,
-    remove_subscriber
+    remove_subscriber,
+    cleanup_old_tasks
 )
 from features import register_all_features
 
@@ -32,18 +33,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---- Network speed tracking (used by /system_stats) ----
 _last_net_sample = None
 _net_sample_lock = threading.Lock()
 
-# ---- Cookie upload config ----
 COOKIE_UPLOAD_TOKEN = os.environ.get('COOKIE_UPLOAD_TOKEN', 'whyyouleftme')
 COOKIES_SAVE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
 
 
-# ------------------------------------------------------------
-# Flask app factory
-# ------------------------------------------------------------
 def create_app():
     app = Flask(__name__)
     app.config['SECRET_KEY'] = SECRET_KEY
@@ -52,7 +48,6 @@ def create_app():
 
     register_all_features(app)
 
-    # ---------- 404 handler ----------
     @app.errorhandler(NotFound)
     def handle_not_found(e):
         if request.path.startswith(('/api', '/get_tasks', '/progress', '/system_stats',
@@ -60,13 +55,11 @@ def create_app():
             return jsonify({'error': 'Endpoint not found'}), 404
         return render_template('index.html'), 404
 
-    # ---------- Global error handler ----------
     @app.errorhandler(Exception)
     def handle_exception(e):
         logger.exception("Unhandled exception")
         return jsonify({'error': 'Internal server error'}), 500
 
-    # ---------- Task endpoints ----------
     @app.route('/get_tasks', methods=['GET'])
     def get_tasks():
         try:
@@ -75,7 +68,6 @@ def create_app():
             logger.error(f"Failed to list tasks: {e}")
             return jsonify([])
 
-    # ---------- EVENT-DRIVEN SSE ENDPOINT ----------
     @app.route('/tasks/stream')
     def tasks_stream():
         q = queue.Queue(maxsize=1)
@@ -99,10 +91,8 @@ def create_app():
 
         return Response(stream_with_context(event_stream()), mimetype="text/event-stream")
 
-    # ---------- System stats (CPU / RAM / Disk / Network) ----------
     @app.route('/system_stats')
     def system_stats():
-        """Return live CPU, RAM, disk usage and network speed."""
         global _last_net_sample
         try:
             cpu = psutil.cpu_percent(interval=None)
@@ -142,7 +132,6 @@ def create_app():
                 'ram_used': 0, 'ram_total': 1,
             })
 
-    # ---------- Progress endpoint ----------
     @app.route('/progress/<task_id>', methods=['GET'])
     def progress(task_id):
         try:
@@ -160,10 +149,8 @@ def create_app():
             logger.error(f"Failed to get progress for {task_id}: {e}")
             return jsonify({'error': str(e)}), 500
 
-    # ---------- Cancel endpoint (scoped – only this task) ----------
     @app.route('/cancel/<task_id>', methods=['POST'])
     def cancel(task_id):
-        """Cancel ONLY this task's processes (scoped, not global)."""
         try:
             task = load_task(task_id)
             if not task:
@@ -175,7 +162,6 @@ def create_app():
 
             killed = []
 
-            # 1. Kill yt-dlp subprocess belonging to this task (if any)
             try:
                 from features.url_download import kill_process as kill_dl_process
                 if kill_dl_process(task_id):
@@ -183,7 +169,6 @@ def create_app():
             except Exception as e:
                 logger.debug(f"kill_dl_process failed: {e}")
 
-            # 2. Cancel Telegram operation for this task (if any)
             try:
                 from features.telegram import cancel_telegram_task
                 if cancel_telegram_task(task_id):
@@ -197,13 +182,8 @@ def create_app():
             logger.error(f"Failed to cancel task {task_id}: {e}")
             return jsonify({'error': str(e)}), 500
 
-    # ---------- Cookie upload endpoint ----------
     @app.route('/upload_cookies', methods=['POST'])
     def upload_cookies():
-        """
-        Receive cookies.txt content from the browser extension.
-        Auth: X-Upload-Token header must match COOKIE_UPLOAD_TOKEN.
-        """
         token = request.headers.get('X-Upload-Token', '')
         if not token or token != COOKIE_UPLOAD_TOKEN:
             logger.warning("Cookie upload: invalid or missing token")
@@ -230,7 +210,7 @@ def create_app():
                             if l and not l.startswith('#') and '\t' in l]
 
             logger.info(f"Cookies updated: {len(cookie_lines)} entries, "
-                        f"{len(content)} bytes written to {COOKIES_SAVE_PATH}")
+                        f"{len(content)} bytes written")
 
             return jsonify({
                 'status': 'ok',
@@ -242,7 +222,6 @@ def create_app():
             logger.exception("Failed to save cookies")
             return jsonify({'error': str(e)}), 500
 
-    # ---------- Index / favicon ----------
     @app.route('/')
     def index():
         return render_template('index.html')
@@ -254,17 +233,12 @@ def create_app():
     return app
 
 
-# ------------------------------------------------------------
-# Main entry
-# ------------------------------------------------------------
 if __name__ == '__main__':
-    # Clean up stale task files
-    for tid in get_all_task_ids():
-        if not load_task(tid):
-            try:
-                os.remove(os.path.join(TASKS_DIR, f"{tid}.json"))
-            except Exception:
-                pass
+    # Cleanup old terminal task files (older than 1 day)
+    try:
+        cleanup_old_tasks(max_age_seconds=86400)
+    except Exception as e:
+        logger.warning(f"cleanup_old_tasks failed: {e}")
 
     app = create_app()
     logger.info("Starting server on 0.0.0.0:5000")
