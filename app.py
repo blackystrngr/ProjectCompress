@@ -6,9 +6,9 @@ import time
 import json
 import logging
 import psutil
-import shutil
 import threading
 import queue
+import shutil
 from flask import Flask, render_template, jsonify, request, Response, stream_with_context
 from waitress import serve
 from werkzeug.exceptions import NotFound
@@ -32,9 +32,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---- Network speed tracking ----
-_last_net_sample = None      # (timestamp, bytes_sent, bytes_recv)
+# ---- Network speed tracking (used by /system_stats) ----
+_last_net_sample = None
 _net_sample_lock = threading.Lock()
+
+# ---- Cookie upload config ----
+COOKIE_UPLOAD_TOKEN = os.environ.get('COOKIE_UPLOAD_TOKEN', 'change-me-in-production')
+COOKIES_SAVE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
 
 
 # ------------------------------------------------------------
@@ -48,66 +52,11 @@ def create_app():
 
     register_all_features(app)
 
-
-        # ---------- Cookie upload endpoint ----------
-    # Set this in your environment:  export COOKIE_UPLOAD_TOKEN="long-random-string"
-    COOKIE_UPLOAD_TOKEN = os.environ.get('COOKIE_UPLOAD_TOKEN', 'whyyouleftme')
-    COOKIES_SAVE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
-    
-    @app.route('/upload_cookies', methods=['POST'])
-    def upload_cookies():
-        """
-        Receive cookies.txt content from the browser extension.
-        Auth:  X-Upload-Token header must match COOKIE_UPLOAD_TOKEN.
-        """
-        # --- Auth ---
-        token = request.headers.get('X-Upload-Token', '')
-        if not token or token != COOKIE_UPLOAD_TOKEN:
-            logger.warning("Cookie upload: invalid or missing token")
-            return jsonify({'error': 'Unauthorized'}), 401
-    
-        # --- Get body ---
-        content = request.get_data(as_text=True)
-        if not content or len(content) < 50:
-            return jsonify({'error': 'Empty or too-short cookie data'}), 400
-    
-        if 'youtube.com' not in content:
-            return jsonify({'error': 'No YouTube cookies found in payload'}), 400
-    
-        # --- Backup old cookies, then write new ---
-        try:
-            if os.path.exists(COOKIES_SAVE_PATH):
-                shutil.copy(COOKIES_SAVE_PATH, COOKIES_SAVE_PATH + '.bak')
-    
-            # Ensure file starts with the Netscape header
-            if not content.lstrip().startswith('# Netscape HTTP Cookie File'):
-                content = '# Netscape HTTP Cookie File\n# Uploaded by extension\n' + content
-    
-            with open(COOKIES_SAVE_PATH, 'w', encoding='utf-8') as f:
-                f.write(content)
-    
-            # Count cookies for logging
-            cookie_lines = [l for l in content.splitlines()
-                            if l and not l.startswith('#') and '\t' in l]
-    
-            logger.info(f"Cookies updated: {len(cookie_lines)} entries, "
-                        f"{len(content)} bytes written to {COOKIES_SAVE_PATH}")
-    
-            return jsonify({
-                'status': 'ok',
-                'cookies': len(cookie_lines),
-                'bytes': len(content),
-                'saved_at': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
-            })
-    
-        except Exception as e:
-            logger.exception("Failed to save cookies")
-            return jsonify({'error': str(e)}), 500
-
     # ---------- 404 handler ----------
     @app.errorhandler(NotFound)
     def handle_not_found(e):
-        if request.path.startswith(('/api', '/get_tasks', '/progress', '/system_stats')):
+        if request.path.startswith(('/api', '/get_tasks', '/progress', '/system_stats',
+                                     '/upload_cookies')):
             return jsonify({'error': 'Endpoint not found'}), 404
         return render_template('index.html'), 404
 
@@ -193,7 +142,7 @@ def create_app():
                 'ram_used': 0, 'ram_total': 1,
             })
 
-    # ---------- Progress and cancel endpoints ----------
+    # ---------- Progress endpoint ----------
     @app.route('/progress/<task_id>', methods=['GET'])
     def progress(task_id):
         try:
@@ -211,50 +160,89 @@ def create_app():
             logger.error(f"Failed to get progress for {task_id}: {e}")
             return jsonify({'error': str(e)}), 500
 
+    # ---------- Cancel endpoint (scoped – only this task) ----------
     @app.route('/cancel/<task_id>', methods=['POST'])
     def cancel(task_id):
+        """Cancel ONLY this task's processes (scoped, not global)."""
         try:
             task = load_task(task_id)
             if not task:
                 return jsonify({'error': 'Task not found'}), 404
+
             task['cancelled'] = True
             task['status'] = 'cancelled'
             save_task(task_id, task)
 
+            killed = []
+
+            # 1. Kill yt-dlp subprocess belonging to this task (if any)
             try:
-                from features.url_download import kill_process
-                kill_process(task_id)
+                from features.url_download import kill_process as kill_dl_process
+                if kill_dl_process(task_id):
+                    killed.append('yt-dlp')
             except Exception as e:
-                logger.warning(f"kill_process failed: {e}")
+                logger.debug(f"kill_dl_process failed: {e}")
 
-            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-                try:
-                    if 'ffmpeg' in (proc.info['name'] or '') or \
-                       'ffmpeg' in ' '.join(proc.info['cmdline'] or []):
-                        proc.terminate()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
+            # 2. Cancel Telegram operation for this task (if any)
+            try:
+                from features.telegram import cancel_telegram_task
+                if cancel_telegram_task(task_id):
+                    killed.append('telegram')
+            except Exception as e:
+                logger.debug(f"cancel_telegram_task failed: {e}")
 
-            logger.info(f"Task {task_id} cancelled")
-            return jsonify({'status': 'cancelling'})
+            logger.info(f"Task {task_id} cancelled – killed: {killed}")
+            return jsonify({'status': 'cancelling', 'killed': killed})
         except Exception as e:
             logger.error(f"Failed to cancel task {task_id}: {e}")
             return jsonify({'error': str(e)}), 500
 
-    @app.route('/kill_all_ffmpeg', methods=['POST'])
-    def kill_all_ffmpeg():
-        killed = []
-        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-            try:
-                if 'ffmpeg' in (proc.info['name'] or '') or \
-                   'ffmpeg' in ' '.join(proc.info['cmdline'] or []):
-                    proc.terminate()
-                    killed.append(proc.info['pid'])
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-        logger.info(f"Killed ffmpeg: {killed}")
-        return jsonify({'status': 'killed', 'pids': killed})
+    # ---------- Cookie upload endpoint ----------
+    @app.route('/upload_cookies', methods=['POST'])
+    def upload_cookies():
+        """
+        Receive cookies.txt content from the browser extension.
+        Auth: X-Upload-Token header must match COOKIE_UPLOAD_TOKEN.
+        """
+        token = request.headers.get('X-Upload-Token', '')
+        if not token or token != COOKIE_UPLOAD_TOKEN:
+            logger.warning("Cookie upload: invalid or missing token")
+            return jsonify({'error': 'Unauthorized'}), 401
 
+        content = request.get_data(as_text=True)
+        if not content or len(content) < 50:
+            return jsonify({'error': 'Empty or too-short cookie data'}), 400
+
+        if 'youtube.com' not in content:
+            return jsonify({'error': 'No YouTube cookies found in payload'}), 400
+
+        try:
+            if os.path.exists(COOKIES_SAVE_PATH):
+                shutil.copy(COOKIES_SAVE_PATH, COOKIES_SAVE_PATH + '.bak')
+
+            if not content.lstrip().startswith('# Netscape HTTP Cookie File'):
+                content = '# Netscape HTTP Cookie File\n# Uploaded by extension\n' + content
+
+            with open(COOKIES_SAVE_PATH, 'w', encoding='utf-8') as f:
+                f.write(content)
+
+            cookie_lines = [l for l in content.splitlines()
+                            if l and not l.startswith('#') and '\t' in l]
+
+            logger.info(f"Cookies updated: {len(cookie_lines)} entries, "
+                        f"{len(content)} bytes written to {COOKIES_SAVE_PATH}")
+
+            return jsonify({
+                'status': 'ok',
+                'cookies': len(cookie_lines),
+                'bytes': len(content),
+                'saved_at': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
+            })
+        except Exception as e:
+            logger.exception("Failed to save cookies")
+            return jsonify({'error': str(e)}), 500
+
+    # ---------- Index / favicon ----------
     @app.route('/')
     def index():
         return render_template('index.html')
@@ -270,6 +258,7 @@ def create_app():
 # Main entry
 # ------------------------------------------------------------
 if __name__ == '__main__':
+    # Clean up stale task files
     for tid in get_all_task_ids():
         if not load_task(tid):
             try:
