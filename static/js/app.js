@@ -76,6 +76,20 @@ function formatSpeed(bytesPerSec) {
     }
 
     // ------------------------------------------------------------
+    // Pause SSE when tab is hidden (saves bandwidth + CPU)
+    // ------------------------------------------------------------
+    document.addEventListener('visibilitychange', function() {
+        if (document.hidden) {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+        } else {
+            connectSSE();
+        }
+    });
+
+    // ------------------------------------------------------------
     // Render task cards
     // ------------------------------------------------------------
     function renderTasks(tasks) {
@@ -281,8 +295,21 @@ function formatSpeed(bytesPerSec) {
         if (!statusEl || !resultEl) return;
 
         let interval = setInterval(async () => {
+            // === PAUSE when tab is hidden ===
+            if (document.hidden) return;
+
             try {
                 const resp = await fetch(`/progress/${taskId}`);
+
+                // === HANDLE 404: task no longer exists on server ===
+                if (resp.status === 404) {
+                    clearInterval(interval);
+                    localStorage.removeItem(`task_${taskId}`);
+                    statusEl.innerHTML = '';
+                    resultEl.innerHTML = '';
+                    return;
+                }
+
                 const task = await resp.json();
 
                 if (task.error) {
@@ -315,7 +342,7 @@ function formatSpeed(bytesPerSec) {
             } catch (err) {
                 console.error(err);
             }
-        }, 2000);
+        }, 5000);   // <-- 5 seconds (was 2)
 
         return interval;
     }
@@ -339,8 +366,16 @@ function formatSpeed(bytesPerSec) {
             if (!taskId) return;
 
             fetch(`/progress/${taskId}`)
-                .then(resp => resp.json())
+                .then(resp => {
+                    // === HANDLE 404 ===
+                    if (resp.status === 404) {
+                        localStorage.removeItem(`${feature}_task_id`);
+                        return null;
+                    }
+                    return resp.json();
+                })
                 .then(task => {
+                    if (!task) return;
                     if (task.status && !['done', 'error', 'cancelled'].includes(task.status)) {
                         // Map feature → status/result element IDs
                         const mapping = {
