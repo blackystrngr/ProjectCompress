@@ -481,6 +481,34 @@ button.danger:hover {
     transition: color 0.3s ease;
 }
 
+/* ===== Thumbnail pause toggle ===== */
+.sys-stat.sys-toggle {
+    flex: 0 0 auto;
+    min-width: auto;
+    cursor: pointer;
+    padding: 2px 8px;
+    border-radius: 1rem;
+    transition: background 0.15s ease;
+    user-select: none;
+}
+
+.sys-stat.sys-toggle:hover {
+    background: rgba(95, 143, 224, 0.15);
+}
+
+.sys-stat.sys-toggle input[type="checkbox"] {
+    cursor: pointer;
+    width: 14px;
+    height: 14px;
+    margin: 0;
+}
+
+.sys-stat.sys-toggle i {
+    color: #5f8fe0;
+    font-size: 0.85rem;
+    transition: color 0.15s ease;
+}
+
 /* On mobile, stack network items too */
 @media (max-width: 700px) {
     .sys-stat.sys-net {
