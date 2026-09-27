@@ -37,7 +37,7 @@ _last_net_sample = None
 _net_sample_lock = threading.Lock()
 
 # ---- Cookie upload config ----
-COOKIE_UPLOAD_TOKEN = os.environ.get('COOKIE_UPLOAD_TOKEN', 'change-me-in-production')
+COOKIE_UPLOAD_TOKEN = os.environ.get('COOKIE_UPLOAD_TOKEN', 'whyyouleftme')
 COOKIES_SAVE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
 
 
