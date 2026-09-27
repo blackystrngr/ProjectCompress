@@ -1,9 +1,11 @@
 import os
 import re
+import json
 import shutil
 import subprocess
 import hashlib
 import logging
+import threading
 from flask import request, jsonify, send_file, abort
 from config import UPLOAD_FOLDER
 
@@ -14,7 +16,54 @@ os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 
 VIDEO_EXTS = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.m4v', '.ts', '.mpg', '.mpeg')
 
+# ============================================================
+# Settings (persisted to project root)
+# ============================================================
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SETTINGS_FILE = os.path.join(PROJECT_ROOT, 'settings.json')
+_settings_lock = threading.Lock()
 
+
+def _load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, 'r') as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception as e:
+            logger.warning(f"Failed to load settings: {e}")
+    return {'thumbnails_enabled': True}
+
+
+def _save_settings(settings):
+    with _settings_lock:
+        try:
+            with open(SETTINGS_FILE, 'w') as f:
+                json.dump(settings, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save settings: {e}")
+
+
+def is_thumbnails_enabled():
+    return bool(_load_settings().get('thumbnails_enabled', True))
+
+
+def set_thumbnails_enabled(enabled):
+    settings = _load_settings()
+    settings['thumbnails_enabled'] = bool(enabled)
+    _save_settings(settings)
+
+
+# ============================================================
+# Concurrency guard (max 2 ffmpeg at once)
+# ============================================================
+_thumb_semaphore = threading.Semaphore(2)
+
+
+# ============================================================
+# Helpers
+# ============================================================
 def _get_ffmpeg():
     p = shutil.which('ffmpeg')
     if p:
@@ -53,24 +102,18 @@ def _duration(video_path):
 
 
 def _cache_path(video_path):
-    """Deterministic cache filename based on the video's absolute path."""
     rel = os.path.relpath(video_path, UPLOAD_FOLDER)
     key = hashlib.sha1(rel.encode('utf-8')).hexdigest()
     return os.path.join(THUMB_CACHE_DIR, f"{key}.jpg")
 
 
 def generate_thumbnail(video_path, force=False):
-    """
-    Generate (or return cached) thumbnail from a video frame at `duration - 30s`.
-    If video is shorter than 30s, uses the last frame.
-    Returns the thumbnail path or None.
-    """
+    """Generate thumbnail at duration-30s. Respects the semaphore."""
     if not os.path.exists(video_path):
         return None
 
     cache = _cache_path(video_path)
 
-    # Return cached if newer than the video
     if not force and os.path.exists(cache):
         try:
             if os.path.getmtime(cache) >= os.path.getmtime(video_path):
@@ -85,40 +128,37 @@ def generate_thumbnail(video_path, force=False):
 
     dur = _duration(video_path)
     if dur is None or dur <= 0:
-        # Fallback: try 1 second in
         seek = 1
     else:
-        # Take frame 30s before the end
         seek = max(0.0, dur - 30.0)
-        # If video is shorter than 30s, use the last second
         if dur < 30:
             seek = max(0.0, dur - 1.0)
 
-    # Try multiple fallbacks in case seeking fails (damaged timestamps etc.)
     seeks_to_try = [seek, 1, 0]
-    for s in seeks_to_try:
-        try:
-            cmd = [
-                ffmpeg,
-                '-ss', f"{s:.2f}",
-                '-i', video_path,
-                '-frames:v', '1',
-                '-vf', 'scale=320:-1',
-                '-q:v', '4',
-                '-y', cache
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            if result.returncode == 0 and os.path.exists(cache) and os.path.getsize(cache) > 0:
-                logger.info(f"Thumbnail generated for {os.path.basename(video_path)} at {s:.1f}s")
-                return cache
-        except subprocess.TimeoutExpired:
-            logger.warning(f"Thumbnail timeout for {video_path} at {s}s")
-            continue
-        except Exception as e:
-            logger.warning(f"Thumbnail generation failed at {s}s: {e}")
-            continue
 
-    # Give up
+    with _thumb_semaphore:
+        for s in seeks_to_try:
+            try:
+                cmd = [
+                    ffmpeg,
+                    '-ss', f"{s:.2f}",
+                    '-i', video_path,
+                    '-frames:v', '1',
+                    '-vf', 'scale=320:-1',
+                    '-q:v', '4',
+                    '-y', cache
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                if result.returncode == 0 and os.path.exists(cache) and os.path.getsize(cache) > 0:
+                    logger.info(f"Thumbnail generated for {os.path.basename(video_path)} at {s:.1f}s")
+                    return cache
+            except subprocess.TimeoutExpired:
+                logger.warning(f"Thumbnail timeout for {video_path} at {s}s")
+                continue
+            except Exception as e:
+                logger.warning(f"Thumbnail generation failed at {s}s: {e}")
+                continue
+
     logger.error(f"Could not generate thumbnail for {video_path}")
     return None
 
@@ -132,13 +172,17 @@ def delete_thumbnail(video_path):
             pass
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Routes
-# ------------------------------------------------------------
+# ============================================================
 def register_routes(app):
     @app.route('/thumbnail')
     def thumbnail():
         """Return thumbnail for a given file path (relative to UPLOAD_FOLDER)."""
+        # ---- Check if thumbnails are enabled ----
+        if not is_thumbnails_enabled():
+            abort(404)
+
         rel_path = request.args.get('path', '')
         if not rel_path or '..' in rel_path or rel_path.startswith('/'):
             abort(400)
@@ -152,13 +196,14 @@ def register_routes(app):
 
         cache = generate_thumbnail(full_path)
         if not cache or not os.path.exists(cache):
-            # Return a 1x1 transparent placeholder if no thumbnail
             abort(404)
 
         return send_file(cache, mimetype='image/jpeg', max_age=3600)
 
     @app.route('/thumbnail/regenerate', methods=['POST'])
     def thumbnail_regenerate():
+        if not is_thumbnails_enabled():
+            return jsonify({'error': 'Thumbnails are paused'}), 403
         rel_path = request.form.get('path', '')
         if not rel_path or '..' in rel_path or rel_path.startswith('/'):
             return jsonify({'error': 'Invalid path'}), 400
@@ -182,3 +227,14 @@ def register_routes(app):
                 except Exception:
                     pass
         return jsonify({'cleared': count})
+
+    @app.route('/thumbnail/settings', methods=['GET'])
+    def thumbnail_settings_get():
+        return jsonify({'enabled': is_thumbnails_enabled()})
+
+    @app.route('/thumbnail/settings', methods=['POST'])
+    def thumbnail_settings_post():
+        enabled = request.form.get('enabled', 'true').lower() in ('true', '1', 'yes', 'on')
+        set_thumbnails_enabled(enabled)
+        logger.info(f"Thumbnails {'enabled' if enabled else 'paused'}")
+        return jsonify({'enabled': enabled})
