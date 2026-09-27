@@ -9,13 +9,17 @@
             <button id="deleteSelectedBtn" class="danger"><i class="fas fa-trash-alt"></i> Delete</button>
             <button id="telegramSelectedBtn"><i class="fab fa-telegram"></i> Send to Telegram</button>
             <button id="colabSelectedBtn"><i class="fas fa-cloud-upload-alt"></i> Send to Colab</button>
-            <button id="deselectAllBtn">Deselect</button>
+            <button id="deselectAllBtn2">Deselect</button>
         </div>
     </div>
     <div id="breadcrumbs" style="margin-bottom: 1rem; font-size: 0.8rem; word-break: break-all;">
         <span>📁 root</span>
     </div>
     <div id="fileList" class="file-grid empty-state">Loading...</div>
+    <div id="loadMoreContainer" style="display:none; text-align:center; margin-top:1rem;">
+        <button id="loadMoreBtn" class="primary"><i class="fas fa-plus"></i> Load More</button>
+        <div id="loadMoreInfo" style="font-size:0.75rem; color:#8a9bc0; margin-top:0.3rem;"></div>
+    </div>
 </div>
 
 <!-- Modal for video preview -->
@@ -30,23 +34,72 @@
 </div>
 
 <script>
-// Helper functions (in case app.js not loaded)
-function escapeHtml(str) { if (!str) return ''; return str.replace(/[&<>]/g, function(m) { if (m === '&') return '&amp;'; if (m === '<') return '&lt;'; if (m === '>') return '&gt;'; return m; }); }
-function showToast(msg, isErr) { const toast = document.createElement('div'); toast.className = 'toast'; toast.innerHTML = `<i class="fas ${isErr ? 'fa-exclamation-triangle' : 'fa-check-circle'}"></i> ${msg}`; document.body.appendChild(toast); setTimeout(() => toast.remove(), 3000); }
+// Helper functions
+function escapeHtml(str) {
+    if (!str) return '';
+    return str.replace(/[&<>"]/g, function(m) {
+        if (m === '&') return '&amp;';
+        if (m === '<') return '&lt;';
+        if (m === '>') return '&gt;';
+        if (m === '"') return '&quot;';
+        return m;
+    });
+}
+function showToast(msg, isErr) {
+    if (typeof window.showToast === 'function') window.showToast(msg, isErr);
+    else alert((isErr ? 'Error: ' : '') + msg);
+}
 
-let currentPath = "", currentItems = [], selectedPaths = new Set();
-const previewModal = document.getElementById('previewModal'), previewVideo = document.getElementById('previewVideo'), previewInfo = document.getElementById('previewInfo'), closeModal = document.getElementById('closeModalBtn');
+let currentPath = "";
+let currentItems = [];
+let selectedPaths = new Set();
+let currentPage = 0;
+let hasMore = false;
+let totalItems = 0;
 
-async function loadDirectory(path = "") {
+const previewModal = document.getElementById('previewModal');
+const previewVideo = document.getElementById('previewVideo');
+const previewInfo = document.getElementById('previewInfo');
+const closeModal = document.getElementById('closeModalBtn');
+const loadMoreContainer = document.getElementById('loadMoreContainer');
+const loadMoreBtn = document.getElementById('loadMoreBtn');
+const loadMoreInfo = document.getElementById('loadMoreInfo');
+
+async function loadDirectory(path = "", reset = true) {
+    if (reset) {
+        currentPage = 0;
+        currentItems = [];
+        currentPath = path;
+    }
     try {
-        const resp = await fetch(`/browse?path=${encodeURIComponent(path)}`);
+        const url = `/browse?path=${encodeURIComponent(path)}&page=${currentPage}`;
+        const resp = await fetch(url);
         const data = await resp.json();
         if (data.error) throw new Error(data.error);
+
         currentPath = data.current_path;
-        currentItems = data.items;
+        if (reset) {
+            currentItems = data.items;
+        } else {
+            currentItems = currentItems.concat(data.items);
+        }
+        hasMore = data.has_more;
+        totalItems = data.total;
+
         renderBreadcrumbs(data.breadcrumbs);
         renderFileList(currentItems);
-    } catch (err) { document.getElementById('fileList').innerHTML = `<div class="empty-state">Error: ${err.message}</div>`; }
+
+        // Show / hide load more
+        if (hasMore) {
+            loadMoreContainer.style.display = 'block';
+            loadMoreInfo.textContent = `Showing ${currentItems.length} of ${totalItems}`;
+        } else {
+            loadMoreContainer.style.display = 'none';
+            loadMoreInfo.textContent = '';
+        }
+    } catch (err) {
+        document.getElementById('fileList').innerHTML = `<div class="empty-state">Error: ${escapeHtml(err.message)}</div>`;
+    }
 }
 
 function renderBreadcrumbs(bc) {
@@ -80,13 +133,19 @@ function renderFileList(items) {
 
         let thumbHtml = '';
         if (isVideo) {
-            const thumbUrl = `/thumbnail?path=${encodeURIComponent(item.path)}`;
-            thumbHtml = `<div class="file-thumb">
-                            <img src="${thumbUrl}" alt=""
-                                 loading="lazy"
-                                 onerror="this.style.display='none'; this.parentElement.classList.add('thumb-failed');"
-                                 onclick="openPreview('${escapeHtml(item.path)}', '${escapeHtml(item.name)}')">
-                         </div>`;
+            // If thumbnails are paused → render icon directly (no HTTP request)
+            if (window.thumbnailsEnabled === false) {
+                thumbHtml = `<div class="file-thumb thumb-failed"
+                                  onclick="openPreview('${escapeHtml(item.path)}', '${escapeHtml(item.name)}')"></div>`;
+            } else {
+                const thumbUrl = `/thumbnail?path=${encodeURIComponent(item.path)}`;
+                thumbHtml = `<div class="file-thumb">
+                                <img src="${thumbUrl}" alt=""
+                                     loading="lazy"
+                                     onerror="this.style.display='none'; this.parentElement.classList.add('thumb-failed');"
+                                     onclick="openPreview('${escapeHtml(item.path)}', '${escapeHtml(item.name)}')">
+                             </div>`;
+            }
         } else if (isImage) {
             thumbHtml = `<div class="file-thumb">
                             <img src="/stream_file?path=${encodeURIComponent(item.path)}"
@@ -117,7 +176,7 @@ function renderFileList(items) {
     attachEvents();
     updateActionBar();
 }
-    
+
 function attachEvents() {
     document.querySelectorAll('.file-checkbox').forEach(cb => {
         cb.onchange = () => {
@@ -132,7 +191,7 @@ function attachEvents() {
         btn.onclick = () => {
             const p = btn.dataset.path, name = btn.dataset.name;
             const ext = p.split('.').pop().toLowerCase();
-            if (['mp4','mkv','avi','mov','webm','flv','m4v'].includes(ext)) openPreview(p,name);
+            if (['mp4','mkv','avi','mov','webm','flv','m4v'].includes(ext)) openPreview(p, name);
             else showToast('Preview only for video files', true);
         };
     });
@@ -140,9 +199,9 @@ function attachEvents() {
         btn.onclick = async () => {
             const p = btn.dataset.path;
             if (confirm(`Delete "${p}"?`)) {
-                const resp = await fetch(`/delete_file?path=${encodeURIComponent(p)}`,{method:'DELETE'});
-                if (resp.ok) { showToast('Deleted'); loadDirectory(currentPath); selectedPaths.delete(p); }
-                else { const err = await resp.json(); showToast(err.error||'Delete failed',true); }
+                const resp = await fetch(`/delete_file?path=${encodeURIComponent(p)}`, {method: 'DELETE'});
+                if (resp.ok) { showToast('Deleted'); selectedPaths.delete(p); loadDirectory(currentPath); }
+                else { const err = await resp.json(); showToast(err.error || 'Delete failed', true); }
             }
         };
     });
@@ -150,9 +209,9 @@ function attachEvents() {
         btn.onclick = async () => {
             const p = btn.dataset.path;
             if (confirm(`Delete entire folder "${p}" and its contents?`)) {
-                const resp = await fetch(`/delete_folder?path=${encodeURIComponent(p)}`,{method:'DELETE'});
-                if (resp.ok) { showToast('Folder deleted'); loadDirectory(currentPath); selectedPaths.delete(p); }
-                else { const err = await resp.json(); showToast(err.error||'Delete failed',true); }
+                const resp = await fetch(`/delete_folder?path=${encodeURIComponent(p)}`, {method: 'DELETE'});
+                if (resp.ok) { showToast('Folder deleted'); selectedPaths.delete(p); loadDirectory(currentPath); }
+                else { const err = await resp.json(); showToast(err.error || 'Delete failed', true); }
             }
         };
     });
@@ -171,7 +230,7 @@ function attachEvents() {
             const data = await resp.json();
             if (data.error) showToast(data.error, true);
             else showToast(`Send task: ${data.task_id}`);
-            fetchTasks();
+            if (typeof fetchTasks === 'function') fetchTasks();
         };
     });
     document.querySelectorAll('.colab-single').forEach(btn => {
@@ -185,7 +244,7 @@ function attachEvents() {
             const data = await resp.json();
             if (data.error) showToast(data.error, true);
             else showToast(`Task started: ${data.task_id}`);
-            fetchTasks();
+            if (typeof fetchTasks === 'function') fetchTasks();
         };
     });
 }
@@ -193,8 +252,12 @@ function attachEvents() {
 function updateActionBar() {
     const count = selectedPaths.size;
     const bar = document.getElementById('actionBar');
-    if (count > 0) { bar.style.display = 'flex'; document.getElementById('selectedCount').innerText = count; }
-    else { bar.style.display = 'none'; }
+    if (count > 0) {
+        bar.style.display = 'flex';
+        document.getElementById('selectedCount').innerText = count;
+    } else {
+        bar.style.display = 'none';
+    }
 }
 function updateCardSelection() {
     document.querySelectorAll('.file-card').forEach(card => {
@@ -204,15 +267,28 @@ function updateCardSelection() {
     });
 }
 
-document.getElementById('selectAllBtn').onclick = () => { currentItems.forEach(i => selectedPaths.add(i.path)); renderFileList(currentItems); };
-document.getElementById('deselectAllBtn').onclick = () => { selectedPaths.clear(); renderFileList(currentItems); };
-document.getElementById('downloadSelectedBtn').onclick = () => { for (let p of selectedPaths) window.open(`/download_file?path=${encodeURIComponent(p)}`, '_blank'); showToast(`Download started for ${selectedPaths.size} file(s)`); };
+document.getElementById('selectAllBtn').onclick = () => {
+    currentItems.forEach(i => selectedPaths.add(i.path));
+    renderFileList(currentItems);
+};
+document.getElementById('deselectAllBtn').onclick = () => {
+    selectedPaths.clear();
+    renderFileList(currentItems);
+};
+document.getElementById('deselectAllBtn2').onclick = () => {
+    selectedPaths.clear();
+    renderFileList(currentItems);
+};
+document.getElementById('downloadSelectedBtn').onclick = () => {
+    for (let p of selectedPaths) window.open(`/download_file?path=${encodeURIComponent(p)}`, '_blank');
+    showToast(`Download started for ${selectedPaths.size} file(s)`);
+};
 document.getElementById('deleteSelectedBtn').onclick = async () => {
     if (!confirm(`Delete ${selectedPaths.size} selected item(s)?`)) return;
     for (let p of selectedPaths) {
         const item = currentItems.find(i => i.path === p);
-        if (item && item.type === 'directory') await fetch(`/delete_folder?path=${encodeURIComponent(p)}`,{method:'DELETE'});
-        else await fetch(`/delete_file?path=${encodeURIComponent(p)}`,{method:'DELETE'});
+        if (item && item.type === 'directory') await fetch(`/delete_folder?path=${encodeURIComponent(p)}`, {method: 'DELETE'});
+        else await fetch(`/delete_file?path=${encodeURIComponent(p)}`, {method: 'DELETE'});
     }
     showToast('Deleted selected items');
     selectedPaths.clear();
@@ -225,19 +301,41 @@ document.getElementById('telegramSelectedBtn').onclick = async () => {
     if (!chat) return;
     localStorage.setItem('telegram_last_chat_link', chat);
     for (let p of selectedPaths) {
-        await fetch('/telegram/send_file', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:`file_path=${encodeURIComponent(p)}&chat_link=${encodeURIComponent(chat)}` });
+        await fetch('/telegram/send_file', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: `file_path=${encodeURIComponent(p)}&chat_link=${encodeURIComponent(chat)}`
+        });
     }
     showToast(`Sent ${selectedPaths.size} file(s) to Telegram`);
-    fetchTasks();
+    if (typeof fetchTasks === 'function') fetchTasks();
 };
 document.getElementById('colabSelectedBtn').onclick = async () => {
     if (selectedPaths.size === 0) { showToast('No files selected', true); return; }
     for (let p of selectedPaths) {
-        await fetch('/colab_process', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:`file_path=${encodeURIComponent(p)}` });
+        await fetch('/colab_process', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: `file_path=${encodeURIComponent(p)}`
+        });
     }
     showToast(`Colab tasks started for ${selectedPaths.size} file(s)`);
-    fetchTasks();
+    if (typeof fetchTasks === 'function') fetchTasks();
 };
+
+// Load more
+loadMoreBtn.onclick = () => {
+    currentPage += 1;
+    loadDirectory(currentPath, false);
+};
+
+// Thumbnail toggle refresh
+window.addEventListener('thumbnailsToggled', () => {
+    const localTab = document.getElementById('local-tab');
+    if (localTab && localTab.classList.contains('active') && currentPath !== undefined) {
+        loadDirectory(currentPath);
+    }
+});
 
 function openPreview(path, name) {
     previewVideo.src = `/stream_file?path=${encodeURIComponent(path)}`;
@@ -248,38 +346,12 @@ function openPreview(path, name) {
 }
 closeModal.onclick = () => { previewVideo.pause(); previewVideo.src = ''; previewModal.style.display = 'none'; };
 previewModal.onclick = (e) => { if (e.target === previewModal) closeModal.click(); };
+
 loadDirectory();
 </script>
 
 <style>
 .file-card.selected { border-color: #5f8fe0; background: rgba(45,65,100,0.6); }
 #actionBar { display: inline-flex; gap: 0.5rem; background: rgba(20,25,40,0.95); border-radius: 2rem; padding: 0.2rem 1rem; margin-left: 1rem; }
-
-.file-thumb {
-    width: 100%;
-    aspect-ratio: 16 / 9;
-    background: #0d1220;
-    border-radius: 0.8rem;
-    overflow: hidden;
-    margin-bottom: 0.5rem;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    border: 1px solid rgba(95, 143, 224, 0.15);
-}
-.file-thumb img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    display: block;
-}
-.file-thumb.thumb-failed::after {
-    content: '\f03d';
-    font-family: 'Font Awesome 6 Free';
-    font-weight: 900;
-    font-size: 1.4rem;
-    color: #2c3e66;
-}
-    
+#loadMoreBtn { padding: 0.6rem 1.4rem; }
 </style>
