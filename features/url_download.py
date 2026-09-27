@@ -4,11 +4,12 @@ import uuid
 import threading
 import time
 import logging
+import hashlib
 import requests
 import subprocess
 import shutil
 import signal
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs
 from flask import request, jsonify
 from tasks import save_task, load_task
 from config import UPLOAD_FOLDER, PROXY_DICT
@@ -27,7 +28,6 @@ COOKIES_FILE = os.path.join(
     'cookies.txt'
 )
 
-# ---- Quality selectors for yt-dlp ----
 QUALITY_MAP = {
     'best':  'bv*+ba/b',
     '2160p': 'bv*[height<=2160]+ba/b[height<=2160]/b',
@@ -40,14 +40,12 @@ QUALITY_MAP = {
     'audio': 'ba/b',
 }
 
-# Video streams / pages → yt-dlp
 VIDEO_STREAM_EXTS = {'.m3u8', '.mpd', '.ts'}
 MEDIA_EXTS = {
     '.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.m4v', '.wmv', '.3gp',
     '.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a', '.wma', '.opus',
 }
 
-# Video site hostnames (for yt-dlp routing)
 VIDEO_SITES = [
     'youtube.com', 'youtu.be', 'vimeo.com', 'dailymotion.com',
     'twitter.com', 'x.com', 'facebook.com', 'instagram.com',
@@ -63,7 +61,7 @@ class DownloadCancelled(Exception):
 
 
 # ============================================================
-# GLOBAL PROCESS TRACKER
+# PROCESS TRACKER
 # ============================================================
 _running_processes = {}
 _processes_lock = threading.Lock()
@@ -103,7 +101,7 @@ def kill_process(task_id):
 
 
 # ============================================================
-# URL CLASSIFICATION HELPERS
+# URL CLASSIFICATION
 # ============================================================
 def _ext(url):
     try:
@@ -124,24 +122,19 @@ def _filename_from_url(url):
 
 
 def is_playlist_url(url):
-    """Detect YouTube playlist / channel / multi-video URLs."""
     lower = url.lower()
     if 'youtube.com' not in lower and 'youtu.be' not in lower:
         return False
-    # Explicit playlist
     if 'list=' in lower or '/playlist' in lower:
         return True
-    # Channel pages
     if any(x in lower for x in ['/channel/', '/c/', '/user/', '/@']):
         return True
     return False
 
 
 def needs_ytdlp(url):
-    """Returns True if URL should be handled by yt-dlp (video or stream or site)."""
     url_lower = url.lower()
     ext = _ext(url)
-
     if ext in VIDEO_STREAM_EXTS:
         return True
     if ext in MEDIA_EXTS:
@@ -149,6 +142,30 @@ def needs_ytdlp(url):
     if any(site in url_lower for site in VIDEO_SITES):
         return True
     return False
+
+
+def _playlist_folder_name(url, quality):
+    """
+    Stable folder name derived from the playlist URL + quality.
+    Same URL → same folder → resume works.
+    """
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+
+    # Prefer YouTube playlist ID
+    if 'list' in qs and qs['list']:
+        ident = qs['list'][0]
+    elif '/@' in parsed.path:
+        ident = parsed.path.split('/@')[1].split('/')[0]
+    elif '/channel/' in parsed.path:
+        ident = parsed.path.split('/channel/')[1].split('/')[0]
+    elif '/c/' in parsed.path:
+        ident = parsed.path.split('/c/')[1].split('/')[0]
+    else:
+        ident = hashlib.md5(url.encode()).hexdigest()[:12]
+
+    ident = re.sub(r'[^\w\-]', '_', ident)[:50]
+    return f"playlist_{ident}_{quality}"
 
 
 # ============================================================
@@ -304,7 +321,7 @@ def download_with_ytdlp(url, task_id, quality='best'):
         '--newline', '--progress', '--no-colors',
         '--concurrent-fragments', '4',
         '--retries', '5', '--fragment-retries', '5',
-        '--no-playlist',       # single video only
+        '--no-playlist',
     ]
 
     if os.path.exists(COOKIES_FILE):
@@ -415,20 +432,21 @@ def download_with_ytdlp(url, task_id, quality='best'):
 
 
 # ============================================================
-# PLAYLIST DOWNLOADER
+# PLAYLIST DOWNLOADER (with stable folder + range + resume)
 # ============================================================
-def download_playlist(url, task_id, quality='best'):
-    """
-    Download an entire YouTube playlist (or channel) at the chosen quality.
-    Each video is saved separately with an index prefix.
-    """
+def download_playlist(url, task_id, quality='best', range_start=1, range_end=0):
     task = load_task(task_id)
     if not task:
         raise Exception("Task not found")
+
     task['status'] = 'downloading_playlist'
     task['progress'] = 0
-    task['total_size'] = 0
-    task['downloaded_size'] = 0
+    task['download_progress'] = 0
+    task['current_item'] = 0
+    task['total_items'] = 0
+    task['current_title'] = ''
+    task['current_video_size'] = 0
+    task['current_video_downloaded'] = 0
     task['download_speed'] = 0
     save_task(task_id, task)
 
@@ -437,24 +455,25 @@ def download_playlist(url, task_id, quality='best'):
     ffmpeg_path = shutil.which('ffmpeg') or '/usr/local/bin/ffmpeg'
     if not os.path.exists(ffmpeg_path):
         raise Exception("ffmpeg not found")
-
     if not shutil.which('yt-dlp'):
         raise Exception("yt-dlp not installed")
 
     format_choice = QUALITY_MAP.get(quality, QUALITY_MAP['best'])
 
-    # Dedicated subfolder for the playlist
-    playlist_id = f"playlist_{task_id[:8]}"
-    playlist_dir = os.path.join(UPLOAD_FOLDER, playlist_id)
+    # ---- STABLE folder name (same URL → same folder → resume) ----
+    folder_name = _playlist_folder_name(url, quality)
+    playlist_dir = os.path.join(UPLOAD_FOLDER, folder_name)
     os.makedirs(playlist_dir, exist_ok=True)
+    archive_file = os.path.join(playlist_dir, '.downloaded.txt')
 
-    # Output template: "01 - Video Title [abc123].mp4"
+    logger.info(f"Playlist folder: {folder_name} (resume via {archive_file})")
+
+    # ---- Filename template using ORIGINAL playlist index ----
+    # Video at position 17 → "17 - Title [id].mp4", regardless of range
     output_template = os.path.join(
         playlist_dir,
-        '%(playlist_index)02d - %(title).100B [%(id)s].%(ext)s'
+        '%(playlist_index)s - %(title).80B [%(id)s].%(ext)s'
     )
-
-    archive_file = os.path.join(playlist_dir, '.downloaded.txt')
 
     cmd = [
         'yt-dlp',
@@ -469,13 +488,19 @@ def download_playlist(url, task_id, quality='best'):
         '--concurrent-fragments', '4',
         '--retries', '5', '--fragment-retries', '5',
         '--yes-playlist',
-        '--download-archive', archive_file,
-        # Custom progress line so we can detect item index
-        '--progress-template',
-        'download:[download] %(progress._percent_str)s of %(progress._total_bytes_str)s '
-        'at %(progress._speed_str)s ETA %(progress._eta_str)s | '
-        'item %(info.playlist_index)s of %(info.n_entries)s: %(info.title).50B',
+        '--download-archive', archive_file,   # ← skip already-downloaded
     ]
+
+    # ---- Range selection ----
+    if range_start > 1 or range_end > 0:
+        if range_end > 0:
+            items = f"{range_start}-{range_end}"
+        else:
+            items = f"{range_start}-"
+        cmd += ['--playlist-items', items]
+        logger.info(f"Playlist range: {items}")
+    else:
+        logger.info("Downloading full playlist")
 
     if os.path.exists(COOKIES_FILE):
         cmd += ['--cookies', COOKIES_FILE]
@@ -492,19 +517,33 @@ def download_playlist(url, task_id, quality='best'):
     output_lines = []
     last_update_time = 0
 
-    RE_PCT     = re.compile(r'(\d+(?:\.\d+)?)%')
-    RE_TOTAL   = re.compile(r'of\s+~?\s*([\d.]+)\s*([KMGT]?i?B)')
-    RE_SPEED   = re.compile(r'at\s+([\d.]+)\s*([KMGT]?i?B)/s')
-    RE_ITEM    = re.compile(r'item\s+(\d+)\s+of\s+(\d+)\s*:\s*(.+?)$')
+    # Regexes for parsing yt-dlp output
+    RE_ITEM     = re.compile(r'\[download\]\s+Downloading item\s+(\d+)\s+of\s+(\d+)')
+    RE_DEST     = re.compile(r'\[download\]\s+Destination:\s+(.+)$')
+    RE_PCT      = re.compile(r'\[download\]\s+(\d+(?:\.\d+)?)%')
+    RE_TOTAL    = re.compile(r'of\s+~?\s*([\d.]+)\s*([KMGT]?i?B)')
+    RE_SPEED    = re.compile(r'at\s+([\d.]+)\s*([KMGT]?i?B)/s')
+    RE_ALREADY  = re.compile(r'has already been recorded in the archive')
 
     current_item = 0
     total_items = 0
     current_title = ''
+    current_video_size = 0
+    current_video_downloaded = 0
 
     def to_bytes(value, unit):
         unit = unit.upper().replace('IB', 'B')
         factors = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3, 'TB': 1024**4}
         return int(value * factors.get(unit, 1))
+
+    def extract_title(path):
+        base = os.path.basename(path)
+        base = os.path.splitext(base)[0]
+        # remove "17 - " prefix
+        base = re.sub(r'^\d+\s*-\s*', '', base)
+        # remove " [id]" suffix
+        base = re.sub(r'\s*\[[^\]]+\]$', '', base)
+        return base
 
     try:
         while True:
@@ -516,67 +555,98 @@ def download_playlist(url, task_id, quality='best'):
 
             output_lines.append(line)
 
+            # ---- Cancellation ----
             task = load_task(task_id)
             if task and task.get('cancelled', False):
                 logger.info(f"Playlist {task_id} cancelled – killing yt-dlp")
                 kill_process(task_id)
                 raise DownloadCancelled("Cancelled by user")
 
-            # Parse which video we're on
-            item_match = RE_ITEM.search(line)
-            if item_match:
-                current_item = int(item_match.group(1))
-                total_items = int(item_match.group(2))
-                current_title = item_match.group(3).strip()
+            # ---- Item position ----
+            m = RE_ITEM.search(line)
+            if m:
+                current_item = int(m.group(1))
+                total_items = int(m.group(2))
+                continue
 
-            pct_match = RE_PCT.search(line)
-            if pct_match:
-                pct = float(pct_match.group(1))
+            # ---- Skip notice ----
+            if RE_ALREADY.search(line):
+                logger.info(f"Playlist {task_id}: skipping already-downloaded")
+                continue
+
+            # ---- New file starting ----
+            m = RE_DEST.search(line)
+            if m:
+                file_path = m.group(1).strip()
+                current_title = extract_title(file_path)
+                current_video_size = 0
+                current_video_downloaded = 0
+                logger.info(f"Playlist {task_id}: starting '{current_title}'")
+
+            # ---- Progress line ----
+            pct_m = RE_PCT.search(line)
+            if pct_m:
+                pct = float(pct_m.group(1))
+                total_m = RE_TOTAL.search(line)
+                if total_m:
+                    current_video_size = to_bytes(
+                        float(total_m.group(1)), total_m.group(2)
+                    )
+                if current_video_size > 0:
+                    current_video_downloaded = int(current_video_size * pct / 100)
+
+                speed_m = RE_SPEED.search(line)
                 speed_kbps = 0
-                speed_match = RE_SPEED.search(line)
-                if speed_match:
-                    speed_bytes = to_bytes(float(speed_match.group(1)), speed_match.group(2))
+                if speed_m:
+                    speed_bytes = to_bytes(float(speed_m.group(1)), speed_m.group(2))
                     speed_kbps = int(speed_bytes / 1024)
 
                 # Overall playlist progress
                 if total_items > 0:
-                    overall_pct = int(((current_item - 1) * 100 + pct) / total_items)
-                    overall_pct = min(99, overall_pct)
+                    overall = int(((current_item - 1) * 100 + pct) / total_items)
+                    overall = min(99, overall)
                 else:
-                    overall_pct = int(pct)
+                    overall = int(pct)
 
                 now = time.time()
                 if now - last_update_time >= 0.5:
                     task = load_task(task_id)
                     if task:
-                        task['progress'] = overall_pct
-                        task['download_progress'] = overall_pct
+                        task['progress'] = overall
+                        task['download_progress'] = overall
                         task['download_speed'] = speed_kbps
                         task['current_item'] = current_item
                         task['total_items'] = total_items
                         task['current_title'] = current_title
-                        task['current_video_pct'] = int(pct)
+                        task['current_video_size'] = current_video_size
+                        task['current_video_downloaded'] = current_video_downloaded
                         save_task(task_id, task)
                     last_update_time = now
 
             if 'ERROR' in line:
                 logger.error(f"yt-dlp: {line.strip()}")
-            if '[download] Destination:' in line:
-                logger.info(f"Playlist {task_id}: {line.strip()}")
 
         process.wait()
     finally:
         unregister_process(task_id)
 
-    # Count downloaded videos (ignore .downloaded.txt, .jpg etc.)
-    video_files = [
-        f for f in os.listdir(playlist_dir)
-        if f.endswith('.mp4')
-    ]
+    # ---- Count results ----
+    video_files = [f for f in os.listdir(playlist_dir) if f.endswith('.mp4')]
 
     if not video_files:
         full_output = ''.join(output_lines)
-        logger.error(f"Playlist {task_id} – no videos downloaded. Full output:\n{full_output[-3000:]}")
+        logger.error(f"Playlist {task_id} – no videos downloaded. Output:\n{full_output[-3000:]}")
+        # If everything was already in the archive, that's not an error
+        if 'has already been recorded' in full_output:
+            task = load_task(task_id)
+            if task:
+                task['status'] = 'done'
+                task['progress'] = 100
+                task['download_progress'] = 100
+                task['output_file'] = folder_name + '/'
+                task['error_msg'] = 'All videos already downloaded'
+                save_task(task_id, task)
+            return
         raise Exception("No videos were downloaded from the playlist.")
 
     total_size = sum(
@@ -591,27 +661,28 @@ def download_playlist(url, task_id, quality='best'):
     task['total_size'] = total_size
     task['downloaded_size'] = total_size
     task['download_speed'] = 0
-    task['output_file'] = playlist_id + '/'
+    task['output_file'] = folder_name + '/'
     task['total_items'] = len(video_files)
     save_task(task_id, task)
 
     logger.info(f"Playlist {task_id} finished: {len(video_files)} videos, "
-                f"{total_size / 1024 / 1024:.1f} MB total")
+                f"{total_size / 1024 / 1024:.1f} MB total in {folder_name}/")
 
 
 # ============================================================
 # MAIN ENTRY
 # ============================================================
-def process_url_download(task_id, url, quality='best'):
-    logger.info(f"process_url_download: {task_id} → {url} (quality={quality})")
+def process_url_download(task_id, url, quality='best', range_start=1, range_end=0):
+    logger.info(f"process_url_download: {task_id} → {url} (quality={quality}, "
+                f"range={range_start}-{range_end or 'end'})")
     task = load_task(task_id)
     if not task:
         return
 
     try:
         if is_playlist_url(url):
-            logger.info("→ Playlist detected → playlist downloader")
-            download_playlist(url, task_id, quality)
+            logger.info("→ Playlist detected")
+            download_playlist(url, task_id, quality, range_start, range_end)
         elif needs_ytdlp(url):
             logger.info("→ Single video → yt-dlp")
             download_with_ytdlp(url, task_id, quality)
@@ -753,6 +824,19 @@ def register_routes(app):
         if quality not in QUALITY_MAP:
             quality = 'best'
 
+        # Playlist range
+        try:
+            range_start = int(request.form.get('range_start', 1) or 1)
+        except ValueError:
+            range_start = 1
+        try:
+            range_end = int(request.form.get('range_end', 0) or 0)
+        except ValueError:
+            range_end = 0
+
+        if range_start < 1:
+            range_start = 1
+
         task_id = str(uuid.uuid4())
         task_data = {
             'task_id': task_id,
@@ -766,6 +850,8 @@ def register_routes(app):
             'cancelled': False,
             'url': url,
             'quality': quality,
+            'range_start': range_start,
+            'range_end': range_end,
         }
         save_task(task_id, task_data)
 
@@ -797,7 +883,7 @@ def register_routes(app):
             threading.Thread(target=fetch_torrent, daemon=True).start()
         else:
             def run():
-                process_url_download(task_id, url, quality)
+                process_url_download(task_id, url, quality, range_start, range_end)
             threading.Thread(target=run, daemon=True).start()
 
         return jsonify({'task_id': task_id})
