@@ -188,40 +188,47 @@ def create_app():
         if not token or token != COOKIE_UPLOAD_TOKEN:
             logger.warning("Cookie upload: invalid or missing token")
             return jsonify({'error': 'Unauthorized'}), 401
-
+    
         content = request.get_data(as_text=True)
         if not content or len(content) < 50:
             return jsonify({'error': 'Empty or too-short cookie data'}), 400
-
-        if 'youtube.com' not in content:
-            return jsonify({'error': 'No YouTube cookies found in payload'}), 400
-
+    
+        # ---- (REMOVED the "youtube.com required" check) ----
+    
         try:
             if os.path.exists(COOKIES_SAVE_PATH):
                 shutil.copy(COOKIES_SAVE_PATH, COOKIES_SAVE_PATH + '.bak')
-
+    
             if not content.lstrip().startswith('# Netscape HTTP Cookie File'):
                 content = '# Netscape HTTP Cookie File\n# Uploaded by extension\n' + content
-
+    
             with open(COOKIES_SAVE_PATH, 'w', encoding='utf-8') as f:
                 f.write(content)
-
+    
             cookie_lines = [l for l in content.splitlines()
                             if l and not l.startswith('#') and '\t' in l]
-
-            logger.info(f"Cookies updated: {len(cookie_lines)} entries, "
-                        f"{len(content)} bytes written")
-
+    
+            # Count unique domains
+            domains = set()
+            for line in cookie_lines:
+                parts = line.split('\t')
+                if parts:
+                    domains.add(parts[0])
+    
+            logger.info(f"Cookies updated: {len(cookie_lines)} entries across "
+                        f"{len(domains)} domains ({len(content)} bytes)")
+    
             return jsonify({
                 'status': 'ok',
                 'cookies': len(cookie_lines),
+                'domains': len(domains),
                 'bytes': len(content),
                 'saved_at': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
             })
         except Exception as e:
             logger.exception("Failed to save cookies")
             return jsonify({'error': str(e)}), 500
-
+            
     @app.route('/')
     def index():
         return render_template('index.html')
