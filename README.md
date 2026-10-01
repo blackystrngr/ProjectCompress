@@ -73,6 +73,7 @@ git clone https://github.com/blackystrngr/ProjectCompress.git
 cd ProjectCompress
 chmod +x install.sh
 sudo ./install.sh
+python3 app.py
 ```
 
 The script installs and configures:
