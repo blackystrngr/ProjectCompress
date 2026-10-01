@@ -1,8 +1,18 @@
 <div class="card">
-    <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
-        <h2><i class="fab fa-google-drive"></i> Google Drive Files</h2>
-        <button id="refreshDriveBtn"><i class="fas fa-sync-alt"></i> Refresh</button>
+    <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem;">
+        <h2><i class="fab fa-google-drive"></i> Google Drive</h2>
+        <div style="display: flex; gap: 0.5rem;">
+            <button id="driveUpBtn" title="Go to parent folder"><i class="fas fa-level-up-alt"></i> Up</button>
+            <button id="refreshDriveBtn"><i class="fas fa-sync-alt"></i> Refresh</button>
+        </div>
     </div>
+
+    <!-- Breadcrumbs -->
+    <div id="driveBreadcrumbs" style="margin: 0.8rem 0; font-size: 0.85rem; word-break: break-all; padding: 0.5rem 0.8rem; background: rgba(20,25,40,0.6); border-radius: 0.5rem;">
+        <i class="fas fa-folder"></i> Loading...
+    </div>
+
+    <!-- Action bar -->
     <div id="driveActionBar" class="action-bar" style="display: none;">
         <span class="selected-info"><span id="driveSelectedCount">0</span> selected</span>
         <div class="action-buttons">
@@ -10,49 +20,185 @@
             <button id="deselectAllDriveBtn">Deselect All</button>
         </div>
     </div>
+
+    <!-- File list -->
     <div id="driveFileList" class="file-grid empty-state">Loading Drive files...</div>
 </div>
 
 <script>
-let driveFiles = [], selectedDriveIds = new Set();
-async function loadDriveFiles() {
-    document.getElementById('driveFileList').innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-pulse"></i> Loading...</div>';
+// ============================================================
+// Drive browser state
+// ============================================================
+let driveCurrentFolderId = null;
+let driveRootId = null;
+let driveParentId = null;
+let driveFiles = [];          // includes folders + files
+let selectedDriveIds = new Set();
+
+// ============================================================
+// Load folder
+// ============================================================
+async function loadDriveFolder(folderId) {
+    const listEl = document.getElementById('driveFileList');
+    listEl.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-pulse"></i> Loading...</div>';
+
     try {
-        const resp = await fetch('/drive/list');
-        const files = await resp.json();
-        if (files.error) throw new Error(files.error);
-        driveFiles = files;
-        if (!driveFiles.length) {
-            document.getElementById('driveFileList').innerHTML = '<div class="empty-state">No files found in Drive folder.</div>';
-            document.getElementById('driveActionBar').style.display = 'none';
-            return;
-        }
+        let url = '/drive/list';
+        if (folderId) url += `?folder_id=${encodeURIComponent(folderId)}`;
+
+        const resp = await fetch(url);
+        const data = await resp.json();
+
+        if (data.error) throw new Error(data.error);
+
+        // Save state
+        driveCurrentFolderId = data.current_folder_id;
+        driveParentId = data.parent_id;
+        if (!driveRootId) driveRootId = data.current_folder_id;
+
+        // Merge folders + files into one list
+        driveFiles = [...(data.folders || []), ...(data.files || [])];
+
+        // Render
+        renderDriveBreadcrumbs(data.breadcrumbs);
         renderDriveFileList();
+        updateDriveUpButton();
+
+        // Clear selection when changing folders
+        selectedDriveIds.clear();
+        updateDriveSelectionUI();
     } catch (err) {
-        document.getElementById('driveFileList').innerHTML = `<div class="empty-state" style="color:#ff8a8a;">Error: ${err.message}</div>`;
+        listEl.innerHTML = `<div class="empty-state" style="color:#ff8a8a;">
+            Error: ${escapeHtml(err.message)}
+        </div>`;
     }
 }
 
-function renderDriveFileList() {
-    let html = '';
-    driveFiles.forEach(file => {
-        const isSelected = selectedDriveIds.has(file.id);
-        html += `<div class="file-card ${isSelected ? 'selected' : ''}" data-id="${file.id}">
-                    <input type="checkbox" class="file-checkbox drive-checkbox" data-id="${file.id}" ${isSelected ? 'checked' : ''}>
-                    <div class="file-name"><i class="fas fa-file"></i> ${escapeHtml(file.name)}</div>
-                    <div class="file-size">${file.size_str}</div>
-                    <div class="file-actions">
-                        <button class="drive-download-single" data-id="${file.id}" data-name="${escapeHtml(file.name)}"><i class="fas fa-download"></i> Download</button>
-                        <button class="drive-delete" data-id="${file.id}"><i class="fas fa-trash-alt"></i> Delete</button>
-                    </div>
-                </div>`;
+// ============================================================
+// Breadcrumbs
+// ============================================================
+function renderDriveBreadcrumbs(crumbs) {
+    const el = document.getElementById('driveBreadcrumbs');
+    if (!crumbs || crumbs.length === 0) {
+        el.innerHTML = '<i class="fas fa-folder"></i> Root';
+        return;
+    }
+
+    let html = '<i class="fas fa-folder-open" style="color:#93c5fd;"></i> ';
+    crumbs.forEach((c, i) => {
+        const isLast = i === crumbs.length - 1;
+        if (isLast) {
+            html += `<strong>${escapeHtml(c.name)}</strong>`;
+        } else {
+            html += `<a href="#" class="drive-crumb" data-folder-id="${escapeHtml(c.id)}"
+                        style="color:#5f8fe0; text-decoration:none;">${escapeHtml(c.name)}</a>`;
+            html += ' <span style="color:#4b5563;">/</span> ';
+        }
     });
-    document.getElementById('driveFileList').innerHTML = html;
+    el.innerHTML = html;
+
+    // Wire up breadcrumb clicks
+    el.querySelectorAll('.drive-crumb').forEach(a => {
+        a.addEventListener('click', (e) => {
+            e.preventDefault();
+            loadDriveFolder(a.dataset.folderId);
+        });
+    });
+}
+
+// ============================================================
+// Up button
+// ============================================================
+function updateDriveUpButton() {
+    const btn = document.getElementById('driveUpBtn');
+    // Only enable "up" if we're not at root
+    if (!driveParentId || driveCurrentFolderId === driveRootId) {
+        btn.disabled = true;
+        btn.style.opacity = 0.4;
+        btn.style.cursor = 'not-allowed';
+    } else {
+        btn.disabled = false;
+        btn.style.opacity = 1;
+        btn.style.cursor = 'pointer';
+    }
+}
+
+document.getElementById('driveUpBtn').onclick = () => {
+    if (driveParentId && driveCurrentFolderId !== driveRootId) {
+        loadDriveFolder(driveParentId);
+    }
+};
+
+// ============================================================
+// File list
+// ============================================================
+function renderDriveFileList() {
+    const listEl = document.getElementById('driveFileList');
+
+    if (!driveFiles.length) {
+        listEl.innerHTML = '<div class="empty-state">Empty folder.</div>';
+        return;
+    }
+
+    let html = '';
+    driveFiles.forEach(item => {
+        const isSel = selectedDriveIds.has(item.id);
+        const isFolder = item.is_folder;
+
+        if (isFolder) {
+            // ---- Folder card ----
+            html += `<div class="file-card drive-folder-card" data-id="${item.id}" data-folder="true">
+                <div class="file-name" style="cursor:pointer;"
+                     onclick="loadDriveFolder('${item.id}')">
+                    <i class="fas fa-folder" style="color:#facc15; font-size:1.2rem;"></i>
+                    <span style="margin-left:4px;">${escapeHtml(item.name)}</span>
+                </div>
+                <div class="file-size" style="color:#93c5fd;">Folder</div>
+                <div class="file-actions">
+                    <button class="drive-open-folder" data-id="${item.id}">
+                        <i class="fas fa-folder-open"></i> Open
+                    </button>
+                </div>
+            </div>`;
+        } else {
+            // ---- File card ----
+            html += `<div class="file-card ${isSel ? 'selected' : ''}" data-id="${item.id}" data-folder="false">
+                <input type="checkbox" class="file-checkbox drive-checkbox"
+                       data-id="${item.id}" ${isSel ? 'checked' : ''}>
+                <div class="file-name">
+                    <i class="fas fa-file"></i>
+                    ${escapeHtml(item.name)}
+                </div>
+                <div class="file-size">${escapeHtml(item.size_str || '—')}</div>
+                <div class="file-actions">
+                    <button class="drive-download-single"
+                            data-id="${item.id}"
+                            data-name="${escapeHtml(item.name)}">
+                        <i class="fas fa-download"></i> Download
+                    </button>
+                    <button class="drive-delete" data-id="${item.id}">
+                        <i class="fas fa-trash-alt"></i> Delete
+                    </button>
+                </div>
+            </div>`;
+        }
+    });
+
+    listEl.innerHTML = html;
     attachDriveEvents();
     updateDriveSelectionUI();
 }
 
+// ============================================================
+// Events
+// ============================================================
 function attachDriveEvents() {
+    // Folder open buttons
+    document.querySelectorAll('.drive-open-folder').forEach(btn => {
+        btn.onclick = () => loadDriveFolder(btn.dataset.id);
+    });
+
+    // Checkboxes
     document.querySelectorAll('.drive-checkbox').forEach(cb => {
         cb.onchange = () => {
             const id = cb.dataset.id;
@@ -61,31 +207,44 @@ function attachDriveEvents() {
             updateDriveSelectionUI();
         };
     });
+
+    // Download single
     document.querySelectorAll('.drive-download-single').forEach(btn => {
         btn.onclick = async () => {
-            const id = btn.dataset.id, name = btn.dataset.name;
+            const id = btn.dataset.id;
+            const name = btn.dataset.name;
             const resp = await fetch('/drive/download_to_server', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                body: `file_id=${id}&file_name=${encodeURIComponent(name)}`
+                body: `file_id=${encodeURIComponent(id)}&file_name=${encodeURIComponent(name)}`
             });
             const data = await resp.json();
             if (data.error) showToast(data.error, true);
-            else showToast(`Task started: ${data.task_id}`);
-            fetchTasks();
+            else showToast(`Download started: ${data.task_id}`);
+            if (typeof fetchTasks === 'function') fetchTasks();
         };
     });
+
+    // Delete
     document.querySelectorAll('.drive-delete').forEach(btn => {
         btn.onclick = async () => {
             if (!confirm('Permanently delete from Drive?')) return;
             const id = btn.dataset.id;
             const resp = await fetch(`/drive/delete/${id}`, { method: 'DELETE' });
-            if (resp.ok) { showToast('Deleted'); loadDriveFiles(); }
-            else showToast('Delete failed', true);
+            if (resp.ok) {
+                showToast('Deleted');
+                loadDriveFolder(driveCurrentFolderId);
+            } else {
+                const err = await resp.json().catch(() => ({}));
+                showToast(err.error || 'Delete failed', true);
+            }
         };
     });
 }
 
+// ============================================================
+// Selection
+// ============================================================
 function updateDriveSelectionUI() {
     const count = selectedDriveIds.size;
     const actionBar = document.getElementById('driveActionBar');
@@ -95,6 +254,7 @@ function updateDriveSelectionUI() {
     } else {
         actionBar.style.display = 'none';
     }
+
     document.querySelectorAll('#driveFileList .file-card').forEach(card => {
         const id = card.dataset.id;
         if (selectedDriveIds.has(id)) card.classList.add('selected');
@@ -102,26 +262,39 @@ function updateDriveSelectionUI() {
     });
 }
 
-document.getElementById('refreshDriveBtn').onclick = loadDriveFiles;
-document.getElementById('downloadSelectedDriveBtn').onclick = async () => {
-    if (selectedDriveIds.size === 0) return;
-    for (let id of selectedDriveIds) {
-        const file = driveFiles.find(f => f.id === id);
-        if (file) {
-            await fetch('/drive/download_to_server', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                body: `file_id=${id}&file_name=${encodeURIComponent(file.name)}`
-            });
-        }
-    }
-    showToast(`Started download of ${selectedDriveIds.size} file(s)`);
-    fetchTasks();
+// ============================================================
+// Refresh / batch buttons
+// ============================================================
+document.getElementById('refreshDriveBtn').onclick = () => {
+    loadDriveFolder(driveCurrentFolderId || driveRootId);
 };
+
 document.getElementById('deselectAllDriveBtn').onclick = () => {
     selectedDriveIds.clear();
     updateDriveSelectionUI();
     renderDriveFileList();
 };
-loadDriveFiles();
+
+document.getElementById('downloadSelectedDriveBtn').onclick = async () => {
+    if (selectedDriveIds.size === 0) return;
+    let started = 0;
+    for (const id of selectedDriveIds) {
+        const file = driveFiles.find(f => f.id === id && !f.is_folder);
+        if (file) {
+            await fetch('/drive/download_to_server', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: `file_id=${encodeURIComponent(id)}&file_name=${encodeURIComponent(file.name)}`
+            });
+            started++;
+        }
+    }
+    showToast(`Started download of ${started} file(s)`);
+    if (typeof fetchTasks === 'function') fetchTasks();
+};
+
+// ============================================================
+// Initial load
+// ============================================================
+loadDriveFolder(null);
 </script>
