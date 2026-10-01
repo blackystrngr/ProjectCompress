@@ -9,7 +9,8 @@ import requests
 import subprocess
 import shutil
 import signal
-from urllib.parse import urlparse, unquote, parse_qs
+from urllib.parse import urlparse, unquote, parse_qs, urljoin
+from bs4 import BeautifulSoup
 from flask import request, jsonify
 from tasks import save_task, load_task
 from config import UPLOAD_FOLDER, PROXY_DICT
@@ -56,6 +57,10 @@ VIDEO_SITES = [
 ]
 
 CHUNK_SIZE = 64 * 1024
+
+USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+              'AppleWebKit/537.36 (KHTML, like Gecko) '
+              'Chrome/120.0.0.0 Safari/537.36')
 
 
 class DownloadCancelled(Exception):
@@ -166,6 +171,117 @@ def _playlist_folder_name(url, quality):
 
 
 # ============================================================
+# HTML SCRAPING — find video URLs inside a webpage
+# ============================================================
+def _fetch_page_html(url, timeout=20):
+    """Fetch HTML from a URL with browser-like headers."""
+    session = requests.Session()
+    if PROXY_DICT:
+        session.proxies = PROXY_DICT
+    session.headers.update({
+        'User-Agent': USER_AGENT,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+    })
+    try:
+        parsed = urlparse(url)
+        session.headers['Referer'] = f"{parsed.scheme}://{parsed.netloc}/"
+    except Exception:
+        pass
+
+    r = session.get(url, timeout=timeout, allow_redirects=True)
+    r.raise_for_status()
+    return r.text, r.url
+
+
+def _extract_video_candidates(html, base_url):
+    """
+    Return a sorted list of candidate video URLs found in the HTML.
+    Higher priority candidates come first.
+    """
+    candidates = []  # list of (priority, url)
+
+    def add(url, priority):
+        """Add a URL if valid and dedupe."""
+        if not url or not isinstance(url, str):
+            return
+        url = url.strip()
+        if url.startswith('//'):
+            url = 'https:' + url
+        if url.startswith('/'):
+            url = urljoin(base_url, url)
+        if not url.startswith(('http://', 'https://')):
+            return
+        candidates.append((priority, url))
+
+    soup = BeautifulSoup(html, 'html.parser')
+
+    # ---------- PRIORITY 1: <video src> and <source src> ----------
+    for video in soup.find_all('video'):
+        src = video.get('src')
+        if src:
+            add(src, 1)
+        for source in video.find_all('source'):
+            src = source.get('src')
+            if src:
+                add(src, 1)
+
+    # ---------- PRIORITY 2: og:video / twitter:player:stream meta ----------
+    for meta in soup.find_all('meta'):
+        prop = (meta.get('property') or meta.get('name') or '').lower()
+        content = meta.get('content', '')
+        if prop in ('og:video', 'og:video:url', 'og:video:secure_url',
+                    'twitter:player:stream', 'twitter:player'):
+            add(content, 2)
+
+    # ---------- PRIORITY 3: JSON-LD contentUrl / embedUrl ----------
+    for script in soup.find_all('script', type='application/ld+json'):
+        if not script.string:
+            continue
+        for m in re.finditer(r'"(?:contentUrl|embedUrl)"\s*:\s*"([^"]+)"',
+                             script.string):
+            add(m.group(1), 3)
+
+    # ---------- PRIORITY 4: inline JS patterns ----------
+    js_patterns = [
+        r'(?:file|source|videoUrl|video_url|hlsUrl|hls_url|dashUrl|'\
+        r'playlistUrl|playlist_url|streamUrl|stream_url|mp4Url|mp4_url)'\
+        r'\s*[:=]\s*[\'"]([^\'"]+\.(?:mp4|m3u8|mpd|webm|mov|mkv|ts)[^\'"]*)[\'"]',
+        r'[\'"](https?://[^\'"]+\.(?:mp4|m3u8|mpd|webm|mov|mkv|ts)(?:\?[^\'"]*)?)[\'"]',
+    ]
+    for script in soup.find_all('script'):
+        if not script.string:
+            continue
+        text = script.string
+        for pattern in js_patterns:
+            for m in re.finditer(pattern, text, re.IGNORECASE):
+                add(m.group(1), 4)
+
+    # ---------- PRIORITY 5: iframes (embedded players) ----------
+    for iframe in soup.find_all('iframe'):
+        src = iframe.get('src')
+        if src:
+            add(src, 5)
+
+    # ---------- PRIORITY 6: <a href> pointing to video files ----------
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        ext = os.path.splitext(urlparse(href).path)[1].lower()
+        if ext in MEDIA_EXTS or ext in VIDEO_STREAM_EXTS:
+            add(href, 6)
+
+    # ---------- Sort by priority, dedupe ----------
+    seen = set()
+    sorted_list = []
+    for priority, url in sorted(candidates, key=lambda x: x[0]):
+        if url in seen:
+            continue
+        seen.add(url)
+        sorted_list.append(url)
+    return sorted_list
+
+
+# ============================================================
 # DIRECT FILE DOWNLOAD
 # ============================================================
 def download_direct_file(url, task_id):
@@ -180,32 +296,18 @@ def download_direct_file(url, task_id):
     session = requests.Session()
     if PROXY_DICT:
         session.proxies = PROXY_DICT
-
-    # ---- Full browser-like headers ----
     session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,'
-                  'image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'User-Agent': USER_AGENT,
+        'Accept': '*/*',
         'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
         'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
-        'Cache-Control': 'max-age=0',
     })
-
-    # ---- Referer ----
     try:
         parsed = urlparse(url)
         session.headers['Referer'] = f"{parsed.scheme}://{parsed.netloc}/"
     except Exception:
         pass
 
-    # ---- Get total size & real filename ----
     total = 0
     try:
         head = session.head(url, allow_redirects=True, timeout=30)
@@ -300,7 +402,7 @@ def download_direct_file(url, task_id):
 
 
 # ============================================================
-# SINGLE VIDEO DOWNLOADER (yt-dlp)
+# YT-DLP DOWNLOADER
 # ============================================================
 def download_with_ytdlp(url, task_id, quality='best'):
     task = load_task(task_id)
@@ -567,7 +669,6 @@ def download_playlist(url, task_id, quality='best', range_start=1, range_end=0):
 
             task = load_task(task_id)
             if task and task.get('cancelled', False):
-                logger.info(f"Playlist {task_id} cancelled – killing yt-dlp")
                 kill_process(task_id)
                 raise DownloadCancelled("Cancelled by user")
 
@@ -594,9 +695,7 @@ def download_playlist(url, task_id, quality='best', range_start=1, range_end=0):
                 pct = float(pct_m.group(1))
                 total_m = RE_TOTAL.search(line)
                 if total_m:
-                    current_video_size = to_bytes(
-                        float(total_m.group(1)), total_m.group(2)
-                    )
+                    current_video_size = to_bytes(float(total_m.group(1)), total_m.group(2))
                 if current_video_size > 0:
                     current_video_downloaded = int(current_video_size * pct / 100)
 
@@ -671,11 +770,11 @@ def download_playlist(url, task_id, quality='best', range_start=1, range_end=0):
 
 
 # ============================================================
-# MAIN ENTRY (smart routing)
+# MAIN ENTRY — smart routing with HTML scraping fallback
 # ============================================================
 def process_url_download(task_id, url, quality='best', range_start=1, range_end=0):
-    logger.info(f"process_url_download: {task_id} → {url} (quality={quality}, "
-                f"range={range_start}-{range_end or 'end'})")
+    logger.info(f"process_url_download: {task_id} → {url} "
+                f"(quality={quality}, range={range_start}-{range_end or 'end'})")
     task = load_task(task_id)
     if not task:
         return
@@ -689,31 +788,92 @@ def process_url_download(task_id, url, quality='best', range_start=1, range_end=
 
         # ---- 2. Known video site or stream ----
         if needs_ytdlp(url):
-            logger.info("→ yt-dlp (known video site or stream)")
+            logger.info("→ yt-dlp (known video site / direct stream)")
             download_with_ytdlp(url, task_id, quality)
             return
 
-        # ---- 3. URL with a real file extension (pdf, zip, mp4, etc.) ----
+        # ---- 3. URL with a real file extension → direct download ----
         ext = _ext(url)
         if ext and ext not in VIDEO_STREAM_EXTS:
             logger.info(f"→ Direct file (extension: {ext})")
             download_direct_file(url, task_id)
             return
 
-        # ---- 4. Unknown URL – try yt-dlp first, fallback to direct ----
-        logger.info("→ Unknown URL – trying yt-dlp first")
+        # ---- 4. Unknown URL → multi-step fallback ----
+        logger.info("→ Unknown URL — trying yt-dlp first")
+
+        # Attempt A: yt-dlp directly
         try:
             download_with_ytdlp(url, task_id, quality)
+            return
         except Exception as ytdlp_err:
             err_text = str(ytdlp_err).lower()
-            if any(kw in err_text for kw in [
+            known_failures = [
                 'unsupported url', 'no suitable', 'not a valid url',
-                'unable to extract', 'no video formats', 'no video formats found'
-            ]):
-                logger.warning(f"yt-dlp can't handle it, falling back to direct: {ytdlp_err}")
-                download_direct_file(url, task_id)
-            else:
+                'unable to extract', 'no video formats', 'no video formats found',
+                'this video is not available', 'unable to download webpage',
+            ]
+            if not any(kw in err_text for kw in known_failures):
+                # Unknown failure — re-raise rather than silently scraping
                 raise
+            logger.warning(f"yt-dlp failed on the page. Trying HTML scrape. "
+                           f"Reason: {ytdlp_err}")
+
+        # Attempt B: scrape HTML → find video candidates
+        try:
+            html, final_url = _fetch_page_html(url)
+        except Exception as fetch_err:
+            logger.error(f"Could not fetch page HTML: {fetch_err}")
+            raise Exception(f"Could not load page: {fetch_err}")
+
+        candidates = _extract_video_candidates(html, final_url)
+        logger.info(f"Found {len(candidates)} candidate video URL(s):")
+        for c in candidates[:10]:
+            logger.info(f"  • {c[:100]}...")
+
+        # Save candidate list on the task for the user to see
+        task = load_task(task_id)
+        if task:
+            task['candidates'] = candidates[:20]
+            save_task(task_id, task)
+
+        if not candidates:
+            raise Exception(
+                "This page has no directly extractable video URL. "
+                "The video may be behind a player that requires JavaScript "
+                "or a login. Try uploading cookies via the browser extension, "
+                "or use the Video Extractor tab with yt-dlp enabled."
+            )
+
+        # Attempt B1: try each candidate with yt-dlp
+        last_err = None
+        for i, candidate in enumerate(candidates, 1):
+            try:
+                logger.info(f"→ Trying candidate {i}/{len(candidates)}: {candidate[:80]}")
+                download_with_ytdlp(candidate, task_id, quality)
+                return
+            except DownloadCancelled:
+                raise
+            except Exception as e:
+                logger.warning(f"Candidate {i} failed: {str(e)[:120]}")
+                last_err = e
+                continue
+
+        # Attempt B2: direct download fallback
+        for i, candidate in enumerate(candidates, 1):
+            try:
+                logger.info(f"→ Direct download attempt {i}: {candidate[:80]}")
+                download_direct_file(candidate, task_id)
+                return
+            except DownloadCancelled:
+                raise
+            except Exception as e:
+                logger.warning(f"Direct {i} failed: {str(e)[:120]}")
+                last_err = e
+                continue
+
+        raise Exception(f"All {len(candidates)} candidates failed. "
+                        f"Last error: {last_err}")
 
     except DownloadCancelled:
         task = load_task(task_id)
