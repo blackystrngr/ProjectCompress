@@ -244,9 +244,19 @@ if __name__ == '__main__':
     # Cleanup old terminal task files (older than 1 day)
     try:
         cleanup_old_tasks(max_age_seconds=86400)
-    except Exception as e:
+    except Exception as e: 
         logger.warning(f"cleanup_old_tasks failed: {e}")
 
+        # ---- Kill any orphan playwright/chromium from previous runs ----
+    try:
+        from features.url_download import _cleanup_playwright_processes
+        killed = _cleanup_playwright_processes(verbose=True)
+        if killed:
+            logger.warning(f"Startup: killed {killed} orphan browser process(es)")
+    except Exception as e:
+        logger.debug(f"Startup browser cleanup failed: {e}")
+
+    
     app = create_app()
     logger.info("Starting server on 0.0.0.0:5000")
     serve(
