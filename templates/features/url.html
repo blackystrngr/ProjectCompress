@@ -21,7 +21,7 @@
         </button>
     </div>
 
-    <!-- Playlist options (shown when playlist URL is pasted) -->
+    <!-- Playlist options -->
     <div id="playlistOptions" style="display: none; margin-top: 0.5rem; padding: 0.8rem;
          background: rgba(30, 40, 60, 0.5); border-radius: 1rem; border: 1px solid #2a3248;">
         <div style="font-size: 0.8rem; color: #7cc3ff; margin-bottom: 0.5rem;">
@@ -41,17 +41,15 @@
             <input type="number" id="rangeEnd" value="" min="1" placeholder="end"
                    style="width: 70px; padding: 4px 6px; background: #1e2438; color: white;
                           border: 1px solid #2a3248; border-radius: 6px;">
-            <span style="color: #8a9bc0; font-size: 0.75rem;">(leave end empty = until last)</span>
         </label>
     </div>
 
     <div class="help-text">
         <i class="fas fa-shield-alt"></i>
-        Unknown pages are sniffed via a headless browser to find the real video stream.
-        You'll be asked to pick the media before downloading.
+        Unknown pages are sniffed via a headless browser. You'll be asked to pick the media before downloading.
     </div>
 
-    <!-- ========== Media Chooser (VDH-style) ========== -->
+    <!-- ========== Media Chooser ========== -->
     <div id="mediaChooser" style="display:none; margin-top: 1rem; padding: 1rem;
          background: rgba(30, 40, 60, 0.6); border-radius: 1rem; border: 1px solid #3a5a9a;">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.6rem;">
@@ -68,6 +66,15 @@
     <!-- ========== Status ========== -->
     <div id="urlStatus" class="help-text" style="margin-top: 1rem;"></div>
     <div id="urlResult" class="empty-state" style="margin-top: 0.5rem;"></div>
+
+    <!-- Debug row -->
+    <div style="margin-top: 0.4rem; font-size: 0.7rem; color:#6b7280;">
+        Task: <span id="debugTaskId">—</span> · Status: <span id="debugStatus">—</span>
+        <button id="reloadTaskBtn" class="secondary"
+                style="padding:0.2rem 0.6rem; font-size:0.7rem; margin-left:0.4rem;">
+            <i class="fas fa-sync-alt"></i> Reload task
+        </button>
+    </div>
 
     <!-- ========== Torrent Upload ========== -->
     <div style="margin-top: 1.5rem;">
@@ -116,7 +123,9 @@
 </div>
 
 <script>
+// ============================================================
 // Helpers
+// ============================================================
 function escapeHtml(str) {
     if (!str) return '';
     return str.replace(/[&<>"]/g, function(m) {
@@ -136,12 +145,35 @@ function showToast(msg, isErr) {
 }
 
 // ============================================================
-// Playlist URL detection
+// Element refs
 // ============================================================
 const urlInput = document.getElementById('directUrl');
 const playlistOptions = document.getElementById('playlistOptions');
+const downloadBtn = document.getElementById('downloadUrlBtn');
+const formatSelect = document.getElementById('videoFormat');
+const uploadBtn = document.getElementById('uploadTorrentBtn');
+const torrentFileInput = document.getElementById('torrentFileUpload');
+const statusDiv = document.getElementById('urlStatus');
+const resultDiv = document.getElementById('urlResult');
+const mediaChooser = document.getElementById('mediaChooser');
+const mediaChooserList = document.getElementById('mediaChooserList');
+const cancelChooserBtn = document.getElementById('cancelChooserBtn');
+const debugTaskId = document.getElementById('debugTaskId');
+const debugStatus = document.getElementById('debugStatus');
+const reloadTaskBtn = document.getElementById('reloadTaskBtn');
+
+// ============================================================
+// State
+// ============================================================
+let currentTaskId = null;
+let pollInterval = null;
+let lastRenderedCandidateSig = null;  // avoid re-rendering chooser repeatedly
+
+// ============================================================
+// Playlist detection
+// ============================================================
 function isPlaylistURL(url) {
-    const lower = url.toLowerCase();
+    const lower = (url || '').toLowerCase();
     if (!(lower.includes('youtube.com') || lower.includes('youtu.be'))) return false;
     return lower.includes('list=') || lower.includes('/playlist')
         || lower.includes('/channel/') || lower.includes('/@')
@@ -152,101 +184,122 @@ urlInput.addEventListener('input', () => {
 });
 
 // ============================================================
-// State
-// ============================================================
-let currentTaskId = null;
-let pollInterval = null;
-
-const downloadBtn = document.getElementById('downloadUrlBtn');
-const formatSelect = document.getElementById('videoFormat');
-const uploadBtn = document.getElementById('uploadTorrentBtn');
-const torrentFileInput = document.getElementById('torrentFileUpload');
-const statusDiv = document.getElementById('urlStatus');
-const resultDiv = document.getElementById('urlResult');
-const mediaChooser = document.getElementById('mediaChooser');
-const mediaChooserList = document.getElementById('mediaChooserList');
-const cancelChooserBtn = document.getElementById('cancelChooserBtn');
-
-// ============================================================
 // Polling
 // ============================================================
 function startPollingForTask(taskId) {
+    if (!taskId) return;
+    currentTaskId = taskId;
+    localStorage.setItem('url_task_id', taskId);
+    debugTaskId.textContent = taskId.slice(0, 8);
     if (pollInterval) clearInterval(pollInterval);
-    pollInterval = setInterval(async () => {
-        if (document.hidden) return;
-        try {
-            const resp = await fetch(`/progress/${taskId}`);
-            if (resp.status === 404) {
-                clearInterval(pollInterval);
-                localStorage.removeItem('url_task_id');
-                statusDiv.innerHTML = '';
-                resultDiv.innerHTML = '';
-                return;
-            }
-            const task = await resp.json();
-            handleTaskUpdate(task);
-        } catch (err) {
-            console.error('Polling error:', err);
-        }
-    }, 2000);
+    // Poll immediately + every 2s
+    fetchTaskNow(taskId);
+    pollInterval = setInterval(() => fetchTaskNow(taskId), 2000);
 }
 
+async function fetchTaskNow(taskId) {
+    if (!taskId) return;
+    try {
+        const resp = await fetch(`/progress/${taskId}`);
+        if (resp.status === 404) {
+            if (pollInterval) clearInterval(pollInterval);
+            localStorage.removeItem('url_task_id');
+            debugStatus.textContent = 'not found';
+            return;
+        }
+        const task = await resp.json();
+        if (task.error) {
+            debugStatus.textContent = 'error';
+            return;
+        }
+        handleTaskUpdate(task);
+    } catch (err) {
+        console.error('Polling error:', err);
+    }
+}
+
+// ============================================================
+// Task renderer
+// ============================================================
 function handleTaskUpdate(task) {
+    const status = task.status || 'unknown';
+    debugStatus.textContent = status;
+
     const progress = task.download_progress || task.progress || 0;
     const speed = task.download_speed ? ` (${task.download_speed} kB/s)` : '';
 
-    // ---- AWAITING CHOICE STATE ----
-    if (task.status === 'awaiting_choice') {
-        showMediaChooser(task);
-        statusDiv.innerHTML = `<i class="fas fa-crosshairs"></i> ${task.candidates.length} stream(s) found — pick one below`;
+    // ---- AWAITING CHOICE → show chooser ----
+    if (status === 'awaiting_choice') {
+        const candidates = task.candidates || [];
+        // Only re-render if the candidate set actually changed
+        const sig = candidates.map(c => c.url).join('|');
+        if (sig !== lastRenderedCandidateSig) {
+            lastRenderedCandidateSig = sig;
+            showMediaChooser(task);
+        }
+        mediaChooser.style.display = 'block';
+        statusDiv.innerHTML = `<i class="fas fa-crosshairs"></i> ${candidates.length} stream(s) found — pick one below`;
         resultDiv.innerHTML = '';
         return;
     }
 
-    // ---- HIDE CHOOSER IF NOT CHOOSING ----
-    if (task.status !== 'awaiting_choice') {
-        mediaChooser.style.display = 'none';
-    }
+    // ---- Any other status → hide chooser ----
+    mediaChooser.style.display = 'none';
+    lastRenderedCandidateSig = null;
 
-    if (task.status === 'sniffing') {
-        statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Sniffing page for media streams... (this may take 30-60s)';
+    if (status === 'sniffing') {
+        statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Sniffing page for media streams... (may take up to 60s)';
         resultDiv.innerHTML = '<div class="empty-state">Looking for video streams in browser network traffic...</div>';
         return;
     }
 
-    if (task.status === 'done') {
+    if (status === 'done') {
         if (pollInterval) clearInterval(pollInterval);
-        statusDiv.innerHTML = `✅ Done! <a href="/download_file?path=${encodeURIComponent(task.output_file)}" target="_blank">Download</a>`;
-        resultDiv.innerHTML = `<div class="empty-state">✅ Ready: ${escapeHtml(task.output_file)}</div>`;
+        statusDiv.innerHTML = `✅ Done! <a href="/download_file?path=${encodeURIComponent(task.output_file || '')}" target="_blank">Download</a>`;
+        resultDiv.innerHTML = `<div class="empty-state">✅ Ready: ${escapeHtml(task.output_file || '')}</div>`;
         localStorage.removeItem('url_task_id');
         if (typeof fetchTasks === 'function') fetchTasks();
-    } else if (task.status === 'error') {
+        return;
+    }
+
+    if (status === 'error') {
         if (pollInterval) clearInterval(pollInterval);
         statusDiv.innerHTML = `<span style="color:#ff8a8a;">❌ Error: ${escapeHtml(task.error_msg || 'Unknown')}</span>`;
         resultDiv.innerHTML = '<div class="empty-state">Download failed.</div>';
         localStorage.removeItem('url_task_id');
-    } else if (task.status === 'cancelled') {
+        return;
+    }
+
+    if (status === 'cancelled') {
         if (pollInterval) clearInterval(pollInterval);
         statusDiv.innerHTML = '⛔ Cancelled.';
         resultDiv.innerHTML = '<div class="empty-state">Cancelled.</div>';
         localStorage.removeItem('url_task_id');
-    } else if (task.status === 'downloading_playlist') {
+        return;
+    }
+
+    if (status === 'downloading_playlist') {
         const cur = task.current_item || 0;
         const tot = task.total_items || 0;
         const title = task.current_title ? ` — ${escapeHtml(task.current_title)}` : '';
         statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> 📺 Playlist ${cur}/${tot}${title} (${progress}%)${speed}`;
         resultDiv.innerHTML = `<div class="empty-state">Downloading playlist... ${cur}/${tot}</div>`;
-    } else if (task.status === 'downloading') {
+        return;
+    }
+
+    if (status === 'downloading') {
         statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Downloading... ${progress}%${speed}`;
         resultDiv.innerHTML = `<div class="empty-state">Downloading (${progress}%)...</div>`;
-    } else {
-        statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${escapeHtml(task.status)}... ${progress}%`;
-        resultDiv.innerHTML = `<div class="empty-state">${escapeHtml(task.status)} (${progress}%)</div>`;
+        return;
     }
+
+    // Fallback
+    statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${escapeHtml(status)}... ${progress}%`;
+    resultDiv.innerHTML = `<div class="empty-state">${escapeHtml(status)} (${progress}%)</div>`;
 }
 
 // ============================================================
-// Media chooser UI
+// Media chooser
 // ============================================================
 function showMediaChooser(task) {
     const candidates = task.candidates || [];
@@ -254,8 +307,6 @@ function showMediaChooser(task) {
         mediaChooser.style.display = 'none';
         return;
     }
-    mediaChooser.style.display = 'block';
-
     let html = '';
     candidates.forEach((c, idx) => {
         const badge = c.is_thumbnail
@@ -298,6 +349,7 @@ function showMediaChooser(task) {
                 const data = await resp.json();
                 if (data.error) throw new Error(data.error);
                 mediaChooser.style.display = 'none';
+                lastRenderedCandidateSig = null;
                 statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Download starting...';
                 resultDiv.innerHTML = '<div class="empty-state">Please wait...</div>';
             } catch (err) {
@@ -319,6 +371,16 @@ cancelChooserBtn.onclick = async () => {
     } catch (err) {
         showToast(err.message, true);
     }
+};
+
+// Manual reload task button
+reloadTaskBtn.onclick = () => {
+    const id = currentTaskId || localStorage.getItem('url_task_id');
+    if (!id) {
+        showToast('No task to reload', true);
+        return;
+    }
+    fetchTaskNow(id);
 };
 
 // ============================================================
@@ -353,6 +415,7 @@ async function startDownload(url, format) {
 
         currentTaskId = data.task_id;
         localStorage.setItem('url_task_id', currentTaskId);
+        lastRenderedCandidateSig = null;
 
         mediaChooser.style.display = 'none';
         statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Started...';
@@ -399,7 +462,7 @@ uploadBtn.onclick = () => {
 };
 
 // ============================================================
-// Video Link Extractor (unchanged)
+// Video Link Extractor
 // ============================================================
 let currentExtractTaskId = null;
 let extractPollInterval = null;
@@ -495,7 +558,7 @@ function displayExtractedUrls(urls, combinedUrl) {
 }
 
 // ============================================================
-// Torrent Searcher (unchanged)
+// Torrent Searcher
 // ============================================================
 let searchTaskId = null;
 let searchPollInterval = null;
@@ -576,28 +639,49 @@ function displayTorrentResults(results) {
 }
 
 // ============================================================
-// Resume on page load
+// RESUME: on page load, tab focus, visibility change
 // ============================================================
-(function resumeTaskOnLoad() {
+async function resumeTaskIfAny() {
     const saved = localStorage.getItem('url_task_id');
     if (!saved) return;
-    fetch(`/progress/${saved}`)
-        .then(r => {
-            if (r.status === 404) {
-                localStorage.removeItem('url_task_id');
-                return null;
-            }
-            return r.json();
-        })
-        .then(task => {
-            if (!task) return;
-            if (task.status && !['done', 'error', 'cancelled'].includes(task.status)) {
-                currentTaskId = saved;
-                startPollingForTask(saved);
-            } else {
-                localStorage.removeItem('url_task_id');
-            }
-        })
-        .catch(() => localStorage.removeItem('url_task_id'));
-})();
+    try {
+        const resp = await fetch(`/progress/${saved}`);
+        if (resp.status === 404) {
+            localStorage.removeItem('url_task_id');
+            return;
+        }
+        const task = await resp.json();
+        if (!task || task.error) return;
+
+        // If task is finished → clean up
+        if (['done', 'error', 'cancelled'].includes(task.status)) {
+            // Leave the ID so a fresh page load shows the final state once more? No — clean up.
+            localStorage.removeItem('url_task_id');
+            return;
+        }
+
+        // Otherwise → resume polling
+        currentTaskId = saved;
+        startPollingForTask(saved);
+    } catch (e) {
+        // Network error — keep the ID, will retry on next focus
+        console.warn('Resume failed:', e);
+    }
+}
+
+// Run on load
+resumeTaskIfAny();
+
+// Run whenever the tab becomes visible again
+document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) resumeTaskIfAny();
+});
+
+// Also when the window regains focus (belt and suspenders)
+window.addEventListener('focus', resumeTaskIfAny);
+
+// Clean interval when leaving (avoid runaway timers)
+window.addEventListener('beforeunload', () => {
+    if (pollInterval) clearInterval(pollInterval);
+});
 </script>
