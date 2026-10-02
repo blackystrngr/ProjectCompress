@@ -143,31 +143,43 @@ function showToast(msg, isErr) {
         alert((isErr ? 'Error: ' : '') + msg);
     }
 }
+function dbg(...args) {
+    console.log('[URLDownload]', ...args);
+}
 
 // ============================================================
-// Element refs
+// Element refs (with null safety)
 // ============================================================
-const urlInput = document.getElementById('directUrl');
-const playlistOptions = document.getElementById('playlistOptions');
-const downloadBtn = document.getElementById('downloadUrlBtn');
-const formatSelect = document.getElementById('videoFormat');
-const uploadBtn = document.getElementById('uploadTorrentBtn');
-const torrentFileInput = document.getElementById('torrentFileUpload');
-const statusDiv = document.getElementById('urlStatus');
-const resultDiv = document.getElementById('urlResult');
-const mediaChooser = document.getElementById('mediaChooser');
-const mediaChooserList = document.getElementById('mediaChooserList');
-const cancelChooserBtn = document.getElementById('cancelChooserBtn');
-const debugTaskId = document.getElementById('debugTaskId');
-const debugStatus = document.getElementById('debugStatus');
-const reloadTaskBtn = document.getElementById('reloadTaskBtn');
+const $ = (id) => document.getElementById(id);
+
+const urlInput = $('directUrl');
+const playlistOptions = $('playlistOptions');
+const downloadBtn = $('downloadUrlBtn');
+const formatSelect = $('videoFormat');
+const uploadBtn = $('uploadTorrentBtn');
+const torrentFileInput = $('torrentFileUpload');
+const statusDiv = $('urlStatus');
+const resultDiv = $('urlResult');
+const mediaChooser = $('mediaChooser');
+const mediaChooserList = $('mediaChooserList');
+const cancelChooserBtn = $('cancelChooserBtn');
+const debugTaskId = $('debugTaskId');
+const debugStatus = $('debugStatus');
+const reloadTaskBtn = $('reloadTaskBtn');
+
+dbg('Initializing. Elements found:', {
+    urlInput: !!urlInput,
+    downloadBtn: !!downloadBtn,
+    mediaChooser: !!mediaChooser,
+    debugTaskId: !!debugTaskId,
+});
 
 // ============================================================
 // State
 // ============================================================
 let currentTaskId = null;
 let pollInterval = null;
-let lastRenderedCandidateSig = null;  // avoid re-rendering chooser repeatedly
+let lastRenderedCandidateSig = null;
 
 // ============================================================
 // Playlist detection
@@ -179,20 +191,28 @@ function isPlaylistURL(url) {
         || lower.includes('/channel/') || lower.includes('/@')
         || lower.includes('/c/') || lower.includes('/user/');
 }
-urlInput.addEventListener('input', () => {
-    playlistOptions.style.display = isPlaylistURL(urlInput.value) ? 'block' : 'none';
-});
+if (urlInput) {
+    urlInput.addEventListener('input', () => {
+        if (playlistOptions) {
+            playlistOptions.style.display = isPlaylistURL(urlInput.value) ? 'block' : 'none';
+        }
+    });
+}
 
 // ============================================================
 // Polling
 // ============================================================
 function startPollingForTask(taskId) {
-    if (!taskId) return;
+    if (!taskId) {
+        dbg('startPollingForTask called with empty taskId');
+        return;
+    }
     currentTaskId = taskId;
-    localStorage.setItem('url_task_id', taskId);
-    debugTaskId.textContent = taskId.slice(0, 8);
+    try { localStorage.setItem('url_task_id', taskId); } catch (e) {}
+    if (debugTaskId) debugTaskId.textContent = String(taskId).slice(0, 8);
+    dbg('Started polling for task', taskId);
+
     if (pollInterval) clearInterval(pollInterval);
-    // Poll immediately + every 2s
     fetchTaskNow(taskId);
     pollInterval = setInterval(() => fetchTaskNow(taskId), 2000);
 }
@@ -202,19 +222,20 @@ async function fetchTaskNow(taskId) {
     try {
         const resp = await fetch(`/progress/${taskId}`);
         if (resp.status === 404) {
+            dbg('Task not found (404):', taskId);
             if (pollInterval) clearInterval(pollInterval);
-            localStorage.removeItem('url_task_id');
-            debugStatus.textContent = 'not found';
+            try { localStorage.removeItem('url_task_id'); } catch (e) {}
+            if (debugStatus) debugStatus.textContent = 'not found';
             return;
         }
         const task = await resp.json();
-        if (task.error) {
-            debugStatus.textContent = 'error';
+        if (!task || task.error) {
+            dbg('Task response error:', task);
             return;
         }
         handleTaskUpdate(task);
     } catch (err) {
-        console.error('Polling error:', err);
+        console.error('[URLDownload] Polling error:', err);
     }
 }
 
@@ -222,89 +243,99 @@ async function fetchTaskNow(taskId) {
 // Task renderer
 // ============================================================
 function handleTaskUpdate(task) {
-    const status = task.status || 'unknown';
-    debugStatus.textContent = status;
+    try {
+        const status = task.status || 'unknown';
+        if (debugStatus) debugStatus.textContent = status;
 
-    const progress = task.download_progress || task.progress || 0;
-    const speed = task.download_speed ? ` (${task.download_speed} kB/s)` : '';
+        const progress = task.download_progress || task.progress || 0;
+        const speed = task.download_speed ? ` (${task.download_speed} kB/s)` : '';
 
-    // ---- AWAITING CHOICE → show chooser ----
-    if (status === 'awaiting_choice') {
-        const candidates = task.candidates || [];
-        // Only re-render if the candidate set actually changed
-        const sig = candidates.map(c => c.url).join('|');
-        if (sig !== lastRenderedCandidateSig) {
-            lastRenderedCandidateSig = sig;
-            showMediaChooser(task);
+        dbg('Task update:', status, 'progress:', progress, 'candidates:', (task.candidates || []).length);
+
+        // ---- AWAITING CHOICE → show chooser ----
+        if (status === 'awaiting_choice') {
+            const candidates = task.candidates || [];
+            const sig = candidates.map(c => c.url).join('|');
+            if (sig !== lastRenderedCandidateSig) {
+                lastRenderedCandidateSig = sig;
+                showMediaChooser(task);
+            }
+            if (mediaChooser) mediaChooser.style.display = 'block';
+            if (statusDiv) statusDiv.innerHTML = `<i class="fas fa-crosshairs"></i> ${candidates.length} stream(s) found — pick one below`;
+            if (resultDiv) resultDiv.innerHTML = '';
+            return;
         }
-        mediaChooser.style.display = 'block';
-        statusDiv.innerHTML = `<i class="fas fa-crosshairs"></i> ${candidates.length} stream(s) found — pick one below`;
-        resultDiv.innerHTML = '';
-        return;
+
+        // ---- Any other status → hide chooser ----
+        if (mediaChooser) mediaChooser.style.display = 'none';
+        lastRenderedCandidateSig = null;
+
+        if (status === 'sniffing') {
+            if (statusDiv) statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Sniffing page for media streams... (may take up to 60s)';
+            if (resultDiv) resultDiv.innerHTML = '<div class="empty-state">Looking for video streams in browser network traffic...</div>';
+            return;
+        }
+
+        if (status === 'done') {
+            if (pollInterval) clearInterval(pollInterval);
+            if (statusDiv) statusDiv.innerHTML = `✅ Done! <a href="/download_file?path=${encodeURIComponent(task.output_file || '')}" target="_blank">Download</a>`;
+            if (resultDiv) resultDiv.innerHTML = `<div class="empty-state">✅ Ready: ${escapeHtml(task.output_file || '')}</div>`;
+            try { localStorage.removeItem('url_task_id'); } catch (e) {}
+            if (typeof fetchTasks === 'function') fetchTasks();
+            return;
+        }
+
+        if (status === 'error') {
+            if (pollInterval) clearInterval(pollInterval);
+            if (statusDiv) statusDiv.innerHTML = `<span style="color:#ff8a8a;">❌ Error: ${escapeHtml(task.error_msg || 'Unknown')}</span>`;
+            if (resultDiv) resultDiv.innerHTML = '<div class="empty-state">Download failed.</div>';
+            try { localStorage.removeItem('url_task_id'); } catch (e) {}
+            return;
+        }
+
+        if (status === 'cancelled') {
+            if (pollInterval) clearInterval(pollInterval);
+            if (statusDiv) statusDiv.innerHTML = '⛔ Cancelled.';
+            if (resultDiv) resultDiv.innerHTML = '<div class="empty-state">Cancelled.</div>';
+            try { localStorage.removeItem('url_task_id'); } catch (e) {}
+            return;
+        }
+
+        if (status === 'downloading_playlist') {
+            const cur = task.current_item || 0;
+            const tot = task.total_items || 0;
+            const title = task.current_title ? ` — ${escapeHtml(task.current_title)}` : '';
+            if (statusDiv) statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> 📺 Playlist ${cur}/${tot}${title} (${progress}%)${speed}`;
+            if (resultDiv) resultDiv.innerHTML = `<div class="empty-state">Downloading playlist... ${cur}/${tot}</div>`;
+            return;
+        }
+
+        if (status === 'downloading') {
+            if (statusDiv) statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Downloading... ${progress}%${speed}`;
+            if (resultDiv) resultDiv.innerHTML = `<div class="empty-state">Downloading (${progress}%)...</div>`;
+            return;
+        }
+
+        // Fallback
+        if (statusDiv) statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${escapeHtml(status)}... ${progress}%`;
+        if (resultDiv) resultDiv.innerHTML = `<div class="empty-state">${escapeHtml(status)} (${progress}%)</div>`;
+    } catch (err) {
+        console.error('[URLDownload] handleTaskUpdate error:', err);
     }
-
-    // ---- Any other status → hide chooser ----
-    mediaChooser.style.display = 'none';
-    lastRenderedCandidateSig = null;
-
-    if (status === 'sniffing') {
-        statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Sniffing page for media streams... (may take up to 60s)';
-        resultDiv.innerHTML = '<div class="empty-state">Looking for video streams in browser network traffic...</div>';
-        return;
-    }
-
-    if (status === 'done') {
-        if (pollInterval) clearInterval(pollInterval);
-        statusDiv.innerHTML = `✅ Done! <a href="/download_file?path=${encodeURIComponent(task.output_file || '')}" target="_blank">Download</a>`;
-        resultDiv.innerHTML = `<div class="empty-state">✅ Ready: ${escapeHtml(task.output_file || '')}</div>`;
-        localStorage.removeItem('url_task_id');
-        if (typeof fetchTasks === 'function') fetchTasks();
-        return;
-    }
-
-    if (status === 'error') {
-        if (pollInterval) clearInterval(pollInterval);
-        statusDiv.innerHTML = `<span style="color:#ff8a8a;">❌ Error: ${escapeHtml(task.error_msg || 'Unknown')}</span>`;
-        resultDiv.innerHTML = '<div class="empty-state">Download failed.</div>';
-        localStorage.removeItem('url_task_id');
-        return;
-    }
-
-    if (status === 'cancelled') {
-        if (pollInterval) clearInterval(pollInterval);
-        statusDiv.innerHTML = '⛔ Cancelled.';
-        resultDiv.innerHTML = '<div class="empty-state">Cancelled.</div>';
-        localStorage.removeItem('url_task_id');
-        return;
-    }
-
-    if (status === 'downloading_playlist') {
-        const cur = task.current_item || 0;
-        const tot = task.total_items || 0;
-        const title = task.current_title ? ` — ${escapeHtml(task.current_title)}` : '';
-        statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> 📺 Playlist ${cur}/${tot}${title} (${progress}%)${speed}`;
-        resultDiv.innerHTML = `<div class="empty-state">Downloading playlist... ${cur}/${tot}</div>`;
-        return;
-    }
-
-    if (status === 'downloading') {
-        statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Downloading... ${progress}%${speed}`;
-        resultDiv.innerHTML = `<div class="empty-state">Downloading (${progress}%)...</div>`;
-        return;
-    }
-
-    // Fallback
-    statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${escapeHtml(status)}... ${progress}%`;
-    resultDiv.innerHTML = `<div class="empty-state">${escapeHtml(status)} (${progress}%)</div>`;
 }
 
 // ============================================================
 // Media chooser
 // ============================================================
 function showMediaChooser(task) {
+    if (!mediaChooserList) {
+        dbg('mediaChooserList element not found!');
+        return;
+    }
     const candidates = task.candidates || [];
+    dbg('Rendering media chooser with', candidates.length, 'candidates');
     if (!candidates.length) {
-        mediaChooser.style.display = 'none';
+        if (mediaChooser) mediaChooser.style.display = 'none';
         return;
     }
     let html = '';
@@ -348,10 +379,10 @@ function showMediaChooser(task) {
                 const resp = await fetch('/choose_media', { method: 'POST', body });
                 const data = await resp.json();
                 if (data.error) throw new Error(data.error);
-                mediaChooser.style.display = 'none';
+                if (mediaChooser) mediaChooser.style.display = 'none';
                 lastRenderedCandidateSig = null;
-                statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Download starting...';
-                resultDiv.innerHTML = '<div class="empty-state">Please wait...</div>';
+                if (statusDiv) statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Download starting...';
+                if (resultDiv) resultDiv.innerHTML = '<div class="empty-state">Please wait...</div>';
             } catch (err) {
                 showToast(err.message, true);
                 btn.disabled = false;
@@ -361,33 +392,39 @@ function showMediaChooser(task) {
     });
 }
 
-cancelChooserBtn.onclick = async () => {
-    if (!currentTaskId) return;
-    try {
-        await fetch(`/cancel/${currentTaskId}`, { method: 'POST' });
-        mediaChooser.style.display = 'none';
-        statusDiv.innerHTML = '⛔ Cancelled.';
-        if (pollInterval) clearInterval(pollInterval);
-    } catch (err) {
-        showToast(err.message, true);
-    }
-};
+if (cancelChooserBtn) {
+    cancelChooserBtn.onclick = async () => {
+        if (!currentTaskId) return;
+        try {
+            await fetch(`/cancel/${currentTaskId}`, { method: 'POST' });
+            if (mediaChooser) mediaChooser.style.display = 'none';
+            if (statusDiv) statusDiv.innerHTML = '⛔ Cancelled.';
+            if (pollInterval) clearInterval(pollInterval);
+        } catch (err) {
+            showToast(err.message, true);
+        }
+    };
+}
 
-// Manual reload task button
-reloadTaskBtn.onclick = () => {
-    const id = currentTaskId || localStorage.getItem('url_task_id');
-    if (!id) {
-        showToast('No task to reload', true);
-        return;
-    }
-    fetchTaskNow(id);
-};
+if (reloadTaskBtn) {
+    reloadTaskBtn.onclick = () => {
+        const id = currentTaskId || (localStorage.getItem('url_task_id'));
+        dbg('Reload task button clicked. ID:', id);
+        if (!id) {
+            showToast('No task to reload', true);
+            return;
+        }
+        if (!currentTaskId) currentTaskId = id;
+        fetchTaskNow(id);
+    };
+}
 
 // ============================================================
 // Start download
 // ============================================================
 async function startDownload(url, format) {
     try {
+        dbg('startDownload called with url:', url, 'format:', format);
         const formData = new URLSearchParams();
         formData.append('url', url);
         if (format) {
@@ -410,88 +447,108 @@ async function startDownload(url, format) {
             headers: {'Content-Type': 'application/x-www-form-urlencoded'},
             body: formData
         });
-        const data = await resp.json();
-        if (data.error) throw new Error(data.error);
+        dbg('Response status:', resp.status);
+        const rawText = await resp.text();
+        dbg('Raw response text:', rawText);
+        let data;
+        try {
+            data = JSON.parse(rawText);
+        } catch (e) {
+            throw new Error('Server returned non-JSON: ' + rawText.slice(0, 200));
+        }
+        if (!data || data.error) throw new Error((data && data.error) || 'No task_id in response');
+        if (!data.task_id) throw new Error('No task_id in response: ' + JSON.stringify(data));
 
+        dbg('Got task_id:', data.task_id);
         currentTaskId = data.task_id;
-        localStorage.setItem('url_task_id', currentTaskId);
+        try { localStorage.setItem('url_task_id', currentTaskId); } catch (e) {}
+        if (debugTaskId) debugTaskId.textContent = String(currentTaskId).slice(0, 8);
         lastRenderedCandidateSig = null;
 
-        mediaChooser.style.display = 'none';
-        statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Started...';
-        resultDiv.innerHTML = '<div class="empty-state">Please wait...</div>';
+        if (mediaChooser) mediaChooser.style.display = 'none';
+        if (statusDiv) statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Started...';
+        if (resultDiv) resultDiv.innerHTML = '<div class="empty-state">Please wait...</div>';
 
         startPollingForTask(currentTaskId);
         if (typeof fetchTasks === 'function') fetchTasks();
     } catch (err) {
+        console.error('[URLDownload] startDownload error:', err);
         showToast(err.message, true);
     }
 }
 
-downloadBtn.onclick = () => {
-    const url = urlInput.value.trim();
-    if (!url) { showToast('Enter a URL', true); return; }
-    const format = formatSelect ? formatSelect.value : '1080p';
-    startDownload(url, format);
-};
+if (downloadBtn) {
+    downloadBtn.onclick = () => {
+        const url = urlInput.value.trim();
+        if (!url) { showToast('Enter a URL', true); return; }
+        const format = formatSelect ? formatSelect.value : '1080p';
+        startDownload(url, format);
+    };
+}
 
-urlInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); downloadBtn.click(); }
-});
+if (urlInput) {
+    urlInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); if (downloadBtn) downloadBtn.click(); }
+    });
+}
 
 // ============================================================
 // Torrent upload
 // ============================================================
-uploadBtn.onclick = () => {
-    const file = torrentFileInput.files[0];
-    if (!file) { showToast('Select a .torrent file', true); return; }
-    const formData = new FormData();
-    formData.append('torrent_file', file);
-    fetch('/start_upload_torrent', { method: 'POST', body: formData })
-        .then(resp => resp.json())
-        .then(data => {
-            if (data.error) throw new Error(data.error);
-            currentTaskId = data.task_id;
-            localStorage.setItem('url_task_id', currentTaskId);
-            statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Torrent download started...';
-            resultDiv.innerHTML = '<div class="empty-state">Please wait...</div>';
-            startPollingForTask(currentTaskId);
-            if (typeof fetchTasks === 'function') fetchTasks();
-        })
-        .catch(err => showToast(err.message, true));
-};
+if (uploadBtn) {
+    uploadBtn.onclick = () => {
+        const file = torrentFileInput.files[0];
+        if (!file) { showToast('Select a .torrent file', true); return; }
+        const formData = new FormData();
+        formData.append('torrent_file', file);
+        fetch('/start_upload_torrent', { method: 'POST', body: formData })
+            .then(resp => resp.json())
+            .then(data => {
+                if (data.error) throw new Error(data.error);
+                currentTaskId = data.task_id;
+                try { localStorage.setItem('url_task_id', currentTaskId); } catch (e) {}
+                if (statusDiv) statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Torrent download started...';
+                if (resultDiv) resultDiv.innerHTML = '<div class="empty-state">Please wait...</div>';
+                startPollingForTask(currentTaskId);
+                if (typeof fetchTasks === 'function') fetchTasks();
+            })
+            .catch(err => showToast(err.message, true));
+    };
+}
 
 // ============================================================
 // Video Link Extractor
 // ============================================================
 let currentExtractTaskId = null;
 let extractPollInterval = null;
-const extractBtn = document.getElementById('extractBtn');
-const extractorUrlInput = document.getElementById('extractorUrl');
-const ytdlpCheckbox = document.getElementById('useYtdlpCheckbox');
-const extractStatusDiv = document.getElementById('extractStatus');
-const extractResultsDiv = document.getElementById('extractResults');
+const extractBtn = $('extractBtn');
+const extractorUrlInput = $('extractorUrl');
+const ytdlpCheckbox = $('useYtdlpCheckbox');
+const extractStatusDiv = $('extractStatus');
+const extractResultsDiv = $('extractResults');
 
-extractBtn.onclick = async () => {
-    let url = extractorUrlInput.value.trim();
-    if (!url) { showToast('Enter a webpage URL', true); return; }
-    if (!url.startsWith('http')) url = 'https://' + url;
-    const useYtdlp = ytdlpCheckbox.checked;
-    try {
-        const resp = await fetch('/extract/fetch', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: `url=${encodeURIComponent(url)}&use_ytdlp=${useYtdlp}`
-        });
-        const data = await resp.json();
-        if (data.error) throw new Error(data.error);
-        currentExtractTaskId = data.task_id;
-        extractStatusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Extracting...`;
-        extractResultsDiv.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-pulse"></i> Please wait...</div>';
-        if (extractPollInterval) clearInterval(extractPollInterval);
-        extractPollInterval = setInterval(pollExtractTask, 1500);
-    } catch (err) { showToast(err.message, true); }
-};
+if (extractBtn) {
+    extractBtn.onclick = async () => {
+        let url = extractorUrlInput.value.trim();
+        if (!url) { showToast('Enter a webpage URL', true); return; }
+        if (!url.startsWith('http')) url = 'https://' + url;
+        const useYtdlp = ytdlpCheckbox.checked;
+        try {
+            const resp = await fetch('/extract/fetch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: `url=${encodeURIComponent(url)}&use_ytdlp=${useYtdlp}`
+            });
+            const data = await resp.json();
+            if (data.error) throw new Error(data.error);
+            currentExtractTaskId = data.task_id;
+            if (extractStatusDiv) extractStatusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Extracting...`;
+            if (extractResultsDiv) extractResultsDiv.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-pulse"></i> Please wait...</div>';
+            if (extractPollInterval) clearInterval(extractPollInterval);
+            extractPollInterval = setInterval(pollExtractTask, 1500);
+        } catch (err) { showToast(err.message, true); }
+    };
+}
 
 async function pollExtractTask() {
     if (!currentExtractTaskId) return;
@@ -500,25 +557,26 @@ async function pollExtractTask() {
         const data = await resp.json();
         if (data.error) {
             clearInterval(extractPollInterval);
-            extractStatusDiv.innerHTML = `<span style="color:#ff8a8a;">Error: ${escapeHtml(data.error)}</span>`;
-            extractResultsDiv.innerHTML = '<div class="empty-state">Extraction failed.</div>';
+            if (extractStatusDiv) extractStatusDiv.innerHTML = `<span style="color:#ff8a8a;">Error: ${escapeHtml(data.error)}</span>`;
+            if (extractResultsDiv) extractResultsDiv.innerHTML = '<div class="empty-state">Extraction failed.</div>';
             return;
         }
         if (data.status === 'done') {
             clearInterval(extractPollInterval);
             displayExtractedUrls(data.video_urls, data.combined_url);
-            extractStatusDiv.innerHTML = `✅ Found ${data.count} URL(s).`;
+            if (extractStatusDiv) extractStatusDiv.innerHTML = `✅ Found ${data.count} URL(s).`;
         } else if (data.status === 'error') {
             clearInterval(extractPollInterval);
-            extractStatusDiv.innerHTML = `<span style="color:#ff8a8a;">❌ Error: ${escapeHtml(data.error_msg)}</span>`;
-            extractResultsDiv.innerHTML = '<div class="empty-state">Extraction failed.</div>';
+            if (extractStatusDiv) extractStatusDiv.innerHTML = `<span style="color:#ff8a8a;">❌ Error: ${escapeHtml(data.error_msg)}</span>`;
+            if (extractResultsDiv) extractResultsDiv.innerHTML = '<div class="empty-state">Extraction failed.</div>';
         } else {
-            extractStatusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Processing...`;
+            if (extractStatusDiv) extractStatusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Processing...`;
         }
     } catch (err) { console.error(err); }
 }
 
 function displayExtractedUrls(urls, combinedUrl) {
+    if (!extractResultsDiv) return;
     if (!urls || !urls.length) {
         extractResultsDiv.innerHTML = '<div class="empty-state">No direct video URLs found.</div>';
         return;
@@ -562,29 +620,31 @@ function displayExtractedUrls(urls, combinedUrl) {
 // ============================================================
 let searchTaskId = null;
 let searchPollInterval = null;
-const searchBtn = document.getElementById('searchTorrentsBtn');
-const queryInput = document.getElementById('torrentQuery');
-const searchStatusDiv = document.getElementById('torrentSearchStatus');
-const searchResultsDiv = document.getElementById('torrentSearchResults');
+const searchBtn = $('searchTorrentsBtn');
+const queryInput = $('torrentQuery');
+const searchStatusDiv = $('torrentSearchStatus');
+const searchResultsDiv = $('torrentSearchResults');
 
-searchBtn.onclick = async () => {
-    const query = queryInput.value.trim();
-    if (!query) { showToast('Enter search query', true); return; }
-    try {
-        const resp = await fetch('/torrent_search', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-            body: `query=${encodeURIComponent(query)}`
-        });
-        const data = await resp.json();
-        if (data.error) throw new Error(data.error);
-        searchTaskId = data.task_id;
-        searchStatusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Searching torrents...';
-        searchResultsDiv.innerHTML = '<div class="empty-state">Searching...</div>';
-        if (searchPollInterval) clearInterval(searchPollInterval);
-        searchPollInterval = setInterval(pollTorrentSearch, 2000);
-    } catch (err) { showToast(err.message, true); }
-};
+if (searchBtn) {
+    searchBtn.onclick = async () => {
+        const query = queryInput.value.trim();
+        if (!query) { showToast('Enter search query', true); return; }
+        try {
+            const resp = await fetch('/torrent_search', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: `query=${encodeURIComponent(query)}`
+            });
+            const data = await resp.json();
+            if (data.error) throw new Error(data.error);
+            searchTaskId = data.task_id;
+            if (searchStatusDiv) searchStatusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Searching torrents...';
+            if (searchResultsDiv) searchResultsDiv.innerHTML = '<div class="empty-state">Searching...</div>';
+            if (searchPollInterval) clearInterval(searchPollInterval);
+            searchPollInterval = setInterval(pollTorrentSearch, 2000);
+        } catch (err) { showToast(err.message, true); }
+    };
+}
 
 async function pollTorrentSearch() {
     if (!searchTaskId) return;
@@ -592,22 +652,23 @@ async function pollTorrentSearch() {
     const task = await resp.json();
     if (task.error) {
         clearInterval(searchPollInterval);
-        searchStatusDiv.innerHTML = `<span style="color:#ff8a8a;">Error: ${escapeHtml(task.error)}</span>`;
+        if (searchStatusDiv) searchStatusDiv.innerHTML = `<span style="color:#ff8a8a;">Error: ${escapeHtml(task.error)}</span>`;
         return;
     }
     if (task.status === 'search_done') {
         clearInterval(searchPollInterval);
         displayTorrentResults(task.results || []);
-        searchStatusDiv.innerHTML = `✅ Found ${(task.results || []).length} results.`;
+        if (searchStatusDiv) searchStatusDiv.innerHTML = `✅ Found ${(task.results || []).length} results.`;
     } else if (task.status === 'error') {
         clearInterval(searchPollInterval);
-        searchStatusDiv.innerHTML = `<span style="color:#ff8a8a;">❌ Error: ${escapeHtml(task.error_msg)}</span>`;
+        if (searchStatusDiv) searchStatusDiv.innerHTML = `<span style="color:#ff8a8a;">❌ Error: ${escapeHtml(task.error_msg)}</span>`;
     } else {
-        searchStatusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${escapeHtml(task.status)}...`;
+        if (searchStatusDiv) searchStatusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${escapeHtml(task.status)}...`;
     }
 }
 
 function displayTorrentResults(results) {
+    if (!searchResultsDiv) return;
     if (!results.length) {
         searchResultsDiv.innerHTML = '<div class="empty-state">No results found.</div>';
         return;
@@ -639,48 +700,39 @@ function displayTorrentResults(results) {
 }
 
 // ============================================================
-// RESUME: on page load, tab focus, visibility change
+// Resume on page load / tab focus / visibility change
 // ============================================================
 async function resumeTaskIfAny() {
-    const saved = localStorage.getItem('url_task_id');
-    if (!saved) return;
+    let saved;
+    try { saved = localStorage.getItem('url_task_id'); } catch (e) { return; }
+    if (!saved || saved === 'undefined' || saved === 'null') {
+        if (saved) { try { localStorage.removeItem('url_task_id'); } catch (e) {} }
+        return;
+    }
     try {
         const resp = await fetch(`/progress/${saved}`);
         if (resp.status === 404) {
-            localStorage.removeItem('url_task_id');
+            try { localStorage.removeItem('url_task_id'); } catch (e) {}
             return;
         }
         const task = await resp.json();
         if (!task || task.error) return;
-
-        // If task is finished → clean up
         if (['done', 'error', 'cancelled'].includes(task.status)) {
-            // Leave the ID so a fresh page load shows the final state once more? No — clean up.
-            localStorage.removeItem('url_task_id');
+            try { localStorage.removeItem('url_task_id'); } catch (e) {}
             return;
         }
-
-        // Otherwise → resume polling
+        dbg('Resuming task from localStorage:', saved, 'status:', task.status);
         currentTaskId = saved;
         startPollingForTask(saved);
     } catch (e) {
-        // Network error — keep the ID, will retry on next focus
-        console.warn('Resume failed:', e);
+        console.warn('[URLDownload] Resume failed:', e);
     }
 }
 
-// Run on load
 resumeTaskIfAny();
-
-// Run whenever the tab becomes visible again
-document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) resumeTaskIfAny();
-});
-
-// Also when the window regains focus (belt and suspenders)
+document.addEventListener('visibilitychange', () => { if (!document.hidden) resumeTaskIfAny(); });
 window.addEventListener('focus', resumeTaskIfAny);
 
-// Clean interval when leaving (avoid runaway timers)
 window.addEventListener('beforeunload', () => {
     if (pollInterval) clearInterval(pollInterval);
 });
