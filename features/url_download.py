@@ -1,20 +1,29 @@
 """
 url_download.py
 ===============
-Universal downloader with noise-free network sniffing + user media selection.
+Universal downloader + smart video cracker with VDH-style network sniffing.
 
-Strategies:
-  1. Direct file URL  → download immediately
-  2. Known video site → yt-dlp
-  3. Playlist         → yt-dlp with resume
-  4. Torrent          → libtorrent
-  5. Unknown page     → yt-dlp --get-url
-                        ├─ Success → download the URL
-                        └─ Failure → network sniff (VDH-style, leak-proof,
-                                     ad-filtered, duration-ranked)
-                                    → return candidates
-                                    → wait for user choice
-                                    → download chosen media
+Handles:
+  - Direct file URLs (.mp4, .pdf, .zip, etc.)
+  - yt-dlp supported sites (YouTube, Vimeo, TikTok, etc.)
+  - Playlists with resume
+  - Torrents (magnet + .torrent)
+  - Any media page via 15-strategy video cracking:
+      1.  Direct URL detection
+      2.  yt-dlp --get-url (native site extractors)
+      3.  HTML tags (<video>, <source>, <object>, <embed>)
+      4.  Meta tags (og:video, twitter:player, schema.org)
+      5.  JSON-LD (contentUrl, embedUrl)
+      6.  JSON script blocks (Next.js __NEXT_DATA__, Vidsonic)
+      7.  Player configs (Plyr, Video.js, JW Player, DPlayer, etc.)
+      8.  Inline JS patterns
+      9.  Obfuscated payloads (Base64, hex, packed, ROT13)
+      10. Raw URL regex anywhere
+      11. Known streaming hosts (Lulustream, Doodstream, etc.)
+      12. Iframes (recursive)
+      13. API endpoint guessing (Vidsonic, Vixeo, Doodstream, etc.)
+      14. ** Network sniffing with Playwright (Video DownloadHelper style) **
+      15. Output verification via ffprobe
 """
 
 import os
@@ -23,6 +32,8 @@ import sys
 import json
 import uuid
 import time
+import base64
+import asyncio
 import threading
 import logging
 import hashlib
@@ -31,7 +42,7 @@ import subprocess
 import shutil
 import signal
 from urllib.parse import urlparse, unquote, parse_qs, urljoin
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from flask import request, jsonify
 from tasks import save_task, load_task
@@ -42,6 +53,7 @@ try:
 except ImportError:
     BeautifulSoup = None
 
+# ---- Playwright is optional ----
 try:
     from playwright.sync_api import sync_playwright
     PLAYWRIGHT_AVAILABLE = True
@@ -98,7 +110,6 @@ SKIP_PATTERNS = [
     '.css', '.woff', '.woff2', '.ttf', '.eot', '.otf',
     '.js', '.mjs', '.jsx', '.map', '.ts',
     '.html', '.htm', '.php', '.aspx', '.jsp',
-    '.riv', '.webmanifest', '.json',
     'google-analytics', 'googletagmanager', 'gtag/js',
     'facebook.com/tr', 'plausible.', 'doubleclick',
     'analytics.', '/ads/', 'adservice', 'beacon',
@@ -109,23 +120,7 @@ SKIP_PATTERNS = [
     'pa-', 'gtm.', 'fbevents',
 ]
 
-# Ad CDNs and known junk hosts — reject these URLs at capture time
-AD_DOMAINS = [
-    'bxcdn.net',
-    'doubleclick.net',
-    'googlesyndication',
-    'adnxs.com',
-    'popads.net',
-    'exoclick.com',
-    'adservice.google',
-    'chapturist.com',
-    'adcolony.com',
-    'applovin.com',
-    'unityads.unity3d.com',
-    'vungle.com',
-    'chartboost.com',
-]
-
+# URLs that match these are preview thumbnails, not the main video
 THUMBNAIL_PATTERNS = [
     '/thumbnails/', '/thumbs/', '/preview/', '/poster/',
     'thumb.jpg', 'preview.mp4', 'sprite', '/sprite/',
@@ -139,7 +134,7 @@ KNOWN_STREAM_HOSTS = [
     'upstream', 'upstream.to', 'fastplay', 'vembed', 'vtube',
     'player4u', 'streamlare', 'streamwish', 'wishembed',
     's3.', '.amazonaws.com', 'cloudfront.net', 'akamaihd',
-    'fastly.net', 'bunnycdn', 'b-cdn.net', 'doppiocdn',
+    'fastly.net', 'bunnycdn', 'b-cdn.net',
 ]
 
 CHUNK_SIZE = 64 * 1024
@@ -148,8 +143,9 @@ USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
               'AppleWebKit/537.36 (KHTML, like Gecko) '
               'Chrome/120.0.0.0 Safari/537.36')
 
-MIN_VIDEO_SIZE = 10_000
+MIN_VIDEO_SIZE = 10_000  # 10 KB
 
+# Content-Type markers that indicate a video stream
 VIDEO_MIME_MARKERS = [
     'video/',
     'audio/',
@@ -160,10 +156,8 @@ VIDEO_MIME_MARKERS = [
     'application/octet-stream',
 ]
 
-# Sniff timings
-SNIFF_TIMEOUT_SEC = 75                     # total budget
-SNIFF_WAIT_AFTER_PLAY_MS = 15000           # wait up to 15s after clicking play (ads run first)
-SNIFF_WAIT_BEFORE_PLAY_MS = 5000           # wait after page load, before play click
+SNIFF_TIMEOUT_SEC = 45
+SNIFF_WAIT_AFTER_PLAY_MS = 6000
 
 
 class DownloadCancelled(Exception):
@@ -208,61 +202,6 @@ def kill_process(task_id):
         except Exception as e:
             logger.warning(f"Failed to kill process for {task_id}: {e}")
     return False
-
-
-# ============================================================
-# GLOBAL SNIFF LOCK + ORPHAN CLEANUP
-# ============================================================
-_sniff_lock = threading.Lock()
-
-
-def _cleanup_playwright_processes(verbose=False):
-    """Kill any orphan Chromium/Playwright processes."""
-    try:
-        import psutil
-    except ImportError:
-        return 0
-
-    killed = []
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-        try:
-            name = (proc.info.get('name') or '').lower()
-            cmdline_list = proc.info.get('cmdline') or []
-            cmdline = ' '.join(cmdline_list).lower()
-
-            is_playwright_browser = (
-                'ms-playwright' in cmdline
-                or ('chrome' in name and 'headless' in cmdline)
-                or ('chrome' in name and 'playwright' in cmdline)
-                or ('chromium' in name and 'headless' in cmdline)
-            )
-            if is_playwright_browser:
-                try:
-                    proc.terminate()
-                    killed.append(proc.info['pid'])
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-
-    if killed:
-        logger.warning(f"[Sniff] Cleaned up {len(killed)} orphan browser process(es)")
-        if verbose:
-            logger.info(f"[Sniff] Killed PIDs: {killed}")
-
-    try:
-        import subprocess as _sp
-        _sp.run(['pkill', '-f', 'ms-playwright.*chromium'],
-                capture_output=True, timeout=5)
-        _sp.run(['pkill', '-f', 'playwright.*driver'],
-                capture_output=True, timeout=5)
-    except Exception:
-        pass
-
-    return len(killed)
 
 
 # ============================================================
@@ -329,7 +268,7 @@ def _playlist_folder_name(url, quality):
 
 
 # ============================================================
-# VALIDATORS
+# HELPERS: validators
 # ============================================================
 def _is_video_url(url):
     if not url or not isinstance(url, str):
@@ -352,26 +291,21 @@ def _is_thumbnail(url):
     return any(pat in low for pat in THUMBNAIL_PATTERNS)
 
 
-def _is_ad_url(url):
-    if not url:
-        return False
-    low = url.lower()
-    return any(ad in low for ad in AD_DOMAINS)
-
-
 def _is_probable_video(url, allow_thumbnail=False):
     if not url:
         return False
     low = url.lower()
+
     for skip in SKIP_PATTERNS:
         if skip in low:
             return False
-    if _is_ad_url(url):
-        return False
+
     if not allow_thumbnail and _is_thumbnail(url):
         return False
+
     if _is_video_url(url):
         return True
+
     for h in KNOWN_STREAM_HOSTS:
         if h in low:
             path = urlparse(url).path.lower()
@@ -386,7 +320,33 @@ def _is_probable_video(url, allow_thumbnail=False):
             ]):
                 return True
             return False
+
     return False
+
+
+def _normalize(url, base):
+    if not url or not isinstance(url, str):
+        return None
+    url = url.strip().rstrip('.,;:!?)]}')
+    if url.startswith('//'):
+        url = 'https:' + url
+    elif url.startswith('/'):
+        url = urljoin(base, url)
+    elif not url.startswith(('http://', 'https://')):
+        return None
+    if any(s in url.lower() for s in SKIP_PATTERNS):
+        return None
+    return url
+
+
+def _dedupe(urls):
+    seen = set()
+    out = []
+    for u in urls:
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
 
 
 def _verify_has_video_stream(file_path):
@@ -405,27 +365,615 @@ def _verify_has_video_stream(file_path):
         return False
 
 
-def _fmt_bytes(n):
-    try:
-        n = int(n)
-    except Exception:
-        return "—"
-    if n < 1024:
-        return f"{n} B"
-    if n < 1024**2:
-        return f"{n/1024:.1f} KB"
-    if n < 1024**3:
-        return f"{n/1024**2:.1f} MB"
-    return f"{n/1024**3:.2f} GB"
+# ============================================================
+# HTML FETCHER
+# ============================================================
+def _fetch_page_html(url, timeout=20):
+    session = requests.Session()
+    if PROXY_DICT:
+        session.proxies = PROXY_DICT
+    session.headers.update({
+        'User-Agent': USER_AGENT,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': url,
+        'Connection': 'keep-alive',
+    })
+
+    if os.path.exists(COOKIES_FILE):
+        try:
+            with open(COOKIES_FILE, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    parts = line.split('\t')
+                    if len(parts) >= 7:
+                        domain, _, path_, _, _, name, value = parts[:7]
+                        session.cookies.set(name, value,
+                                            domain=domain.lstrip('.'),
+                                            path=path_)
+        except Exception:
+            pass
+
+    r = session.get(url, timeout=timeout, allow_redirects=True)
+    r.raise_for_status()
+    return r.text, r.url
 
 
 # ============================================================
-# YT-DLP: --get-url
+# CRACKER: #3 HTML tags
+# ============================================================
+def _crack_html_tags(html, base):
+    if not BeautifulSoup:
+        return []
+    out = []
+    soup = BeautifulSoup(html, 'html.parser')
+
+    for tag in soup.find_all(['video', 'audio']):
+        src = tag.get('src')
+        if src:
+            u = _normalize(src, base)
+            if u:
+                out.append(u)
+        for source in tag.find_all('source'):
+            src = source.get('src')
+            if src:
+                u = _normalize(src, base)
+                if u:
+                    out.append(u)
+
+    for tag in soup.find_all(['object', 'embed']):
+        data = tag.get('data') or tag.get('src')
+        if data:
+            u = _normalize(data, base)
+            if u:
+                out.append(u)
+
+    for tag in soup.find_all('source'):
+        src = tag.get('src')
+        if src:
+            u = _normalize(src, base)
+            if u:
+                out.append(u)
+
+    return out
+
+
+# ============================================================
+# CRACKER: #4 Meta tags
+# ============================================================
+def _crack_meta(html, base):
+    if not BeautifulSoup:
+        return []
+    out = []
+    soup = BeautifulSoup(html, 'html.parser')
+    META_KEYS = {
+        'og:video', 'og:video:url', 'og:video:secure_url',
+        'twitter:player', 'twitter:player:stream',
+        'video:url', 'video:secure_url', 'media:content',
+    }
+    for meta in soup.find_all('meta'):
+        prop = (meta.get('property') or meta.get('name') or '').lower()
+        content = meta.get('content', '')
+        if prop in META_KEYS and content:
+            u = _normalize(content, base)
+            if u:
+                out.append(u)
+    return out
+
+
+# ============================================================
+# CRACKER: #5 JSON-LD
+# ============================================================
+def _crack_jsonld(html, base):
+    if not BeautifulSoup:
+        return []
+    out = []
+    soup = BeautifulSoup(html, 'html.parser')
+    for script in soup.find_all('script', type='application/ld+json'):
+        if not script.string:
+            continue
+        try:
+            data = json.loads(script.string)
+        except Exception:
+            for m in re.finditer(r'"(?:contentUrl|embedUrl)"\s*:\s*"([^"]+)"',
+                                  script.string):
+                u = _normalize(m.group(1), base)
+                if u:
+                    out.append(u)
+            continue
+
+        def walk(obj):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k in ('contentUrl', 'embedUrl', 'url') and isinstance(v, str):
+                        u = _normalize(v, base)
+                        if u:
+                            out.append(u)
+                    else:
+                        walk(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    walk(item)
+
+        walk(data)
+    return out
+
+
+# ============================================================
+# CRACKER: #6 JSON script blocks
+# ============================================================
+def _crack_json_scripts(html, base):
+    if not BeautifulSoup:
+        return []
+    out = []
+    soup = BeautifulSoup(html, 'html.parser')
+
+    candidate_scripts = []
+    for script in soup.find_all('script'):
+        stype = (script.get('type') or '').lower()
+        sid = (script.get('id') or '').lower()
+        if stype in ('application/json', 'application/ld+json'):
+            candidate_scripts.append(script.string or '')
+        elif sid in ('__next_data__', 'initial-state', '__init_data__',
+                     '__nuxt_data__'):
+            candidate_scripts.append(script.string or '')
+
+    for text in candidate_scripts:
+        if not text:
+            continue
+        try:
+            data = json.loads(text)
+        except Exception:
+            for u in _crack_raw_urls(text, base):
+                out.append(u)
+            continue
+
+        def walk(obj):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if isinstance(v, str) and _is_probable_video(v):
+                        u = _normalize(v, base)
+                        if u:
+                            out.append(u)
+                    else:
+                        walk(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    walk(item)
+
+        walk(data)
+    return out
+
+
+# ============================================================
+# CRACKER: #7 Player configs
+# ============================================================
+def _crack_players(html, base):
+    out = []
+    patterns = [
+        r'sources?\s*:\s*\[\s*\{[^}]*?src\s*:\s*[\'"]([^\'"]+)[\'"]',
+        r'source\s*:\s*\{[^}]*?src\s*:\s*[\'"]([^\'"]+)[\'"]',
+        r'file\s*:\s*[\'"]([^\'"]+\.(?:mp4|m3u8|mpd|webm|mov)[^\'"]*)[\'"]',
+        r'"file"\s*:\s*"([^"]+)"',
+        r'new\s+DPlayer\(\{[^}]*?url\s*:\s*[\'"]([^\'"]+)[\'"]',
+        r'fluidPlayer\([^)]*,\s*\{[^}]*?video[\'"]?\s*:\s*[\'"]([^\'"]+)',
+        r'new\s+Clappr\.Player\(\{[^}]*?source\s*:\s*[\'"]([^\'"]+)',
+        r'hls\.loadSource\(\s*[\'"]([^\'"]+)',
+        r'loadSource\(\s*[\'"]([^\'"]+)',
+        r'(?:videoUrl|video_url|hlsUrl|hls_url|dashUrl|dash_url|'
+        r'playlistUrl|playlist_url|streamUrl|stream_url|'
+        r'mp4Url|mp4_url|fileUrl|file_url|mediaUrl|media_url)'
+        r'\s*[:=]\s*[\'"]([^\'"]+)[\'"]',
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, html, re.IGNORECASE | re.DOTALL):
+            raw = m.group(1).replace('\\/', '/').replace('\\"', '"')
+            u = _normalize(raw, base)
+            if u:
+                out.append(u)
+    return out
+
+
+# ============================================================
+# CRACKER: #8 Inline JS URLs
+# ============================================================
+def _crack_inline_js(html, base):
+    out = []
+    regex = re.compile(
+        r'[\'"](https?://[^\s\'"<>\\]+?\.(?:mp4|m3u8|mpd|webm|mov|mkv|ts|m4v)(?:\?[^\s\'"<>\\]*)?)[\'"]',
+        re.IGNORECASE
+    )
+    for m in regex.finditer(html):
+        raw = m.group(1).replace('\\/', '/').replace('\\"', '"')
+        u = _normalize(raw, base)
+        if u:
+            out.append(u)
+    return out
+
+
+# ============================================================
+# CRACKER: #9 Obfuscated payloads
+# ============================================================
+def _crack_obfuscated(html, base):
+    out = []
+
+    for m in re.finditer(r'[\'"]([A-Za-z0-9+/=]{40,})[\'"]', html):
+        try:
+            decoded = base64.b64decode(m.group(1) + '===').decode(
+                'utf-8', errors='ignore'
+            )
+            out.extend(_crack_raw_urls(decoded, base))
+        except Exception:
+            pass
+
+    for m in re.finditer(r'[\'"]([0-9a-fA-F]{60,})[\'"]', html):
+        try:
+            raw = bytes.fromhex(m.group(1)).decode('utf-8', errors='ignore')
+            out.extend(_crack_raw_urls(raw, base))
+        except Exception:
+            pass
+
+    for m in re.finditer(
+        r"eval\(function\(p,a,c,k,e,[dr]\)\{.*?\}\('(.+?)',(\d+),(\d+),'(.+?)'\.split",
+        html, re.DOTALL
+    ):
+        try:
+            p = m.group(1)
+            k = m.group(4).split('|')
+
+            def repl(tok):
+                try:
+                    idx = int(tok, 36)
+                except ValueError:
+                    return tok
+                return k[idx] if 0 <= idx < len(k) and k[idx] else tok
+
+            unpacked = re.sub(r'\b[0-9a-z]+\b', repl, p)
+            out.extend(_crack_raw_urls(unpacked, base))
+        except Exception:
+            pass
+
+    return out
+
+
+# ============================================================
+# CRACKER: #10 Raw URL regex
+# ============================================================
+def _crack_raw_urls(text, base):
+    out = []
+    regex = re.compile(
+        r'https?://[^\s\'"<>\\]+?\.(?:mp4|m3u8|mpd|webm|mov|mkv|ts|m4v)(?:\?[^\s\'"<>\\]*)?',
+        re.IGNORECASE
+    )
+    for m in regex.finditer(text):
+        raw = m.group(0).replace('\\/', '/')
+        u = _normalize(raw, base)
+        if u:
+            out.append(u)
+    return out
+
+
+# ============================================================
+# CRACKER: #11 Known streaming hosts
+# ============================================================
+def _crack_known_hosts(html, base):
+    out = []
+    for host in KNOWN_STREAM_HOSTS:
+        pattern = re.compile(
+            rf'https?://[^\s\'"<>]*?{re.escape(host)}[^\s\'"<>]*',
+            re.IGNORECASE
+        )
+        for m in pattern.finditer(html):
+            raw = m.group(0).replace('\\/', '/').rstrip('.,;:!?)]}')
+            u = _normalize(raw, base)
+            if u and not any(s in u.lower() for s in SKIP_PATTERNS):
+                path = urlparse(u).path.lower()
+                if any(path.endswith(bad) for bad in
+                       ['.js', '.css', '.json', '.map', '.html', '.htm']):
+                    continue
+                out.append(u)
+    return out
+
+
+# ============================================================
+# CRACKER: #12 Iframes
+# ============================================================
+def _crack_iframes(html, base):
+    if not BeautifulSoup:
+        return []
+    out = []
+    soup = BeautifulSoup(html, 'html.parser')
+    for iframe in soup.find_all('iframe'):
+        src = iframe.get('src') or iframe.get('data-src')
+        if src:
+            u = _normalize(src, base)
+            if u:
+                out.append(u)
+    return out
+
+
+# ============================================================
+# CRACKER: #13 API guessing
+# ============================================================
+def _crack_apis(page_url):
+    parsed = urlparse(page_url)
+    host = parsed.netloc.lower()
+    slug = parsed.path.strip('/').split('/')[-1]
+    if not slug:
+        return []
+
+    paths = []
+    if any(h in host for h in ['vidsonic', 'lulu', 'vixeo', 'vix']):
+        paths += [
+            f"/api/video/{slug}", f"/api/video?id={slug}",
+            f"/api/get/{slug}", f"/api/media/{slug}",
+            f"/api/player/{slug}", f"/api/source/{slug}",
+            f"/api/stream/{slug}", f"/api/file/{slug}",
+            f"/v1/video/{slug}", f"/v1/media/{slug}",
+            f"/v1/source/{slug}", f"/v1/poster/{slug}",
+            f"/v1/file/{slug}", f"/get_video/{slug}",
+            f"/play/{slug}.json", f"/e/{slug}.json",
+        ]
+    if 'dood' in host:
+        paths += [f"/pass_md5/{slug}", f"/api/source/{slug}"]
+    if 'streamtape' in host:
+        paths += [f"/get_video?id={slug}", f"/api/get_video?id={slug}"]
+    if 'mixdrop' in host:
+        paths += [f"/api/media/{slug}", f"/api/v1/media/{slug}"]
+
+    paths += [f"/api/video/{slug}", f"/api/media/{slug}",
+              f"/video/{slug}.json", f"/api/source/{slug}"]
+
+    found = []
+    session = requests.Session()
+    if PROXY_DICT:
+        session.proxies = PROXY_DICT
+    session.headers.update({
+        'User-Agent': USER_AGENT,
+        'Accept': 'application/json,*/*',
+        'Referer': page_url,
+    })
+
+    for p in paths:
+        url = f"{parsed.scheme}://{parsed.netloc}{p}"
+        try:
+            r = session.get(url, timeout=8, allow_redirects=True)
+            if r.status_code != 200:
+                continue
+            text = r.text
+            found.extend(_crack_raw_urls(text, page_url))
+            found.extend(_crack_known_hosts(text, page_url))
+            for m in re.finditer(r'"(?:url|file|src|source|link)"\s*:\s*"([^"]+)"',
+                                  text):
+                u = _normalize(m.group(1).replace('\\/', '/'), page_url)
+                if u and _is_probable_video(u):
+                    found.append(u)
+            if found:
+                logger.info(f"[Crack] API hit: {url}")
+                break
+        except Exception:
+            continue
+    return found
+
+
+# ============================================================
+# CRACKER: #14 Network Sniffing (Video DownloadHelper style)
+# ============================================================
+def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
+    """
+    Launch a headless Chromium via Playwright, navigate to the page,
+    and intercept every network response that looks like a video stream.
+
+    Mirrors how Video DownloadHelper detects streams.
+    Returns a list of candidate URLs, ranked by likelihood of being the main video.
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        logger.info("[Sniff] Playwright not installed — skipping network sniff")
+        return []
+
+    logger.info("[Sniff] Launching headless Chromium...")
+    captured = []  # list of dicts {url, mime, size, order}
+
+    def run_sync():
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-blink-features=AutomationControlled',
+                        '--autoplay-policy=no-user-gesture-required',
+                    ]
+                )
+                context = browser.new_context(
+                    user_agent=USER_AGENT,
+                    viewport={'width': 1280, 'height': 720},
+                    # Accept all media
+                    extra_http_headers={
+                        'Accept-Language': 'en-US,en;q=0.9',
+                    }
+                )
+
+                # Load cookies
+                if os.path.exists(COOKIES_FILE):
+                    try:
+                        cookies = []
+                        with open(COOKIES_FILE, 'r', encoding='utf-8') as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line or line.startswith('#'):
+                                    continue
+                                parts = line.split('\t')
+                                if len(parts) < 7:
+                                    continue
+                                dom, _, pth, sec, exp, name, value = parts[:7]
+                                try:
+                                    exp_val = int(exp) if exp and exp != '0' else -1
+                                except ValueError:
+                                    exp_val = -1
+                                cookies.append({
+                                    'name': name,
+                                    'value': value,
+                                    'domain': dom.lstrip('.') if not dom.startswith('.') else dom,
+                                    'path': pth or '/',
+                                    'secure': sec.upper() == 'TRUE',
+                                    'expires': exp_val,
+                                })
+                        if cookies:
+                            context.add_cookies(cookies)
+                            logger.info(f"[Sniff] Loaded {len(cookies)} cookies")
+                    except Exception as e:
+                        logger.debug(f"[Sniff] Cookie load failed: {e}")
+
+                page = context.new_page()
+
+                order_counter = [0]  # mutable counter
+
+                def on_response(response):
+                    try:
+                        url = response.url
+                        mime = (response.headers.get('content-type', '') or '').lower()
+                        # Reject obvious junk
+                        if any(skip in url.lower() for skip in SKIP_PATTERNS):
+                            return
+                        if not (any(m in mime for m in VIDEO_MIME_MARKERS)
+                                or _is_video_url(url)):
+                            return
+                        # Reject thumbnails unless they're a m3u8 preview
+                        # (Video DownloadHelper also shows these; keep them but rank low)
+                        is_thumb = _is_thumbnail(url)
+                        try:
+                            cl = response.headers.get('content-length')
+                            size = int(cl) if cl else 0
+                        except Exception:
+                            size = 0
+                        order_counter[0] += 1
+                        captured.append({
+                            'url': url,
+                            'mime': mime,
+                            'size': size,
+                            'thumb': is_thumb,
+                            'order': order_counter[0],
+                        })
+                        tag = "📼" if not is_thumb else "🖼️"
+                        logger.info(f"[Sniff] {tag} {url[:110]}")
+                    except Exception:
+                        pass
+
+                page.on('response', on_response)
+
+                logger.info(f"[Sniff] Navigating to {page_url}")
+                try:
+                    page.goto(page_url, timeout=30000,
+                              wait_until='domcontentloaded')
+                except Exception as e:
+                    logger.warning(f"[Sniff] goto failed: {e}")
+
+                # Give the page time to load + fetch initial assets
+                page.wait_for_timeout(4000)
+
+                # Try clicking play buttons
+                play_selectors = [
+                    'button[aria-label*="play" i]',
+                    'button[title*="play" i]',
+                    '.play-button',
+                    '.vjs-big-play-button',
+                    '.plyr__control--overlaid',
+                    '[class*="play" i]:not(script)',
+                    'button:has-text("Play")',
+                    'video',
+                ]
+                for sel in play_selectors:
+                    try:
+                        page.click(sel, timeout=1500)
+                        logger.info(f"[Sniff] Clicked: {sel}")
+                        page.wait_for_timeout(1500)
+                        break
+                    except Exception:
+                        pass
+
+                # Try to force-play any <video> tags
+                try:
+                    page.evaluate("""
+                        document.querySelectorAll('video').forEach(v => {
+                            try { v.muted = true; v.play(); } catch (e) {}
+                        });
+                    """)
+                except Exception:
+                    pass
+
+                # Wait for the player to spin up streams
+                page.wait_for_timeout(SNIFF_WAIT_AFTER_PLAY_MS)
+
+                # Scroll a bit to trigger lazy-loaded players
+                try:
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
+                    page.wait_for_timeout(2000)
+                except Exception:
+                    pass
+
+                browser.close()
+        except Exception as e:
+            logger.error(f"[Sniff] Fatal error: {e}")
+
+    # Run Playwright's sync API in a dedicated thread so we don't fight
+    # Flask's event loop or need asyncio.run here
+    t = threading.Thread(target=run_sync, daemon=True)
+    t.start()
+    t.join(timeout=timeout + 10)
+
+    if not captured:
+        logger.info("[Sniff] No video streams detected")
+        return []
+
+    # ---- Rank captured URLs ----
+    # Higher score = more likely the main video
+    def score(item):
+        s = 0
+        u = item['url'].lower()
+        if item['thumb']:
+            s -= 100
+        if u.endswith('.m3u8') or 'm3u8' in u:
+            s += 50
+        if 'master' in u or 'index' in u or 'manifest' in u:
+            s += 20
+        if u.endswith('.mp4'):
+            s += 10
+        if u.endswith('.mpd'):
+            s += 40
+        if item['size'] > 1_000_000:
+            s += 30
+        elif item['size'] > 100_000:
+            s += 10
+        if 'video' in item['mime']:
+            s += 15
+        # Later requests are usually the real stream (after teaser)
+        s += min(item['order'], 10)
+        # Prefer URLs NOT on the page host (real stream is usually on a CDN)
+        try:
+            if urlparse(item['url']).netloc != urlparse(page_url).netloc:
+                s += 5
+        except Exception:
+            pass
+        return s
+
+    ranked = sorted(captured, key=score, reverse=True)
+    urls = _dedupe([item['url'] for item in ranked])
+    logger.info(f"[Sniff] Ranked {len(urls)} stream(s)")
+    return urls
+
+
+# ============================================================
+# CRACKER: yt-dlp --get-url
 # ============================================================
 def _crack_ytdlp_geturl(url):
     ytdlp = shutil.which('yt-dlp')
     if not ytdlp:
         return []
+
     cmd = [
         ytdlp, '--get-url',
         '--no-warnings', '--ignore-errors',
@@ -435,10 +983,12 @@ def _crack_ytdlp_geturl(url):
     ]
     if os.path.exists(COOKIES_FILE):
         cmd += ['--cookies', COOKIES_FILE]
+
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
     except Exception:
         return []
+
     urls = []
     for line in (r.stdout or '').splitlines():
         line = line.strip()
@@ -448,415 +998,107 @@ def _crack_ytdlp_geturl(url):
 
 
 # ============================================================
-# HLS DURATION PROBE (via yt-dlp --dump-json)
+# MASTER CRACK FUNCTION
 # ============================================================
-def _probe_hls_duration(url):
-    """
-    Ask yt-dlp for metadata on a stream URL.
-    Returns duration in seconds (0 if unknown).
-    Used to distinguish ads (15-45s) from real videos (minutes+).
-    """
-    ytdlp = shutil.which('yt-dlp')
-    if not ytdlp:
-        return 0
-    cmd = [
-        ytdlp, '--dump-json', '--no-warnings', '--ignore-errors',
-        '--impersonate', 'chrome',
-        '--extractor-args', 'generic:impersonate',
-    ]
-    if os.path.exists(COOKIES_FILE):
-        cmd += ['--cookies', COOKIES_FILE]
-    cmd.append(url)
+def crack_video_urls(page_url, deep=True, save_debug_to=None):
+    candidates = []
+    seen = set()
+
+    def add(urls, source="", allow_thumbnail=False):
+        for u in urls or []:
+            if not u or u in seen:
+                continue
+            if not allow_thumbnail and not _is_probable_video(u):
+                low = u.lower()
+                if any(skip in low for skip in SKIP_PATTERNS):
+                    continue
+                if _is_thumbnail(u):
+                    continue
+            seen.add(u)
+            candidates.append(u)
+            if source:
+                logger.debug(f"[Crack] +{source}: {u[:100]}")
+
+    logger.info(f"[Crack] Analyzing: {page_url}")
+
+    if _is_video_url(page_url):
+        logger.info("[Crack] Input is already a direct video URL")
+        return [page_url]
+
+    # Strategy 2: yt-dlp
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
-        if r.returncode != 0:
-            return 0
-        for line in (r.stdout or '').splitlines():
-            line = line.strip()
-            if not line.startswith('{'):
-                continue
-            try:
-                data = json.loads(line)
-                return int(data.get('duration') or 0)
-            except Exception:
-                continue
-    except Exception:
-        return 0
-    return 0
+        ytdlp_urls = _crack_ytdlp_geturl(page_url)
+        if ytdlp_urls:
+            logger.info(f"[Crack] yt-dlp: {len(ytdlp_urls)} URL(s)")
+            add(ytdlp_urls, "ytdlp")
+            if not deep:
+                return _dedupe(candidates)
+    except Exception as e:
+        logger.debug(f"[Crack] yt-dlp failed: {e}")
 
+    # Fetch HTML
+    html, final_url = None, page_url
+    try:
+        html, final_url = _fetch_page_html(page_url)
+        logger.info(f"[Crack] Fetched {len(html)} bytes from {final_url}")
+    except Exception as e:
+        logger.warning(f"[Crack] Fetch failed: {e}")
 
-# ============================================================
-# NETWORK SNIFFER — clean shutdown + duration-based ranking
-# ============================================================
-def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
-    """
-    Launch headless Chromium, navigate, intercept responses.
-    - Filters junk (ads, fragments, low-latency rolls, pings)
-    - Captures across the entire ad→video transition
-    - Skips ads when possible
-    - Shuts down the browser gracefully (no asyncio noise)
-    - Ranks by duration so the real video wins over the ad
-    """
-    if not PLAYWRIGHT_AVAILABLE:
-        logger.info("[Sniff] Playwright not installed — skipping")
-        return []
+    if html:
+        add(_crack_html_tags(html, final_url), "html-tags")
+        add(_crack_meta(html, final_url), "meta")
+        add(_crack_jsonld(html, final_url), "json-ld")
+        add(_crack_json_scripts(html, final_url), "json-script")
+        add(_crack_players(html, final_url), "player-config")
+        add(_crack_inline_js(html, final_url), "inline-js")
+        add(_crack_obfuscated(html, final_url), "obfuscated")
+        add(_crack_raw_urls(html, final_url), "raw-scan")
+        add(_crack_known_hosts(html, final_url), "known-hosts")
 
-    if not _sniff_lock.acquire(timeout=60):
-        logger.warning("[Sniff] Another sniff is already running — skipping")
-        return []
+        iframe_urls = _crack_iframes(html, final_url)
+        add(iframe_urls, "iframes")
 
-    captured = []
-    stop_event = threading.Event()
-
-    def run_sync():
-        pw = None
-        browser = None
-        context = None
-        try:
-            pw = sync_playwright().start()
-            browser = pw.chromium.launch(
-                headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-blink-features=AutomationControlled',
-                    '--autoplay-policy=no-user-gesture-required',
-                    '--disable-gpu',
-                    '--disable-software-rasterizer',
-                    '--disable-extensions',
-                    '--disable-background-networking',
-                    '--disable-background-timer-throttling',
-                    '--disable-renderer-backgrounding',
-                    '--disable-features=TranslateUI',
-                    '--disable-features=site-per-process',
-                    '--js-flags=--max-old-space-size=256',
-                    '--window-size=1280,720',
-                ]
-            )
-            context = browser.new_context(
-                user_agent=USER_AGENT,
-                viewport={'width': 1280, 'height': 720},
-                extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'},
-            )
-
-            # ---- Cookies ----
-            if os.path.exists(COOKIES_FILE):
+        if deep and iframe_urls:
+            for iframe in iframe_urls[:3]:
+                if _is_video_url(iframe):
+                    add([iframe], "iframe-direct")
+                    continue
                 try:
-                    cookies = []
-                    with open(COOKIES_FILE, 'r', encoding='utf-8') as f:
-                        for line in f:
-                            line = line.strip()
-                            if not line or line.startswith('#'):
-                                continue
-                            parts = line.split('\t')
-                            if len(parts) < 7:
-                                continue
-                            dom, _, pth, sec, exp, name, value = parts[:7]
-                            try:
-                                exp_val = int(exp) if exp and exp != '0' else -1
-                            except ValueError:
-                                exp_val = -1
-                            cookies.append({
-                                'name': name,
-                                'value': value,
-                                'domain': dom,
-                                'path': pth or '/',
-                                'secure': sec.upper() == 'TRUE',
-                                'expires': exp_val,
-                            })
-                    if cookies:
-                        context.add_cookies(cookies)
+                    logger.info(f"[Crack] Following iframe: {iframe[:80]}")
+                    nested = crack_video_urls(iframe, deep=True)
+                    add(nested, "iframe-nested")
                 except Exception as e:
-                    logger.debug(f"[Sniff] Cookie load failed: {e}")
+                    logger.debug(f"[Crack] Iframe failed: {e}")
 
-            page = context.new_page()
-            order_counter = [0]
-
-            def is_junk_url(url):
-                low = url.lower()
-                path = urlparse(url).path.lower()
-                for skip in SKIP_PATTERNS:
-                    if skip in low:
-                        return True
-                for ad in AD_DOMAINS:
-                    if ad in low:
-                        return True
-                if '_hls_msn' in low or '_hls_part' in low:
-                    return True
-                if re.search(r'_part\d+\.mp4', path):
-                    return True
-                if 'init_' in path and path.endswith('.mp4'):
-                    return True
-                if 'ping.m3u8' in low:
-                    return True
-                for bad in ['.riv', '.svg', '.json', '.webmanifest',
-                            '.woff2', '.woff', '.ttf', '.eot', '.otf']:
-                    if path.endswith(bad):
-                        return True
-                return False
-
-            def on_response(response):
-                try:
-                    url = response.url
-                    mime = (response.headers.get('content-type', '') or '').lower()
-                    if not (any(m in mime for m in VIDEO_MIME_MARKERS)
-                            or _is_video_url(url)):
-                        return
-                    if is_junk_url(url):
-                        return
-                    try:
-                        cl = response.headers.get('content-length')
-                        size = int(cl) if cl else 0
-                    except Exception:
-                        size = 0
-                    if 0 < size < 100:
-                        return
-                    order_counter[0] += 1
-                    captured.append({
-                        'url': url,
-                        'mime': mime,
-                        'size': size,
-                        'is_thumbnail': _is_thumbnail(url),
-                        'order': order_counter[0],
-                    })
-                    logger.info(f"[Sniff] 📼 {url[:110]}")
-                except Exception:
-                    pass
-
-            page.on('response', on_response)
-
-            logger.info(f"[Sniff] Navigating to {page_url}")
+        if save_debug_to:
             try:
-                page.goto(page_url, timeout=30000, wait_until='domcontentloaded')
-            except Exception as e:
-                logger.warning(f"[Sniff] goto failed: {e}")
-
-            page.wait_for_timeout(SNIFF_WAIT_BEFORE_PLAY_MS)
-
-            # Click play buttons
-            for sel in [
-                'button[aria-label*="play" i]',
-                'button[title*="play" i]',
-                '.play-button',
-                '.vjs-big-play-button',
-                '.plyr__control--overlaid',
-                'button:has-text("Play")',
-                'video',
-            ]:
-                try:
-                    page.click(sel, timeout=1500)
-                    logger.info(f"[Sniff] Clicked: {sel}")
-                    page.wait_for_timeout(1500)
-                    break
-                except Exception:
-                    pass
-
-            # Force <video> tags to play
-            try:
-                page.evaluate("""
-                    document.querySelectorAll('video').forEach(v => {
-                        try { v.muted = true; v.play(); } catch (e) {}
-                    });
-                """)
+                os.makedirs(save_debug_to, exist_ok=True)
+                safe = re.sub(r'[^\w\-]', '_', urlparse(final_url).netloc)[:40]
+                path = os.path.join(save_debug_to, f"crack_{safe}.html")
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(html)
+                logger.info(f"[Crack] Debug HTML: {path}")
             except Exception:
                 pass
 
-            # Auto-skip ads
-            def try_skip_ads():
-                for sel in [
-                    '.skip-button',
-                    '.skip-ad',
-                    '.videoAdUiSkipButton',
-                    'button[aria-label*="skip" i]',
-                    'button:has-text("Skip Ad")',
-                    'button:has-text("Skip")',
-                    '.ytp-ad-skip-button',
-                ]:
-                    try:
-                        page.click(sel, timeout=300)
-                        logger.info(f"[Sniff] Skipped ad: {sel}")
-                        return True
-                    except Exception:
-                        pass
-                return False
+    # Strategy 13: API guessing
+    try:
+        add(_crack_apis(final_url), "api-guess")
+    except Exception as e:
+        logger.debug(f"[Crack] API guess failed: {e}")
 
-            # Wait in 2s slices, trying to skip ads each time
-            total_wait = SNIFF_WAIT_AFTER_PLAY_MS
-            slice_ms = 2000
-            elapsed = 0
-            while elapsed < total_wait:
-                if stop_event.is_set():
-                    logger.info("[Sniff] Stop requested — shutting down early")
-                    break
-                page.wait_for_timeout(slice_ms)
-                elapsed += slice_ms
-                try_skip_ads()
-
-            if not stop_event.is_set():
-                try:
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
-                    page.wait_for_timeout(2000)
-                except Exception:
-                    pass
-
+    # ---- Strategy 14: Network sniffing (only if nothing useful found) ----
+    if not candidates and deep:
+        try:
+            logger.info("[Crack] Falling back to network sniffing...")
+            sniffed = _sniff_network(page_url)
+            add(sniffed, "sniff", allow_thumbnail=True)
         except Exception as e:
-            logger.error(f"[Sniff] Fatal error: {e}")
-        finally:
-            # Graceful shutdown
-            for closer, name in ((context, 'context'), (browser, 'browser'), (pw, 'playwright')):
-                if closer is None:
-                    continue
-                try:
-                    if name == 'playwright':
-                        closer.stop()
-                    else:
-                        closer.close()
-                except Exception:
-                    pass
+            logger.warning(f"[Crack] Sniff failed: {e}")
 
-    t = threading.Thread(target=run_sync, daemon=True, name="sniff-thread")
-    t.start()
-    t.join(timeout=timeout)
-
-    if t.is_alive():
-        logger.warning("[Sniff] Timed out — requesting clean shutdown")
-        stop_event.set()
-        t.join(timeout=10)
-
-    if t.is_alive():
-        logger.warning("[Sniff] Thread still alive — force killing processes")
-        _cleanup_playwright_processes()
-        t.join(timeout=5)
-
-    try:
-        _sniff_lock.release()
-    except Exception:
-        pass
-
-    _cleanup_playwright_processes()
-
-    if not captured:
-        logger.info("[Sniff] No media streams detected")
-        return []
-
-    # ---- Dedupe by normalizing low-latency rolling URLs ----
-    def normalize_key(url):
-        try:
-            parsed = urlparse(url)
-            qs = parse_qs(parsed.query, keep_blank_values=True)
-            for k in list(qs.keys()):
-                if k.lower() in ('_hls_msn', '_hls_part'):
-                    del qs[k]
-            new_q = '&'.join(f"{k}={v[0]}" for k, v in qs.items())
-            base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-            return base + (f"?{new_q}" if new_q else "")
-        except Exception:
-            return url
-
-    deduped = []
-    seen_keys = set()
-    for item in captured:
-        key = normalize_key(item['url'])
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        deduped.append(item)
-
-    # ---- Probe durations for m3u8/mpd candidates (top 5) ----
-    hls_candidates = [c for c in deduped
-                      if '.m3u8' in c['url'].lower()
-                      or '.mpd' in c['url'].lower()]
-    duration_map = {}
-    for c in hls_candidates[:5]:
-        try:
-            dur = _probe_hls_duration(c['url'])
-            duration_map[c['url']] = dur
-            if dur:
-                logger.info(f"[Sniff] Duration {dur}s for {c['url'][:90]}")
-        except Exception:
-            pass
-
-    # ---- Rank ----
-    def score(item):
-        s = 0
-        u = item['url'].lower()
-        dur = duration_map.get(item['url'], 0)
-
-        if item['is_thumbnail']:
-            s -= 100
-
-        # Duration is the strongest signal
-        if dur >= 120:
-            s += 200
-        elif dur >= 60:
-            s += 100
-        elif dur > 0 and dur < 45:
-            s -= 150
-
-        if '/master/' in u or '/master.' in u:
-            s += 60
-        if 'auto.m3u8' in u:
-            s += 40
-        if '.m3u8' in u:
-            s += 30
-        if '.mpd' in u:
-            s += 25
-
-        if u.endswith('.mp4'):
-            if item['size'] > 10_000_000:
-                s += 60
-            elif item['size'] > 1_000_000:
-                s += 20
-            else:
-                s -= 40
-
-        if 'video/mp4' in item['mime']:
-            s += 10
-        elif 'mpegurl' in item['mime']:
-            s += 15
-
-        s += min(item['order'], 5)
-
-        return s
-
-    ranked = sorted(deduped, key=score, reverse=True)
-
-    out = []
-    for item in ranked:
-        out.append({
-            'url': item['url'],
-            'mime': item['mime'],
-            'size': item['size'],
-            'is_thumbnail': item['is_thumbnail'],
-            'duration': duration_map.get(item['url'], 0),
-        })
-
-    MAX_CANDIDATES = 6
-    out = out[:MAX_CANDIDATES]
-    logger.info(f"[Sniff] {len(captured)} raw → {len(deduped)} deduped → {len(out)} clean candidate(s)")
-    return out
-
-
-# ============================================================
-# MEDIA PROBE
-# ============================================================
-def _probe_media(url):
-    info = {'url': url, 'mime': '', 'size': 0}
-    try:
-        session = requests.Session()
-        if PROXY_DICT:
-            session.proxies = PROXY_DICT
-        session.headers.update({
-            'User-Agent': USER_AGENT,
-            'Referer': url,
-        })
-        r = session.head(url, allow_redirects=True, timeout=10)
-        info['mime'] = (r.headers.get('content-type', '') or '').lower()
-        cl = r.headers.get('content-length')
-        info['size'] = int(cl) if cl else 0
-    except Exception:
-        pass
-    return info
+    final = _dedupe(candidates)
+    logger.info(f"[Crack] {len(final)} unique candidate(s)")
+    return final
 
 
 # ============================================================
@@ -934,8 +1176,10 @@ def download_direct_file(url, task_id):
                     raise DownloadCancelled("Cancelled by user")
                 if not chunk:
                     continue
+
                 f.write(chunk)
                 downloaded += len(chunk)
+
                 now = time.time()
                 if now - last_update >= 0.5:
                     elapsed = now - start_time
@@ -951,6 +1195,7 @@ def download_direct_file(url, task_id):
                         save_task(task_id, task)
                     last_update = now
 
+        # ---- Verify ----
         final_ext = os.path.splitext(output_path)[1].lower()
         if final_ext in MEDIA_EXTS or final_ext in VIDEO_STREAM_EXTS:
             final_size = os.path.getsize(temp_path)
@@ -1120,7 +1365,10 @@ def download_with_ytdlp(url, task_id, quality='best'):
             os.remove(src)
         except Exception:
             pass
-        raise Exception(f"Downloaded file is not a video ({src_size} bytes).")
+        raise Exception(
+            f"Downloaded file is not a video ({src_size} bytes). "
+            f"Likely a script or error page."
+        )
 
     if not _verify_has_video_stream(src):
         try:
@@ -1186,7 +1434,7 @@ def download_playlist(url, task_id, quality='best', range_start=1, range_end=0):
     os.makedirs(playlist_dir, exist_ok=True)
     archive_file = os.path.join(playlist_dir, '.downloaded.txt')
 
-    logger.info(f"Playlist folder: {folder_name}")
+    logger.info(f"Playlist folder: {folder_name} (resume via {archive_file})")
 
     output_template = os.path.join(
         playlist_dir,
@@ -1213,6 +1461,7 @@ def download_playlist(url, task_id, quality='best', range_start=1, range_end=0):
     if range_start > 1 or range_end > 0:
         items = f"{range_start}-{range_end}" if range_end > 0 else f"{range_start}-"
         cmd += ['--playlist-items', items]
+        logger.info(f"Playlist range: {items}")
 
     if os.path.exists(COOKIES_FILE):
         cmd += ['--cookies', COOKIES_FILE]
@@ -1275,6 +1524,7 @@ def download_playlist(url, task_id, quality='best', range_start=1, range_end=0):
                 continue
 
             if RE_ALREADY.search(line):
+                logger.info(f"Playlist {task_id}: skipping already-downloaded")
                 continue
 
             m = RE_DEST.search(line)
@@ -1282,6 +1532,7 @@ def download_playlist(url, task_id, quality='best', range_start=1, range_end=0):
                 current_title = extract_title(m.group(1).strip())
                 current_video_size = 0
                 current_video_downloaded = 0
+                logger.info(f"Playlist {task_id}: starting '{current_title}'")
 
             pct_m = RE_PCT.search(line)
             if pct_m:
@@ -1319,6 +1570,9 @@ def download_playlist(url, task_id, quality='best', range_start=1, range_end=0):
                         save_task(task_id, task)
                     last_update_time = now
 
+            if 'ERROR' in line:
+                logger.error(f"yt-dlp: {line.strip()}")
+
         process.wait()
     finally:
         unregister_process(task_id)
@@ -1353,12 +1607,16 @@ def download_playlist(url, task_id, quality='best', range_start=1, range_end=0):
     task['total_items'] = len(video_files)
     save_task(task_id, task)
 
+    logger.info(f"Playlist {task_id}: {len(video_files)} videos, "
+                f"{total_size / 1024 / 1024:.1f} MB in {folder_name}/")
+
 
 # ============================================================
 # MAIN ROUTER
 # ============================================================
 def process_url_download(task_id, url, quality='best', range_start=1, range_end=0):
-    logger.info(f"process_url_download: {task_id} → {url}")
+    logger.info(f"process_url_download: {task_id} → {url} "
+                f"(quality={quality}, range={range_start}-{range_end or 'end'})")
     task = load_task(task_id)
     if not task:
         return
@@ -1380,51 +1638,73 @@ def process_url_download(task_id, url, quality='best', range_start=1, range_end=
             download_direct_file(url, task_id)
             return
 
-        logger.info("→ Unknown URL — trying yt-dlp --get-url")
-        ytdlp_urls = _crack_ytdlp_geturl(url)
-        if ytdlp_urls:
-            logger.info(f"→ yt-dlp found {len(ytdlp_urls)} stream URL(s). Downloading first...")
-            download_with_ytdlp(ytdlp_urls[0], task_id, quality)
+        logger.info("→ Unknown URL — trying yt-dlp first")
+        try:
+            download_with_ytdlp(url, task_id, quality)
             return
+        except Exception as ytdlp_err:
+            err_text = str(ytdlp_err).lower()
+            known_failures = [
+                'unsupported url', 'no suitable', 'not a valid url',
+                'unable to extract', 'no video formats',
+                'no video formats found', 'this video is not available',
+                'unable to download webpage', 'not a video',
+            ]
+            if not any(kw in err_text for kw in known_failures):
+                raise
+            logger.warning(f"yt-dlp failed. Trying cracker. Reason: "
+                           f"{str(ytdlp_err)[:200]}")
 
-        logger.info("→ yt-dlp failed. Sniffing network for media streams...")
+        debug_dir = os.path.join(UPLOAD_FOLDER, 'crack_debug')
+        candidates = crack_video_urls(url, deep=True, save_debug_to=debug_dir)
+
         task = load_task(task_id)
         if task:
-            task['status'] = 'sniffing'
-            task['progress'] = 0
-            task['download_progress'] = 0
+            task['candidates'] = candidates[:20]
             save_task(task_id, task)
 
-        candidates = _sniff_network(url)
-
-        probed = []
-        for c in candidates[:30]:
-            if not c.get('size') or not c.get('mime'):
-                info = _probe_media(c['url'])
-                c['size'] = c.get('size') or info.get('size', 0)
-                c['mime'] = c.get('mime') or info.get('mime', '')
-            c['size_str'] = _fmt_bytes(c.get('size', 0))
-            probed.append(c)
-
-        task = load_task(task_id)
-        if not task:
-            return
-
-        if not probed:
-            task['status'] = 'error'
-            task['error_msg'] = (
-                "No media found on this page. The player may need a login "
-                "or special headers. Try uploading fresh cookies via the browser extension."
+        if not candidates:
+            raise Exception(
+                "No video URL found on this page. The player may require "
+                "JavaScript or login. Try uploading cookies via the browser "
+                "extension, or check downloads/crack_debug/ for the HTML."
             )
-            save_task(task_id, task)
-            return
 
-        task['status'] = 'awaiting_choice'
-        task['candidates'] = probed
-        task['progress'] = 0
-        task['download_progress'] = 0
-        save_task(task_id, task)
-        logger.info(f"→ {len(probed)} media candidate(s) ready — waiting for user choice")
+        logger.info(f"Found {len(candidates)} candidate(s). Trying each...")
+
+        last_err = None
+        for i, candidate in enumerate(candidates, 1):
+            if not _is_probable_video(candidate, allow_thumbnail=True):
+                logger.info(f"→ Skipping non-video candidate {i}: {candidate[:100]}")
+                continue
+            try:
+                logger.info(f"→ yt-dlp candidate {i}/{len(candidates)}: "
+                            f"{candidate[:120]}")
+                download_with_ytdlp(candidate, task_id, quality)
+                return
+            except DownloadCancelled:
+                raise
+            except Exception as e:
+                logger.warning(f"Candidate {i} failed: {str(e)[:150]}")
+                last_err = e
+                continue
+
+        for i, candidate in enumerate(candidates, 1):
+            if not _is_probable_video(candidate, allow_thumbnail=True):
+                continue
+            try:
+                logger.info(f"→ Direct candidate {i}: {candidate[:120]}")
+                download_direct_file(candidate, task_id)
+                return
+            except DownloadCancelled:
+                raise
+            except Exception as e:
+                logger.warning(f"Direct {i} failed: {str(e)[:150]}")
+                last_err = e
+                continue
+
+        raise Exception(f"All {len(candidates)} candidates failed. "
+                        f"Last: {last_err}")
 
     except DownloadCancelled:
         task = load_task(task_id)
@@ -1434,46 +1714,6 @@ def process_url_download(task_id, url, quality='best', range_start=1, range_end=
             save_task(task_id, task)
     except Exception as e:
         logger.exception(f"Download failed for {task_id}")
-        task = load_task(task_id)
-        if task and not task.get('cancelled', False):
-            task['status'] = 'error'
-            task['error_msg'] = str(e)
-            save_task(task_id, task)
-
-
-# ============================================================
-# DOWNLOAD CHOSEN MEDIA
-# ============================================================
-def download_chosen_media(task_id, chosen_url, quality='best'):
-    logger.info(f"download_chosen_media: {task_id} → {chosen_url[:120]}")
-    task = load_task(task_id)
-    if not task:
-        return
-
-    try:
-        task['status'] = 'downloading'
-        task['progress'] = 0
-        task['download_progress'] = 0
-        task['chosen_url'] = chosen_url
-        task['candidates'] = []
-        save_task(task_id, task)
-
-        try:
-            download_with_ytdlp(chosen_url, task_id, quality)
-            return
-        except Exception as e:
-            logger.warning(f"yt-dlp on chosen URL failed: {e}. Trying direct download...")
-
-        download_direct_file(chosen_url, task_id)
-
-    except DownloadCancelled:
-        task = load_task(task_id)
-        if task:
-            task['status'] = 'cancelled'
-            task['error_msg'] = 'Cancelled by user'
-            save_task(task_id, task)
-    except Exception as e:
-        logger.exception(f"Chosen download failed for {task_id}")
         task = load_task(task_id)
         if task and not task.get('cancelled', False):
             task['status'] = 'error'
@@ -1625,7 +1865,6 @@ def register_routes(app):
             'quality': quality,
             'range_start': range_start,
             'range_end': range_end,
-            'candidates': [],
         }
         save_task(task_id, task_data)
 
@@ -1664,41 +1903,42 @@ def register_routes(app):
 
         return jsonify({'task_id': task_id})
 
-    @app.route('/choose_media', methods=['POST'])
-    def choose_media():
-        task_id = request.form.get('task_id', '').strip()
-        chosen_url = request.form.get('url', '').strip()
-        quality = request.form.get('quality', 'best').strip().lower()
-        if quality not in QUALITY_MAP:
-            quality = 'best'
+    @app.route('/crack/url', methods=['POST'])
+    def crack_url():
+        page_url = request.form.get('url', '').strip()
+        if not page_url:
+            return jsonify({'error': 'URL required'}), 400
 
-        if not task_id or not chosen_url:
-            return jsonify({'error': 'task_id and url required'}), 400
+        debug_dir = os.path.join(UPLOAD_FOLDER, 'crack_debug')
+        try:
+            candidates = crack_video_urls(page_url, deep=True,
+                                           save_debug_to=debug_dir)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
 
-        task = load_task(task_id)
-        if not task:
-            return jsonify({'error': 'Task not found'}), 404
-        if task.get('status') != 'awaiting_choice':
-            return jsonify({'error': f"Task is not awaiting choice (status: {task.get('status')})"}), 400
+        return jsonify({
+            'page_url': page_url,
+            'count': len(candidates),
+            'candidates': candidates,
+        })
 
-        candidates = task.get('candidates', [])
-        valid_urls = {c['url'] for c in candidates}
-        if chosen_url not in valid_urls:
-            return jsonify({'error': 'Chosen URL is not in the candidate list'}), 400
-
-        threading.Thread(
-            target=download_chosen_media,
-            args=(task_id, chosen_url, quality),
-            daemon=True,
-        ).start()
-
-        return jsonify({'status': 'started'})
-
-    @app.route('/cleanup_browsers', methods=['POST'])
-    def cleanup_browsers():
-        """Manually kill any orphan browser processes."""
-        killed = _cleanup_playwright_processes(verbose=True)
-        return jsonify({'killed': killed})
+    @app.route('/sniff/url', methods=['POST'])
+    def sniff_url():
+        """Network-sniffing only endpoint (VDH-style)."""
+        page_url = request.form.get('url', '').strip()
+        if not page_url:
+            return jsonify({'error': 'URL required'}), 400
+        if not PLAYWRIGHT_AVAILABLE:
+            return jsonify({
+                'error': 'Playwright not installed. Run: '
+                         'pip install playwright && playwright install chromium'
+            }), 500
+        urls = _sniff_network(page_url)
+        return jsonify({
+            'page_url': page_url,
+            'count': len(urls),
+            'streams': urls,
+        })
 
     @app.route('/start_upload_torrent', methods=['POST'])
     def start_upload_torrent():
@@ -1722,3 +1962,39 @@ def register_routes(app):
         threading.Thread(target=process_torrent_download,
                          args=(task_id, temp_path), daemon=True).start()
         return jsonify({'task_id': task_id})
+
+
+# ============================================================
+# STANDALONE CLI
+# ============================================================
+def _cli_main():
+    if len(sys.argv) < 2:
+        print("Usage: python url_download.py <url> [--sniff]")
+        sys.exit(1)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%H:%M:%S'
+    )
+
+    url = sys.argv[1]
+    use_sniff = '--sniff' in sys.argv
+
+    if use_sniff:
+        urls = _sniff_network(url)
+    else:
+        urls = crack_video_urls(url, deep=True,
+                                 save_debug_to='/tmp/crack_debug')
+
+    print()
+    print("=" * 70)
+    print(f"  Found {len(urls)} candidate(s)")
+    print("=" * 70)
+    for i, u in enumerate(urls, 1):
+        print(f"  {i}. {u}")
+    print()
+
+
+if __name__ == '__main__' and __name__ != 'features.url_download':
+    _cli_main()
