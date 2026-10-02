@@ -1,7 +1,7 @@
 """
 url_download.py
 ===============
-Universal downloader with leak-proof network sniffing + user media selection.
+Universal downloader with noise-free network sniffing + user media selection.
 
 Strategies:
   1. Direct file URL  → download immediately
@@ -10,7 +10,8 @@ Strategies:
   4. Torrent          → libtorrent
   5. Unknown page     → yt-dlp --get-url
                         ├─ Success → download the URL
-                        └─ Failure → network sniff (VDH-style, leak-proof)
+                        └─ Failure → network sniff (VDH-style, leak-proof,
+                                     ad-filtered, fragment-filtered)
                                     → return candidates
                                     → wait for user choice
                                     → download chosen media
@@ -96,6 +97,7 @@ SKIP_PATTERNS = [
     '.css', '.woff', '.woff2', '.ttf', '.eot', '.otf',
     '.js', '.mjs', '.jsx', '.map', '.ts',
     '.html', '.htm', '.php', '.aspx', '.jsp',
+    '.riv', '.webmanifest', '.json',
     'google-analytics', 'googletagmanager', 'gtag/js',
     'facebook.com/tr', 'plausible.', 'doubleclick',
     'analytics.', '/ads/', 'adservice', 'beacon',
@@ -104,6 +106,23 @@ SKIP_PATTERNS = [
     'cdn.jsdelivr', 'unpkg.com', 'cdnjs.cloudflare',
     '/js/', '/scripts/', '/assets/js/',
     'pa-', 'gtm.', 'fbevents',
+]
+
+# Ad CDNs and known junk hosts — reject these URLs at capture time
+AD_DOMAINS = [
+    'bxcdn.net',
+    'doubleclick.net',
+    'googlesyndication',
+    'adnxs.com',
+    'popads.net',
+    'exoclick.com',
+    'adservice.google',
+    'chapturist.com',
+    'adcolony.com',
+    'applovin.com',
+    'unityads.unity3d.com',
+    'vungle.com',
+    'chartboost.com',
 ]
 
 THUMBNAIL_PATTERNS = [
@@ -119,7 +138,7 @@ KNOWN_STREAM_HOSTS = [
     'upstream', 'upstream.to', 'fastplay', 'vembed', 'vtube',
     'player4u', 'streamlare', 'streamwish', 'wishembed',
     's3.', '.amazonaws.com', 'cloudfront.net', 'akamaihd',
-    'fastly.net', 'bunnycdn', 'b-cdn.net',
+    'fastly.net', 'bunnycdn', 'b-cdn.net', 'doppiocdn',
 ]
 
 CHUNK_SIZE = 64 * 1024
@@ -140,8 +159,10 @@ VIDEO_MIME_MARKERS = [
     'application/octet-stream',
 ]
 
-SNIFF_TIMEOUT_SEC = 45
-SNIFF_WAIT_AFTER_PLAY_MS = 6000
+# Sniff timings
+SNIFF_TIMEOUT_SEC = 60                    # total budget
+SNIFF_WAIT_AFTER_PLAY_MS = 12000          # wait 12s after clicking play (ads run first)
+SNIFF_WAIT_BEFORE_PLAY_MS = 5000          # wait after page load, before play click
 
 
 class DownloadCancelled(Exception):
@@ -195,10 +216,7 @@ _sniff_lock = threading.Lock()
 
 
 def _cleanup_playwright_processes(verbose=False):
-    """
-    Kill any orphan Chromium/Playwright processes.
-    Safe to call from anywhere — no-op if psutil missing.
-    """
+    """Kill any orphan Chromium/Playwright processes."""
     try:
         import psutil
     except ImportError:
@@ -234,7 +252,6 @@ def _cleanup_playwright_processes(verbose=False):
         if verbose:
             logger.info(f"[Sniff] Killed PIDs: {killed}")
 
-    # Extra safety: shell-level kill for playwright driver
     try:
         import subprocess as _sp
         _sp.run(['pkill', '-f', 'ms-playwright.*chromium'],
@@ -334,6 +351,14 @@ def _is_thumbnail(url):
     return any(pat in low for pat in THUMBNAIL_PATTERNS)
 
 
+def _is_ad_url(url):
+    """Return True if the URL is from a known ad CDN."""
+    if not url:
+        return False
+    low = url.lower()
+    return any(ad in low for ad in AD_DOMAINS)
+
+
 def _is_probable_video(url, allow_thumbnail=False):
     if not url:
         return False
@@ -341,6 +366,8 @@ def _is_probable_video(url, allow_thumbnail=False):
     for skip in SKIP_PATTERNS:
         if skip in low:
             return False
+    if _is_ad_url(url):
+        return False
     if not allow_thumbnail and _is_thumbnail(url):
         return False
     if _is_video_url(url):
@@ -421,21 +448,19 @@ def _crack_ytdlp_geturl(url):
 
 
 # ============================================================
-# NETWORK SNIFFER (VDH-style) — leak-proof
+# NETWORK SNIFFER — noise-free, leak-proof
 # ============================================================
 def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
     """
     Launch headless Chromium, navigate, intercept responses.
-    Guarantees browser is closed even on timeout/error.
-    Only one sniff runs at a time (global lock).
-
-    Returns list of dicts: {url, mime, size, is_thumbnail}
+    Filters junk (ads, fragments, low-latency rolls, init segments,
+    pings, tracking) at capture time so the chooser only shows real
+    candidates.
     """
     if not PLAYWRIGHT_AVAILABLE:
         logger.info("[Sniff] Playwright not installed — skipping")
         return []
 
-    # ---- Single browser at a time ----
     if not _sniff_lock.acquire(timeout=60):
         logger.warning("[Sniff] Another sniff is already running — skipping")
         return []
@@ -447,36 +472,30 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
     cleanup_done = [False]
 
     def hard_cleanup():
-        """Force-close everything, always safe to call."""
         if cleanup_done[0]:
             return
         cleanup_done[0] = True
-        # Close context
         try:
             if context_ref[0] is not None:
                 context_ref[0].close()
         except Exception:
             pass
-        # Close browser
         try:
             if browser_ref[0] is not None:
                 browser_ref[0].close()
         except Exception:
             pass
-        # Stop playwright
         try:
             if playwright_ref[0] is not None:
                 playwright_ref[0].stop()
         except Exception:
             pass
-        # Belt & suspenders: kill any orphan chromium
         _cleanup_playwright_processes()
 
     def run_sync():
         try:
             with sync_playwright() as pw:
                 playwright_ref[0] = pw
-
                 browser = pw.chromium.launch(
                     headless=True,
                     args=[
@@ -484,7 +503,6 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
                         '--disable-dev-shm-usage',
                         '--disable-blink-features=AutomationControlled',
                         '--autoplay-policy=no-user-gesture-required',
-                        # ---- Memory limiters ----
                         '--disable-gpu',
                         '--disable-software-rasterizer',
                         '--disable-extensions',
@@ -498,7 +516,6 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
                     ]
                 )
                 browser_ref[0] = browser
-
                 context = browser.new_context(
                     user_agent=USER_AGENT,
                     viewport={'width': 1280, 'height': 720},
@@ -539,21 +556,69 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
                 page = context.new_page()
                 order_counter = [0]
 
+                # ---- Capture-time junk filter ----
+                def is_junk_url(url):
+                    low = url.lower()
+                    path = urlparse(url).path.lower()
+
+                    # Analytics/tracking/etc
+                    for skip in SKIP_PATTERNS:
+                        if skip in low:
+                            return True
+
+                    # Ad CDNs
+                    for ad in AD_DOMAINS:
+                        if ad in low:
+                            return True
+
+                    # Low-latency HLS rolling requests (same stream, new segment)
+                    if '_hls_msn' in low or '_hls_part' in low:
+                        return True
+
+                    # Individual HLS fragments: filename_partN.mp4
+                    if re.search(r'_part\d+\.mp4', path):
+                        return True
+
+                    # Init segments (codec init, ~1 KB)
+                    if 'init_' in path and path.endswith('.mp4'):
+                        return True
+
+                    # Pings / heartbeats
+                    if 'ping.m3u8' in low:
+                        return True
+
+                    # Non-video extensions
+                    for bad in ['.riv', '.svg', '.json', '.webmanifest',
+                                '.woff2', '.woff', '.ttf', '.eot', '.otf']:
+                        if path.endswith(bad):
+                            return True
+
+                    return False
+
                 def on_response(response):
                     try:
                         url = response.url
                         mime = (response.headers.get('content-type', '') or '').lower()
-                        if any(skip in url.lower() for skip in SKIP_PATTERNS):
-                            return
+
+                        # Only video/audio MIME or video-looking URLs
                         if not (any(m in mime for m in VIDEO_MIME_MARKERS)
                                 or _is_video_url(url)):
                             return
+
+                        if is_junk_url(url):
+                            return
+
                         is_thumb = _is_thumbnail(url)
                         try:
                             cl = response.headers.get('content-length')
                             size = int(cl) if cl else 0
                         except Exception:
                             size = 0
+
+                        # Tiny manifests (< 100 B) are usually pings
+                        if 0 < size < 100:
+                            return
+
                         order_counter[0] += 1
                         captured.append({
                             'url': url,
@@ -576,9 +641,10 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
                 except Exception as e:
                     logger.warning(f"[Sniff] goto failed: {e}")
 
-                page.wait_for_timeout(4000)
+                # Wait for initial page + ad to start
+                page.wait_for_timeout(SNIFF_WAIT_BEFORE_PLAY_MS)
 
-                # Click play buttons
+                # Try to click a play button
                 play_selectors = [
                     'button[aria-label*="play" i]',
                     'button[title*="play" i]',
@@ -607,8 +673,10 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
                 except Exception:
                     pass
 
+                # Wait for ads to play then real video to load
                 page.wait_for_timeout(SNIFF_WAIT_AFTER_PLAY_MS)
 
+                # Scroll a bit to trigger any lazy loaders
                 try:
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
                     page.wait_for_timeout(2000)
@@ -618,26 +686,22 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
         except Exception as e:
             logger.error(f"[Sniff] Fatal error: {e}")
         finally:
-            # ALWAYS cleanup
             hard_cleanup()
 
     t = threading.Thread(target=run_sync, daemon=True)
     t.start()
     t.join(timeout=timeout + 10)
 
-    # Thread still alive after timeout → force-kill everything
     if t.is_alive():
         logger.warning("[Sniff] Sniff timed out — force killing browser")
         hard_cleanup()
         t.join(timeout=5)
 
-    # Release lock
     try:
         _sniff_lock.release()
     except Exception:
         pass
 
-    # Final safety net
     _cleanup_playwright_processes()
 
     if not captured:
@@ -650,37 +714,69 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
         u = item['url'].lower()
         if item['is_thumbnail']:
             s -= 100
+
+        # Master playlists — the best signal
+        if '/master/' in u or '/master.' in u:
+            s += 150
+        if 'auto.m3u8' in u:
+            s += 100
+
+        # Any remaining .m3u8 is a real variant
         if '.m3u8' in u:
             s += 50
-        if 'master' in u or 'index' in u or 'manifest' in u:
-            s += 20
-        if u.endswith('.mp4'):
-            s += 10
-        if u.endswith('.mpd'):
+        if '.mpd' in u:
             s += 40
-        if item['size'] > 1_000_000:
-            s += 30
-        elif item['size'] > 100_000:
-            s += 10
-        if 'video' in item['mime']:
+
+        # Direct mp4s — size matters
+        if u.endswith('.mp4'):
+            if item['size'] > 10_000_000:
+                s += 60
+            elif item['size'] > 1_000_000:
+                s += 20
+            else:
+                s -= 40
+
+        # MIME bonus
+        if 'video/mp4' in item['mime']:
             s += 15
+        elif 'mpegurl' in item['mime']:
+            s += 25
+
+        # Later requests usually = post-ad video
         s += min(item['order'], 10)
+
+        # Cross-domain CDN bonus
         try:
             if urlparse(item['url']).netloc != urlparse(page_url).netloc:
                 s += 5
         except Exception:
             pass
+
         return s
 
     ranked = sorted(captured, key=score, reverse=True)
 
-    # Dedupe
-    seen = set()
+    # ---- Collapse low-latency rolling URLs into one entry each ----
+    def normalize_key(url):
+        try:
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query, keep_blank_values=True)
+            for k in list(qs.keys()):
+                if k.lower() in ('_hls_msn', '_hls_part'):
+                    del qs[k]
+            new_q = '&'.join(f"{k}={v[0]}" for k, v in qs.items())
+            base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            return base + (f"?{new_q}" if new_q else "")
+        except Exception:
+            return url
+
+    seen_keys = set()
     out = []
     for item in ranked:
-        if item['url'] in seen:
+        key = normalize_key(item['url'])
+        if key in seen_keys:
             continue
-        seen.add(item['url'])
+        seen_keys.add(key)
         out.append({
             'url': item['url'],
             'mime': item['mime'],
@@ -688,7 +784,10 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
             'is_thumbnail': item['is_thumbnail'],
         })
 
-    logger.info(f"[Sniff] Ranked {len(out)} media stream(s)")
+    MAX_CANDIDATES = 6
+    out = out[:MAX_CANDIDATES]
+
+    logger.info(f"[Sniff] {len(captured)} raw → {len(out)} clean candidate(s)")
     return out
 
 
