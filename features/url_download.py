@@ -1,7 +1,7 @@
 """
 url_download.py
 ===============
-Universal downloader with network sniffing + user media selection.
+Universal downloader with leak-proof network sniffing + user media selection.
 
 Strategies:
   1. Direct file URL  → download immediately
@@ -10,7 +10,7 @@ Strategies:
   4. Torrent          → libtorrent
   5. Unknown page     → yt-dlp --get-url
                         ├─ Success → download the URL
-                        └─ Failure → network sniff (VDH-style)
+                        └─ Failure → network sniff (VDH-style, leak-proof)
                                     → return candidates
                                     → wait for user choice
                                     → download chosen media
@@ -189,6 +189,65 @@ def kill_process(task_id):
 
 
 # ============================================================
+# GLOBAL SNIFF LOCK + ORPHAN CLEANUP
+# ============================================================
+_sniff_lock = threading.Lock()
+
+
+def _cleanup_playwright_processes(verbose=False):
+    """
+    Kill any orphan Chromium/Playwright processes.
+    Safe to call from anywhere — no-op if psutil missing.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return 0
+
+    killed = []
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            name = (proc.info.get('name') or '').lower()
+            cmdline_list = proc.info.get('cmdline') or []
+            cmdline = ' '.join(cmdline_list).lower()
+
+            is_playwright_browser = (
+                'ms-playwright' in cmdline
+                or ('chrome' in name and 'headless' in cmdline)
+                or ('chrome' in name and 'playwright' in cmdline)
+                or ('chromium' in name and 'headless' in cmdline)
+            )
+            if is_playwright_browser:
+                try:
+                    proc.terminate()
+                    killed.append(proc.info['pid'])
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    if killed:
+        logger.warning(f"[Sniff] Cleaned up {len(killed)} orphan browser process(es)")
+        if verbose:
+            logger.info(f"[Sniff] Killed PIDs: {killed}")
+
+    # Extra safety: shell-level kill for playwright driver
+    try:
+        import subprocess as _sp
+        _sp.run(['pkill', '-f', 'ms-playwright.*chromium'],
+                capture_output=True, timeout=5)
+        _sp.run(['pkill', '-f', 'playwright.*driver'],
+                capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+    return len(killed)
+
+
+# ============================================================
 # URL CLASSIFICATION
 # ============================================================
 def _ext(url):
@@ -362,23 +421,62 @@ def _crack_ytdlp_geturl(url):
 
 
 # ============================================================
-# NETWORK SNIFFER (VDH-style)
+# NETWORK SNIFFER (VDH-style) — leak-proof
 # ============================================================
 def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
     """
     Launch headless Chromium, navigate, intercept responses.
+    Guarantees browser is closed even on timeout/error.
+    Only one sniff runs at a time (global lock).
+
     Returns list of dicts: {url, mime, size, is_thumbnail}
     """
     if not PLAYWRIGHT_AVAILABLE:
         logger.info("[Sniff] Playwright not installed — skipping")
         return []
 
-    logger.info("[Sniff] Launching headless Chromium...")
+    # ---- Single browser at a time ----
+    if not _sniff_lock.acquire(timeout=60):
+        logger.warning("[Sniff] Another sniff is already running — skipping")
+        return []
+
     captured = []
+    browser_ref = [None]
+    playwright_ref = [None]
+    context_ref = [None]
+    cleanup_done = [False]
+
+    def hard_cleanup():
+        """Force-close everything, always safe to call."""
+        if cleanup_done[0]:
+            return
+        cleanup_done[0] = True
+        # Close context
+        try:
+            if context_ref[0] is not None:
+                context_ref[0].close()
+        except Exception:
+            pass
+        # Close browser
+        try:
+            if browser_ref[0] is not None:
+                browser_ref[0].close()
+        except Exception:
+            pass
+        # Stop playwright
+        try:
+            if playwright_ref[0] is not None:
+                playwright_ref[0].stop()
+        except Exception:
+            pass
+        # Belt & suspenders: kill any orphan chromium
+        _cleanup_playwright_processes()
 
     def run_sync():
         try:
             with sync_playwright() as pw:
+                playwright_ref[0] = pw
+
                 browser = pw.chromium.launch(
                     headless=True,
                     args=[
@@ -386,15 +484,29 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
                         '--disable-dev-shm-usage',
                         '--disable-blink-features=AutomationControlled',
                         '--autoplay-policy=no-user-gesture-required',
+                        # ---- Memory limiters ----
+                        '--disable-gpu',
+                        '--disable-software-rasterizer',
+                        '--disable-extensions',
+                        '--disable-background-networking',
+                        '--disable-background-timer-throttling',
+                        '--disable-renderer-backgrounding',
+                        '--disable-features=TranslateUI',
+                        '--disable-features=site-per-process',
+                        '--js-flags=--max-old-space-size=256',
+                        '--window-size=1280,720',
                     ]
                 )
+                browser_ref[0] = browser
+
                 context = browser.new_context(
                     user_agent=USER_AGENT,
                     viewport={'width': 1280, 'height': 720},
                     extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'},
                 )
+                context_ref[0] = context
 
-                # Load cookies into the browser
+                # ---- Load cookies ----
                 if os.path.exists(COOKIES_FILE):
                     try:
                         cookies = []
@@ -466,7 +578,7 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
 
                 page.wait_for_timeout(4000)
 
-                # Try to click a play button
+                # Click play buttons
                 play_selectors = [
                     'button[aria-label*="play" i]',
                     'button[title*="play" i]',
@@ -503,13 +615,30 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
                 except Exception:
                     pass
 
-                browser.close()
         except Exception as e:
             logger.error(f"[Sniff] Fatal error: {e}")
+        finally:
+            # ALWAYS cleanup
+            hard_cleanup()
 
     t = threading.Thread(target=run_sync, daemon=True)
     t.start()
     t.join(timeout=timeout + 10)
+
+    # Thread still alive after timeout → force-kill everything
+    if t.is_alive():
+        logger.warning("[Sniff] Sniff timed out — force killing browser")
+        hard_cleanup()
+        t.join(timeout=5)
+
+    # Release lock
+    try:
+        _sniff_lock.release()
+    except Exception:
+        pass
+
+    # Final safety net
+    _cleanup_playwright_processes()
 
     if not captured:
         logger.info("[Sniff] No media streams detected")
@@ -545,7 +674,7 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
 
     ranked = sorted(captured, key=score, reverse=True)
 
-    # Dedupe by URL, keep first occurrence
+    # Dedupe
     seen = set()
     out = []
     for item in ranked:
@@ -564,10 +693,9 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
 
 
 # ============================================================
-# MEDIA PROBE: get more info about a candidate URL (for UI display)
+# MEDIA PROBE
 # ============================================================
 def _probe_media(url):
-    """HEAD request to get content-length and content-type."""
     info = {'url': url, 'mime': '', 'size': 0}
     try:
         session = requests.Session()
@@ -1091,26 +1219,22 @@ def process_url_download(task_id, url, quality='best', range_start=1, range_end=
         return
 
     try:
-        # 1. Playlist
         if is_playlist_url(url):
             logger.info("→ Playlist")
             download_playlist(url, task_id, quality, range_start, range_end)
             return
 
-        # 2. Known video site or stream extension
         if needs_ytdlp(url):
             logger.info("→ yt-dlp (known site / stream)")
             download_with_ytdlp(url, task_id, quality)
             return
 
-        # 3. Direct file extension
         ext = _ext(url)
         if ext and ext not in VIDEO_STREAM_EXTS:
             logger.info(f"→ Direct file (ext: {ext})")
             download_direct_file(url, task_id)
             return
 
-        # 4. Unknown page → try yt-dlp --get-url
         logger.info("→ Unknown URL — trying yt-dlp --get-url")
         ytdlp_urls = _crack_ytdlp_geturl(url)
         if ytdlp_urls:
@@ -1118,7 +1242,6 @@ def process_url_download(task_id, url, quality='best', range_start=1, range_end=
             download_with_ytdlp(ytdlp_urls[0], task_id, quality)
             return
 
-        # 5. Sniff network for candidate media
         logger.info("→ yt-dlp failed. Sniffing network for media streams...")
         task = load_task(task_id)
         if task:
@@ -1129,7 +1252,6 @@ def process_url_download(task_id, url, quality='best', range_start=1, range_end=
 
         candidates = _sniff_network(url)
 
-        # Probe each candidate for size/mime (fills in gaps when sniff missed headers)
         probed = []
         for c in candidates[:30]:
             if not c.get('size') or not c.get('mime'):
@@ -1152,7 +1274,6 @@ def process_url_download(task_id, url, quality='best', range_start=1, range_end=
             save_task(task_id, task)
             return
 
-        # Put task in awaiting_choice state
         task['status'] = 'awaiting_choice'
         task['candidates'] = probed
         task['progress'] = 0
@@ -1185,22 +1306,19 @@ def download_chosen_media(task_id, chosen_url, quality='best'):
         return
 
     try:
-        # Reset progress
         task['status'] = 'downloading'
         task['progress'] = 0
         task['download_progress'] = 0
         task['chosen_url'] = chosen_url
-        task['candidates'] = []  # clear the chooser
+        task['candidates'] = []
         save_task(task_id, task)
 
-        # Try yt-dlp first (handles m3u8, dash, direct mp4)
         try:
             download_with_ytdlp(chosen_url, task_id, quality)
             return
         except Exception as e:
             logger.warning(f"yt-dlp on chosen URL failed: {e}. Trying direct download...")
 
-        # Fallback to direct download
         download_direct_file(chosen_url, task_id)
 
     except DownloadCancelled:
@@ -1403,10 +1521,6 @@ def register_routes(app):
 
     @app.route('/choose_media', methods=['POST'])
     def choose_media():
-        """
-        Called by the frontend after the user picks a media stream
-        from the sniffed candidates list.
-        """
         task_id = request.form.get('task_id', '').strip()
         chosen_url = request.form.get('url', '').strip()
         quality = request.form.get('quality', 'best').strip().lower()
@@ -1422,13 +1536,11 @@ def register_routes(app):
         if task.get('status') != 'awaiting_choice':
             return jsonify({'error': f"Task is not awaiting choice (status: {task.get('status')})"}), 400
 
-        # Validate the chosen URL is one we sniffed
         candidates = task.get('candidates', [])
         valid_urls = {c['url'] for c in candidates}
         if chosen_url not in valid_urls:
             return jsonify({'error': 'Chosen URL is not in the candidate list'}), 400
 
-        # Launch download
         threading.Thread(
             target=download_chosen_media,
             args=(task_id, chosen_url, quality),
@@ -1436,6 +1548,12 @@ def register_routes(app):
         ).start()
 
         return jsonify({'status': 'started'})
+
+    @app.route('/cleanup_browsers', methods=['POST'])
+    def cleanup_browsers():
+        """Manually kill any orphan browser processes."""
+        killed = _cleanup_playwright_processes(verbose=True)
+        return jsonify({'killed': killed})
 
     @app.route('/start_upload_torrent', methods=['POST'])
     def start_upload_torrent():
