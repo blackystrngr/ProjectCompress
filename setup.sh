@@ -43,6 +43,7 @@ apt-get install -y \
     python3 python3-pip python3-dev \
     build-essential libssl-dev libffi-dev \
     ca-certificates gnupg lsb-release software-properties-common
+playwright install chromium
 
 ok "Base packages installed."
 
