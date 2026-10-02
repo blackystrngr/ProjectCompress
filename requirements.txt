@@ -8,6 +8,7 @@ requests>=2.31.0
 beautifulsoup4>=4.12.0
 yt-dlp>=2023.0.0
 curl_cffi
+playwright
 
 # Google Drive & Colab Integration
 google-api-python-client>=2.100.0
