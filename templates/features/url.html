@@ -146,12 +146,21 @@ function showToast(msg, isErr) {
 function dbg(...args) {
     console.log('[URLDownload]', ...args);
 }
+function fmtDuration(sec) {
+    if (!sec || sec <= 0) return '?';
+    sec = Math.floor(sec);
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    if (h) return `${h}h ${m}m`;
+    if (m) return `${m}m ${s}s`;
+    return `${s}s`;
+}
 
 // ============================================================
-// Element refs (with null safety)
+// Element refs
 // ============================================================
 const $ = (id) => document.getElementById(id);
-
 const urlInput = $('directUrl');
 const playlistOptions = $('playlistOptions');
 const downloadBtn = $('downloadUrlBtn');
@@ -167,13 +176,6 @@ const debugTaskId = $('debugTaskId');
 const debugStatus = $('debugStatus');
 const reloadTaskBtn = $('reloadTaskBtn');
 
-dbg('Initializing. Elements found:', {
-    urlInput: !!urlInput,
-    downloadBtn: !!downloadBtn,
-    mediaChooser: !!mediaChooser,
-    debugTaskId: !!debugTaskId,
-});
-
 // ============================================================
 // State
 // ============================================================
@@ -188,7 +190,7 @@ function isPlaylistURL(url) {
     const lower = (url || '').toLowerCase();
     if (!(lower.includes('youtube.com') || lower.includes('youtu.be'))) return false;
     return lower.includes('list=') || lower.includes('/playlist')
-        || lower.includes('/channel/') || lower.includes('/@')
+        || lower.includes('/channel/') || lower.includes('@')
         || lower.includes('/c/') || lower.includes('/user/');
 }
 if (urlInput) {
@@ -203,15 +205,11 @@ if (urlInput) {
 // Polling
 // ============================================================
 function startPollingForTask(taskId) {
-    if (!taskId) {
-        dbg('startPollingForTask called with empty taskId');
-        return;
-    }
+    if (!taskId) return;
     currentTaskId = taskId;
     try { localStorage.setItem('url_task_id', taskId); } catch (e) {}
     if (debugTaskId) debugTaskId.textContent = String(taskId).slice(0, 8);
     dbg('Started polling for task', taskId);
-
     if (pollInterval) clearInterval(pollInterval);
     fetchTaskNow(taskId);
     pollInterval = setInterval(() => fetchTaskNow(taskId), 2000);
@@ -222,17 +220,13 @@ async function fetchTaskNow(taskId) {
     try {
         const resp = await fetch(`/progress/${taskId}`);
         if (resp.status === 404) {
-            dbg('Task not found (404):', taskId);
             if (pollInterval) clearInterval(pollInterval);
             try { localStorage.removeItem('url_task_id'); } catch (e) {}
             if (debugStatus) debugStatus.textContent = 'not found';
             return;
         }
         const task = await resp.json();
-        if (!task || task.error) {
-            dbg('Task response error:', task);
-            return;
-        }
+        if (!task || task.error) return;
         handleTaskUpdate(task);
     } catch (err) {
         console.error('[URLDownload] Polling error:', err);
@@ -250,9 +244,7 @@ function handleTaskUpdate(task) {
         const progress = task.download_progress || task.progress || 0;
         const speed = task.download_speed ? ` (${task.download_speed} kB/s)` : '';
 
-        dbg('Task update:', status, 'progress:', progress, 'candidates:', (task.candidates || []).length);
-
-        // ---- AWAITING CHOICE → show chooser ----
+        // ---- AWAITING CHOICE ----
         if (status === 'awaiting_choice') {
             const candidates = task.candidates || [];
             const sig = candidates.map(c => c.url).join('|');
@@ -266,16 +258,14 @@ function handleTaskUpdate(task) {
             return;
         }
 
-        // ---- Any other status → hide chooser ----
         if (mediaChooser) mediaChooser.style.display = 'none';
         lastRenderedCandidateSig = null;
 
         if (status === 'sniffing') {
-            if (statusDiv) statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Sniffing page for media streams... (may take up to 60s)';
+            if (statusDiv) statusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Sniffing page for media streams... (may take up to 75s)';
             if (resultDiv) resultDiv.innerHTML = '<div class="empty-state">Looking for video streams in browser network traffic...</div>';
             return;
         }
-
         if (status === 'done') {
             if (pollInterval) clearInterval(pollInterval);
             if (statusDiv) statusDiv.innerHTML = `✅ Done! <a href="/download_file?path=${encodeURIComponent(task.output_file || '')}" target="_blank">Download</a>`;
@@ -284,7 +274,6 @@ function handleTaskUpdate(task) {
             if (typeof fetchTasks === 'function') fetchTasks();
             return;
         }
-
         if (status === 'error') {
             if (pollInterval) clearInterval(pollInterval);
             if (statusDiv) statusDiv.innerHTML = `<span style="color:#ff8a8a;">❌ Error: ${escapeHtml(task.error_msg || 'Unknown')}</span>`;
@@ -292,7 +281,6 @@ function handleTaskUpdate(task) {
             try { localStorage.removeItem('url_task_id'); } catch (e) {}
             return;
         }
-
         if (status === 'cancelled') {
             if (pollInterval) clearInterval(pollInterval);
             if (statusDiv) statusDiv.innerHTML = '⛔ Cancelled.';
@@ -300,7 +288,6 @@ function handleTaskUpdate(task) {
             try { localStorage.removeItem('url_task_id'); } catch (e) {}
             return;
         }
-
         if (status === 'downloading_playlist') {
             const cur = task.current_item || 0;
             const tot = task.total_items || 0;
@@ -309,14 +296,11 @@ function handleTaskUpdate(task) {
             if (resultDiv) resultDiv.innerHTML = `<div class="empty-state">Downloading playlist... ${cur}/${tot}</div>`;
             return;
         }
-
         if (status === 'downloading') {
             if (statusDiv) statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Downloading... ${progress}%${speed}`;
             if (resultDiv) resultDiv.innerHTML = `<div class="empty-state">Downloading (${progress}%)...</div>`;
             return;
         }
-
-        // Fallback
         if (statusDiv) statusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${escapeHtml(status)}... ${progress}%`;
         if (resultDiv) resultDiv.innerHTML = `<div class="empty-state">${escapeHtml(status)} (${progress}%)</div>`;
     } catch (err) {
@@ -325,26 +309,28 @@ function handleTaskUpdate(task) {
 }
 
 // ============================================================
-// Media chooser
+// Media chooser (with duration)
 // ============================================================
 function showMediaChooser(task) {
-    if (!mediaChooserList) {
-        dbg('mediaChooserList element not found!');
-        return;
-    }
+    if (!mediaChooserList) return;
     const candidates = task.candidates || [];
-    dbg('Rendering media chooser with', candidates.length, 'candidates');
     if (!candidates.length) {
         if (mediaChooser) mediaChooser.style.display = 'none';
         return;
     }
     let html = '';
-    candidates.forEach((c, idx) => {
+    candidates.forEach((c) => {
         const badge = c.is_thumbnail
             ? '<span style="background:#7a4b00; color:#ffcc80; padding:2px 6px; border-radius:4px; font-size:0.7rem; margin-left:6px;">preview</span>'
             : '<span style="background:#1e5e3a; color:#a5f3c5; padding:2px 6px; border-radius:4px; font-size:0.7rem; margin-left:6px;">stream</span>';
         const mime = c.mime ? escapeHtml(c.mime) : 'unknown';
         const size = c.size_str || '—';
+        const dur = c.duration ? fmtDuration(c.duration) : '?';
+        // Color-code duration: short = likely ad
+        let durColor = '#8a9bc0';
+        if (c.duration && c.duration < 60) durColor = '#ff9090';
+        else if (c.duration && c.duration >= 120) durColor = '#a5f3c5';
+
         html += `
             <div style="display:flex; gap:0.6rem; align-items:flex-start; padding:0.7rem; background:rgba(20,28,45,0.7);
                         border-radius:0.6rem; margin-bottom:0.5rem; border:1px solid #2a3248;">
@@ -353,7 +339,7 @@ function showMediaChooser(task) {
                         ${escapeHtml(c.url)} ${badge}
                     </div>
                     <div style="font-size:0.72rem; color:#8a9bc0; margin-top:3px;">
-                        ${mime} · ${size}
+                        ${mime} · ${size} · <span style="color:${durColor};">⏱ ${dur}</span>
                     </div>
                 </div>
                 <button class="primary pick-media-btn" data-url="${escapeHtml(c.url)}"
@@ -409,11 +395,7 @@ if (cancelChooserBtn) {
 if (reloadTaskBtn) {
     reloadTaskBtn.onclick = () => {
         const id = currentTaskId || (localStorage.getItem('url_task_id'));
-        dbg('Reload task button clicked. ID:', id);
-        if (!id) {
-            showToast('No task to reload', true);
-            return;
-        }
+        if (!id) { showToast('No task to reload', true); return; }
         if (!currentTaskId) currentTaskId = id;
         fetchTaskNow(id);
     };
@@ -424,7 +406,6 @@ if (reloadTaskBtn) {
 // ============================================================
 async function startDownload(url, format) {
     try {
-        dbg('startDownload called with url:', url, 'format:', format);
         const formData = new URLSearchParams();
         formData.append('url', url);
         if (format) {
@@ -447,9 +428,7 @@ async function startDownload(url, format) {
             headers: {'Content-Type': 'application/x-www-form-urlencoded'},
             body: formData
         });
-        dbg('Response status:', resp.status);
         const rawText = await resp.text();
-        dbg('Raw response text:', rawText);
         let data;
         try {
             data = JSON.parse(rawText);
@@ -457,9 +436,8 @@ async function startDownload(url, format) {
             throw new Error('Server returned non-JSON: ' + rawText.slice(0, 200));
         }
         if (!data || data.error) throw new Error((data && data.error) || 'No task_id in response');
-        if (!data.task_id) throw new Error('No task_id in response: ' + JSON.stringify(data));
+        if (!data.task_id) throw new Error('No task_id in response');
 
-        dbg('Got task_id:', data.task_id);
         currentTaskId = data.task_id;
         try { localStorage.setItem('url_task_id', currentTaskId); } catch (e) {}
         if (debugTaskId) debugTaskId.textContent = String(currentTaskId).slice(0, 8);
@@ -721,7 +699,6 @@ async function resumeTaskIfAny() {
             try { localStorage.removeItem('url_task_id'); } catch (e) {}
             return;
         }
-        dbg('Resuming task from localStorage:', saved, 'status:', task.status);
         currentTaskId = saved;
         startPollingForTask(saved);
     } catch (e) {
@@ -732,7 +709,6 @@ async function resumeTaskIfAny() {
 resumeTaskIfAny();
 document.addEventListener('visibilitychange', () => { if (!document.hidden) resumeTaskIfAny(); });
 window.addEventListener('focus', resumeTaskIfAny);
-
 window.addEventListener('beforeunload', () => {
     if (pollInterval) clearInterval(pollInterval);
 });
