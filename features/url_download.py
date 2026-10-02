@@ -8,20 +8,22 @@ Handles:
   - yt-dlp supported sites (YouTube, Vimeo, TikTok, etc.)
   - Playlists with resume
   - Torrents (magnet + .torrent)
-  - Any media-hosting page via 14-strategy video cracking:
+  - Any media-hosting page via 15-strategy video cracking:
       1.  Direct URL detection
       2.  yt-dlp (native site extractors)
       3.  HTML tags (<video>, <source>, <object>, <embed>)
       4.  Meta tags (og:video, twitter:player, schema.org)
       5.  JSON-LD (contentUrl, embedUrl)
-      6.  Player configs (Plyr, Video.js, JW Player, DPlayer, etc.)
-      7.  Inline JS patterns
-      8.  Obfuscated payloads (Base64, hex, packed, ROT13)
-      9.  Raw URL regex anywhere
-      10. Known streaming hosts (Lulustream, Doodstream, etc.)
-      11. Iframes (recursive)
-      12. API endpoint guessing
-      13. Optional headless browser (Playwright)
+      6.  JSON script blocks (Next.js __NEXT_DATA__, Vidsonic)
+      7.  Player configs (Plyr, Video.js, JW Player, DPlayer, etc.)
+      8.  Inline JS patterns
+      9.  Obfuscated payloads (Base64, hex, packed, ROT13)
+      10. Raw URL regex anywhere
+      11. Known streaming hosts (Lulustream, Doodstream, etc.)
+      12. Iframes (recursive)
+      13. API endpoint guessing (Vidsonic, Vixeo, Doodstream, etc.)
+      14. Optional headless browser (Playwright)
+      15. Output verification via ffprobe
 """
 
 import os
@@ -95,17 +97,29 @@ VIDEO_SITES = [
     'rumble.com', 'odysee.com', 'streamable.com',
 ]
 
+# --- Extended skip list: rejects scripts, CSS, tracking, CDNs ---
 SKIP_PATTERNS = [
+    # Images / fonts / styles
     '.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp', '.bmp', '.ico',
     '.css', '.woff', '.woff2', '.ttf', '.eot', '.otf',
-    'google-analytics', 'googletagmanager', 'facebook.com/tr',
-    'plausible.io', 'doubleclick', 'analytics.', '/ads/',
-    'adservice', 'beacon', '/pixel', 'tracker', 'hotjar',
-    'sentry.io', 'recaptcha',
+    # Scripts (never a video)
+    '.js', '.mjs', '.jsx', '.map', '.ts',
+    # Docs / config
+    '.html', '.htm', '.php', '.aspx', '.jsp',
+    # Analytics & tracking
+    'google-analytics', 'googletagmanager', 'gtag/js',
+    'facebook.com/tr', 'plausible.', 'doubleclick',
+    'analytics.', '/ads/', 'adservice', 'beacon',
+    '/pixel', 'tracker', 'hotjar', 'sentry.io',
+    'recaptcha', 'mixpanel', 'amplitude', 'segment.io',
+    'cdn.jsdelivr', 'unpkg.com', 'cdnjs.cloudflare',
+    '/js/', '/scripts/', '/assets/js/',
+    'pa-', 'gtm.', 'fbevents',
 ]
 
 KNOWN_STREAM_HOSTS = [
-    'lulustream', 'luluvdo', 'vidsonic', 'doodstream', 'dood.',
+    'lulustream', 'luluvdo', 'vidsonic', 'vixeo',
+    'doodstream', 'dood.',
     'streamtape', 'streamsb', 'streamhide', 'mixdrop', 'filemoon',
     'voe.sx', 'voe-unblock', 'vidsrc', 'vidsrc.to', 'vidplay',
     'upstream', 'upstream.to', 'fastplay', 'vembed', 'vtube',
@@ -119,6 +133,8 @@ CHUNK_SIZE = 64 * 1024
 USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
               'AppleWebKit/537.36 (KHTML, like Gecko) '
               'Chrome/120.0.0.0 Safari/537.36')
+
+MIN_VIDEO_SIZE = 10_000  # 10 KB — anything smaller is not a real video
 
 
 class DownloadCancelled(Exception):
@@ -246,12 +262,44 @@ def _is_video_url(url):
 
 
 def _is_probable_video(url):
+    """
+    Strict validator:
+      - Reject anything in SKIP_PATTERNS
+      - Accept video extensions
+      - Accept known video hosts ONLY if the path looks like video
+        (not a script or analytics file)
+    """
+    if not url:
+        return False
+    low = url.lower()
+
+    # Reject obvious non-videos first
+    for skip in SKIP_PATTERNS:
+        if skip in low:
+            return False
+
+    # Accept if it has a video extension
     if _is_video_url(url):
         return True
-    low = url.lower()
+
+    # Known video hosts: require video-ish path segments
     for h in KNOWN_STREAM_HOSTS:
-        if h in low and not any(s in low for s in SKIP_PATTERNS):
-            return True
+        if h in low:
+            path = urlparse(url).path.lower()
+            # Reject script-like extensions
+            for bad in ['.js', '.css', '.json', '.map', '.html', '.htm']:
+                if path.endswith(bad):
+                    return False
+            # Require video-ish segment or query
+            if any(seg in low for seg in [
+                '/video', '/media', '/stream', '/play/', '/hls/',
+                '/dash/', '/master', '/index.m3u8', '/manifest',
+                '.mp4', '.m3u8', '.mpd', '/s3/', '/get/',
+                '/source', '/download', '/file/',
+            ]):
+                return True
+            return False
+
     return False
 
 
@@ -280,6 +328,23 @@ def _dedupe(urls):
     return out
 
 
+def _verify_has_video_stream(file_path):
+    """Use ffprobe to confirm the file actually contains a video stream."""
+    ffprobe = shutil.which('ffprobe') or '/usr/local/bin/ffprobe'
+    if not os.path.exists(ffprobe):
+        return True  # can't verify, assume OK
+    try:
+        r = subprocess.run(
+            [ffprobe, '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=codec_type',
+             '-of', 'default=noprint_wrappers=1:nokey=1', file_path],
+            capture_output=True, text=True, timeout=10
+        )
+        return r.returncode == 0 and r.stdout.strip() == 'video'
+    except Exception:
+        return False
+
+
 # ============================================================
 # HTML FETCHER
 # ============================================================
@@ -295,7 +360,6 @@ def _fetch_page_html(url, timeout=20):
         'Connection': 'keep-alive',
     })
 
-    # Load cookies
     if os.path.exists(COOKIES_FILE):
         try:
             with open(COOKIES_FILE, 'r', encoding='utf-8') as f:
@@ -418,7 +482,57 @@ def _crack_jsonld(html, base):
 
 
 # ============================================================
-# CRACKER: strategy #6 — player configs
+# CRACKER: strategy #6 — JSON script blocks (Next.js, Vidsonic, etc.)
+# ============================================================
+def _crack_json_scripts(html, base):
+    """
+    Parse <script type="application/json"> blocks and Next.js __NEXT_DATA__.
+    These often contain the video URL deep in a nested object.
+    """
+    if not BeautifulSoup:
+        return []
+    out = []
+    soup = BeautifulSoup(html, 'html.parser')
+
+    candidate_scripts = []
+    for script in soup.find_all('script'):
+        stype = (script.get('type') or '').lower()
+        sid = (script.get('id') or '').lower()
+        if stype in ('application/json', 'application/ld+json'):
+            candidate_scripts.append(script.string or '')
+        elif sid in ('__next_data__', 'initial-state', '__init_data__',
+                     '__nuxt_data__'):
+            candidate_scripts.append(script.string or '')
+
+    for text in candidate_scripts:
+        if not text:
+            continue
+        try:
+            data = json.loads(text)
+        except Exception:
+            for u in _crack_raw_urls(text, base):
+                out.append(u)
+            continue
+
+        def walk(obj):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if isinstance(v, str) and _is_probable_video(v):
+                        u = _normalize(v, base)
+                        if u:
+                            out.append(u)
+                    else:
+                        walk(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    walk(item)
+
+        walk(data)
+    return out
+
+
+# ============================================================
+# CRACKER: strategy #7 — player configs
 # ============================================================
 def _crack_players(html, base):
     out = []
@@ -447,7 +561,7 @@ def _crack_players(html, base):
 
 
 # ============================================================
-# CRACKER: strategy #7 — inline JS URLs
+# CRACKER: strategy #8 — inline JS URLs
 # ============================================================
 def _crack_inline_js(html, base):
     out = []
@@ -464,7 +578,7 @@ def _crack_inline_js(html, base):
 
 
 # ============================================================
-# CRACKER: strategy #8 — obfuscated payloads
+# CRACKER: strategy #9 — obfuscated payloads
 # ============================================================
 def _crack_obfuscated(html, base):
     out = []
@@ -495,7 +609,7 @@ def _crack_obfuscated(html, base):
         try:
             p = m.group(1)
             k = m.group(4).split('|')
-            # Simple substitution of word tokens
+
             def repl(tok):
                 try:
                     idx = int(tok, 36)
@@ -512,7 +626,7 @@ def _crack_obfuscated(html, base):
 
 
 # ============================================================
-# CRACKER: strategy #9 — raw URL regex
+# CRACKER: strategy #10 — raw URL regex
 # ============================================================
 def _crack_raw_urls(text, base):
     out = []
@@ -529,7 +643,7 @@ def _crack_raw_urls(text, base):
 
 
 # ============================================================
-# CRACKER: strategy #10 — known streaming hosts
+# CRACKER: strategy #11 — known streaming hosts
 # ============================================================
 def _crack_known_hosts(html, base):
     out = []
@@ -542,12 +656,17 @@ def _crack_known_hosts(html, base):
             raw = m.group(0).replace('\\/', '/').rstrip('.,;:!?)]}')
             u = _normalize(raw, base)
             if u and not any(s in u.lower() for s in SKIP_PATTERNS):
+                # Extra check: reject script-like extensions
+                path = urlparse(u).path.lower()
+                if any(path.endswith(bad) for bad in
+                       ['.js', '.css', '.json', '.map', '.html', '.htm']):
+                    continue
                 out.append(u)
     return out
 
 
 # ============================================================
-# CRACKER: strategy #11 — iframes
+# CRACKER: strategy #12 — iframes
 # ============================================================
 def _crack_iframes(html, base):
     if not BeautifulSoup:
@@ -564,7 +683,7 @@ def _crack_iframes(html, base):
 
 
 # ============================================================
-# CRACKER: strategy #12 — API guessing
+# CRACKER: strategy #13 — API guessing
 # ============================================================
 def _crack_apis(page_url):
     parsed = urlparse(page_url)
@@ -574,15 +693,24 @@ def _crack_apis(page_url):
         return []
 
     paths = []
-    if any(h in host for h in ['vidsonic', 'lulu']):
+    if any(h in host for h in ['vidsonic', 'lulu', 'vixeo', 'vix']):
         paths += [
             f"/api/video/{slug}",
             f"/api/video?id={slug}",
             f"/api/get/{slug}",
             f"/api/media/{slug}",
             f"/api/player/{slug}",
+            f"/api/source/{slug}",
+            f"/api/stream/{slug}",
+            f"/api/file/{slug}",
             f"/v1/video/{slug}",
+            f"/v1/media/{slug}",
+            f"/v1/source/{slug}",
             f"/v1/poster/{slug}",
+            f"/v1/file/{slug}",
+            f"/get_video/{slug}",
+            f"/play/{slug}.json",
+            f"/e/{slug}.json",
         ]
     if 'dood' in host:
         paths += [f"/pass_md5/{slug}", f"/api/source/{slug}"]
@@ -595,6 +723,7 @@ def _crack_apis(page_url):
         f"/api/video/{slug}",
         f"/api/media/{slug}",
         f"/video/{slug}.json",
+        f"/api/source/{slug}",
     ]
 
     found = []
@@ -630,7 +759,7 @@ def _crack_apis(page_url):
 
 
 # ============================================================
-# CRACKER: strategy #13 — headless browser (optional)
+# CRACKER: strategy #14 — headless browser (optional)
 # ============================================================
 def _crack_headless(page_url):
     try:
@@ -712,18 +841,25 @@ def _crack_ytdlp_geturl(url):
 def crack_video_urls(page_url, deep=True, save_debug_to=None):
     """
     Try every strategy to extract video URLs from any page.
-    Returns a list of candidate URLs (best first).
+    Returns a list of candidate URLs (best first), filtered by strict rules.
     """
     candidates = []
     seen = set()
 
     def add(urls, source=""):
         for u in urls or []:
-            if u and u not in seen:
-                seen.add(u)
-                candidates.append(u)
-                if source:
-                    logger.debug(f"[Crack] +{source}: {u[:100]}")
+            if not u or u in seen:
+                continue
+            # Reject non-video URLs (scripts, CSS, tracking, etc.)
+            if not _is_probable_video(u) and source not in ("ytdlp",):
+                # Still reject obvious junk for the ytdlp source too
+                low = u.lower()
+                if any(skip in low for skip in SKIP_PATTERNS):
+                    continue
+            seen.add(u)
+            candidates.append(u)
+            if source:
+                logger.debug(f"[Crack] +{source}: {u[:100]}")
 
     logger.info(f"[Crack] Analyzing: {page_url}")
 
@@ -755,6 +891,7 @@ def crack_video_urls(page_url, deep=True, save_debug_to=None):
         add(_crack_html_tags(html, final_url), "html-tags")
         add(_crack_meta(html, final_url), "meta")
         add(_crack_jsonld(html, final_url), "json-ld")
+        add(_crack_json_scripts(html, final_url), "json-script")
         add(_crack_players(html, final_url), "player-config")
         add(_crack_inline_js(html, final_url), "inline-js")
         add(_crack_obfuscated(html, final_url), "obfuscated")
@@ -764,7 +901,6 @@ def crack_video_urls(page_url, deep=True, save_debug_to=None):
         iframe_urls = _crack_iframes(html, final_url)
         add(iframe_urls, "iframes")
 
-        # Recursively crack iframes
         if deep and iframe_urls:
             for iframe in iframe_urls[:3]:
                 if _is_video_url(iframe):
@@ -777,7 +913,6 @@ def crack_video_urls(page_url, deep=True, save_debug_to=None):
                 except Exception as e:
                     logger.debug(f"[Crack] Iframe failed: {e}")
 
-        # Save debug
         if save_debug_to:
             try:
                 os.makedirs(save_debug_to, exist_ok=True)
@@ -789,13 +924,13 @@ def crack_video_urls(page_url, deep=True, save_debug_to=None):
             except Exception:
                 pass
 
-    # Strategy 12: API guessing
+    # Strategy 13: API guessing
     try:
         add(_crack_apis(final_url), "api-guess")
     except Exception as e:
         logger.debug(f"[Crack] API guess failed: {e}")
 
-    # Strategy 13: headless (only if nothing found)
+    # Strategy 14: headless (only if nothing found)
     if not candidates and deep:
         try:
             add(_crack_headless(page_url), "headless")
@@ -900,6 +1035,17 @@ def download_direct_file(url, task_id):
                         task['elapsed_time'] = int(elapsed)
                         save_task(task_id, task)
                     last_update = now
+
+        # ---- Verify the file is actually a video (unless it's clearly a non-video file type) ----
+        final_ext = os.path.splitext(output_path)[1].lower()
+        if final_ext in MEDIA_EXTS:
+            final_size = os.path.getsize(temp_path)
+            if final_size < MIN_VIDEO_SIZE:
+                os.remove(temp_path)
+                raise Exception(f"File too small ({final_size} bytes) — not a video.")
+            if not _verify_has_video_stream(temp_path):
+                os.remove(temp_path)
+                raise Exception("Downloaded file has no video stream.")
 
         os.rename(temp_path, output_path)
         final_size = os.path.getsize(output_path)
@@ -1053,8 +1199,30 @@ def download_with_ytdlp(url, task_id, quality='best'):
     chosen = mp4_files[0] if mp4_files else files[0]
     src = os.path.join(UPLOAD_FOLDER, chosen)
 
+    # ---- Verify the output is actually a video ----
+    src_size = os.path.getsize(src)
+    if src_size < MIN_VIDEO_SIZE:
+        try:
+            os.remove(src)
+        except Exception:
+            pass
+        raise Exception(
+            f"Downloaded file is not a video ({src_size} bytes). "
+            f"Likely a script or error page."
+        )
+
+    if not _verify_has_video_stream(src):
+        try:
+            os.remove(src)
+        except Exception:
+            pass
+        raise Exception("Downloaded file has no video stream.")
+
+    # Rename to a clean filename
     base_name = os.path.basename(urlparse(url).path.rstrip('/')) or 'video'
     base_name = re.sub(r'[^\w\-]', '_', base_name)[:80]
+    # Strip useless extensions from name like .js
+    base_name = re.sub(r'\.(js|css|map|json)$', '', base_name, flags=re.IGNORECASE)
     if quality not in ('best', 'audio'):
         base_name = f"{base_name}_{quality}"
     final_name = _get_unique_filename(f"{base_name}.mp4")
@@ -1327,6 +1495,7 @@ def process_url_download(task_id, url, quality='best', range_start=1, range_end=
                 'unsupported url', 'no suitable', 'not a valid url',
                 'unable to extract', 'no video formats', 'no video formats found',
                 'this video is not available', 'unable to download webpage',
+                'not a video',
             ]
             if not any(kw in err_text for kw in known_failures):
                 raise
@@ -1355,6 +1524,10 @@ def process_url_download(task_id, url, quality='best', range_start=1, range_end=
         # yt-dlp on each candidate
         last_err = None
         for i, candidate in enumerate(candidates, 1):
+            # Skip non-video candidates for the yt-dlp attempt
+            if not _is_probable_video(candidate):
+                logger.info(f"→ Skipping non-video candidate {i}: {candidate[:100]}")
+                continue
             try:
                 logger.info(f"→ yt-dlp candidate {i}/{len(candidates)}: "
                             f"{candidate[:120]}")
@@ -1369,6 +1542,8 @@ def process_url_download(task_id, url, quality='best', range_start=1, range_end=
 
         # Direct download on each candidate
         for i, candidate in enumerate(candidates, 1):
+            if not _is_probable_video(candidate):
+                continue
             try:
                 logger.info(f"→ Direct candidate {i}: {candidate[:120]}")
                 download_direct_file(candidate, task_id)
@@ -1625,7 +1800,7 @@ def register_routes(app):
 
 
 # ============================================================
-# STANDALONE CLI (optional)
+# STANDALONE CLI
 # ============================================================
 def _cli_main():
     if len(sys.argv) < 2:
