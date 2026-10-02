@@ -11,7 +11,7 @@ Strategies:
   5. Unknown page     → yt-dlp --get-url
                         ├─ Success → download the URL
                         └─ Failure → network sniff (VDH-style, leak-proof,
-                                     ad-filtered, fragment-filtered)
+                                     ad-filtered, duration-ranked)
                                     → return candidates
                                     → wait for user choice
                                     → download chosen media
@@ -20,6 +20,7 @@ Strategies:
 import os
 import re
 import sys
+import json
 import uuid
 import time
 import threading
@@ -160,9 +161,9 @@ VIDEO_MIME_MARKERS = [
 ]
 
 # Sniff timings
-SNIFF_TIMEOUT_SEC = 60                    # total budget
-SNIFF_WAIT_AFTER_PLAY_MS = 12000          # wait 12s after clicking play (ads run first)
-SNIFF_WAIT_BEFORE_PLAY_MS = 5000          # wait after page load, before play click
+SNIFF_TIMEOUT_SEC = 75                     # total budget
+SNIFF_WAIT_AFTER_PLAY_MS = 15000           # wait up to 15s after clicking play (ads run first)
+SNIFF_WAIT_BEFORE_PLAY_MS = 5000           # wait after page load, before play click
 
 
 class DownloadCancelled(Exception):
@@ -352,7 +353,6 @@ def _is_thumbnail(url):
 
 
 def _is_ad_url(url):
-    """Return True if the URL is from a known ad CDN."""
     if not url:
         return False
     low = url.lower()
@@ -448,14 +448,54 @@ def _crack_ytdlp_geturl(url):
 
 
 # ============================================================
-# NETWORK SNIFFER — noise-free, leak-proof
+# HLS DURATION PROBE (via yt-dlp --dump-json)
+# ============================================================
+def _probe_hls_duration(url):
+    """
+    Ask yt-dlp for metadata on a stream URL.
+    Returns duration in seconds (0 if unknown).
+    Used to distinguish ads (15-45s) from real videos (minutes+).
+    """
+    ytdlp = shutil.which('yt-dlp')
+    if not ytdlp:
+        return 0
+    cmd = [
+        ytdlp, '--dump-json', '--no-warnings', '--ignore-errors',
+        '--impersonate', 'chrome',
+        '--extractor-args', 'generic:impersonate',
+    ]
+    if os.path.exists(COOKIES_FILE):
+        cmd += ['--cookies', COOKIES_FILE]
+    cmd.append(url)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+        if r.returncode != 0:
+            return 0
+        for line in (r.stdout or '').splitlines():
+            line = line.strip()
+            if not line.startswith('{'):
+                continue
+            try:
+                data = json.loads(line)
+                return int(data.get('duration') or 0)
+            except Exception:
+                continue
+    except Exception:
+        return 0
+    return 0
+
+
+# ============================================================
+# NETWORK SNIFFER — clean shutdown + duration-based ranking
 # ============================================================
 def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
     """
     Launch headless Chromium, navigate, intercept responses.
-    Filters junk (ads, fragments, low-latency rolls, init segments,
-    pings, tracking) at capture time so the chooser only shows real
-    candidates.
+    - Filters junk (ads, fragments, low-latency rolls, pings)
+    - Captures across the entire ad→video transition
+    - Skips ads when possible
+    - Shuts down the browser gracefully (no asyncio noise)
+    - Ranks by duration so the real video wins over the ad
     """
     if not PLAYWRIGHT_AVAILABLE:
         logger.info("[Sniff] Playwright not installed — skipping")
@@ -466,217 +506,193 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
         return []
 
     captured = []
-    browser_ref = [None]
-    playwright_ref = [None]
-    context_ref = [None]
-    cleanup_done = [False]
-
-    def hard_cleanup():
-        if cleanup_done[0]:
-            return
-        cleanup_done[0] = True
-        try:
-            if context_ref[0] is not None:
-                context_ref[0].close()
-        except Exception:
-            pass
-        try:
-            if browser_ref[0] is not None:
-                browser_ref[0].close()
-        except Exception:
-            pass
-        try:
-            if playwright_ref[0] is not None:
-                playwright_ref[0].stop()
-        except Exception:
-            pass
-        _cleanup_playwright_processes()
+    stop_event = threading.Event()
 
     def run_sync():
+        pw = None
+        browser = None
+        context = None
         try:
-            with sync_playwright() as pw:
-                playwright_ref[0] = pw
-                browser = pw.chromium.launch(
-                    headless=True,
-                    args=[
-                        '--no-sandbox',
-                        '--disable-dev-shm-usage',
-                        '--disable-blink-features=AutomationControlled',
-                        '--autoplay-policy=no-user-gesture-required',
-                        '--disable-gpu',
-                        '--disable-software-rasterizer',
-                        '--disable-extensions',
-                        '--disable-background-networking',
-                        '--disable-background-timer-throttling',
-                        '--disable-renderer-backgrounding',
-                        '--disable-features=TranslateUI',
-                        '--disable-features=site-per-process',
-                        '--js-flags=--max-old-space-size=256',
-                        '--window-size=1280,720',
-                    ]
-                )
-                browser_ref[0] = browser
-                context = browser.new_context(
-                    user_agent=USER_AGENT,
-                    viewport={'width': 1280, 'height': 720},
-                    extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'},
-                )
-                context_ref[0] = context
-
-                # ---- Load cookies ----
-                if os.path.exists(COOKIES_FILE):
-                    try:
-                        cookies = []
-                        with open(COOKIES_FILE, 'r', encoding='utf-8') as f:
-                            for line in f:
-                                line = line.strip()
-                                if not line or line.startswith('#'):
-                                    continue
-                                parts = line.split('\t')
-                                if len(parts) < 7:
-                                    continue
-                                dom, _, pth, sec, exp, name, value = parts[:7]
-                                try:
-                                    exp_val = int(exp) if exp and exp != '0' else -1
-                                except ValueError:
-                                    exp_val = -1
-                                cookies.append({
-                                    'name': name,
-                                    'value': value,
-                                    'domain': dom,
-                                    'path': pth or '/',
-                                    'secure': sec.upper() == 'TRUE',
-                                    'expires': exp_val,
-                                })
-                        if cookies:
-                            context.add_cookies(cookies)
-                    except Exception as e:
-                        logger.debug(f"[Sniff] Cookie load failed: {e}")
-
-                page = context.new_page()
-                order_counter = [0]
-
-                # ---- Capture-time junk filter ----
-                def is_junk_url(url):
-                    low = url.lower()
-                    path = urlparse(url).path.lower()
-
-                    # Analytics/tracking/etc
-                    for skip in SKIP_PATTERNS:
-                        if skip in low:
-                            return True
-
-                    # Ad CDNs
-                    for ad in AD_DOMAINS:
-                        if ad in low:
-                            return True
-
-                    # Low-latency HLS rolling requests (same stream, new segment)
-                    if '_hls_msn' in low or '_hls_part' in low:
-                        return True
-
-                    # Individual HLS fragments: filename_partN.mp4
-                    if re.search(r'_part\d+\.mp4', path):
-                        return True
-
-                    # Init segments (codec init, ~1 KB)
-                    if 'init_' in path and path.endswith('.mp4'):
-                        return True
-
-                    # Pings / heartbeats
-                    if 'ping.m3u8' in low:
-                        return True
-
-                    # Non-video extensions
-                    for bad in ['.riv', '.svg', '.json', '.webmanifest',
-                                '.woff2', '.woff', '.ttf', '.eot', '.otf']:
-                        if path.endswith(bad):
-                            return True
-
-                    return False
-
-                def on_response(response):
-                    try:
-                        url = response.url
-                        mime = (response.headers.get('content-type', '') or '').lower()
-
-                        # Only video/audio MIME or video-looking URLs
-                        if not (any(m in mime for m in VIDEO_MIME_MARKERS)
-                                or _is_video_url(url)):
-                            return
-
-                        if is_junk_url(url):
-                            return
-
-                        is_thumb = _is_thumbnail(url)
-                        try:
-                            cl = response.headers.get('content-length')
-                            size = int(cl) if cl else 0
-                        except Exception:
-                            size = 0
-
-                        # Tiny manifests (< 100 B) are usually pings
-                        if 0 < size < 100:
-                            return
-
-                        order_counter[0] += 1
-                        captured.append({
-                            'url': url,
-                            'mime': mime,
-                            'size': size,
-                            'is_thumbnail': is_thumb,
-                            'order': order_counter[0],
-                        })
-                        tag = "🖼️" if is_thumb else "📼"
-                        logger.info(f"[Sniff] {tag} {url[:110]}")
-                    except Exception:
-                        pass
-
-                page.on('response', on_response)
-
-                logger.info(f"[Sniff] Navigating to {page_url}")
-                try:
-                    page.goto(page_url, timeout=30000,
-                              wait_until='domcontentloaded')
-                except Exception as e:
-                    logger.warning(f"[Sniff] goto failed: {e}")
-
-                # Wait for initial page + ad to start
-                page.wait_for_timeout(SNIFF_WAIT_BEFORE_PLAY_MS)
-
-                # Try to click a play button
-                play_selectors = [
-                    'button[aria-label*="play" i]',
-                    'button[title*="play" i]',
-                    '.play-button',
-                    '.vjs-big-play-button',
-                    '.plyr__control--overlaid',
-                    'button:has-text("Play")',
-                    'video',
+            pw = sync_playwright().start()
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-blink-features=AutomationControlled',
+                    '--autoplay-policy=no-user-gesture-required',
+                    '--disable-gpu',
+                    '--disable-software-rasterizer',
+                    '--disable-extensions',
+                    '--disable-background-networking',
+                    '--disable-background-timer-throttling',
+                    '--disable-renderer-backgrounding',
+                    '--disable-features=TranslateUI',
+                    '--disable-features=site-per-process',
+                    '--js-flags=--max-old-space-size=256',
+                    '--window-size=1280,720',
                 ]
-                for sel in play_selectors:
-                    try:
-                        page.click(sel, timeout=1500)
-                        logger.info(f"[Sniff] Clicked: {sel}")
-                        page.wait_for_timeout(1500)
-                        break
-                    except Exception:
-                        pass
+            )
+            context = browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={'width': 1280, 'height': 720},
+                extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'},
+            )
 
-                # Force any <video> tags to play
+            # ---- Cookies ----
+            if os.path.exists(COOKIES_FILE):
                 try:
-                    page.evaluate("""
-                        document.querySelectorAll('video').forEach(v => {
-                            try { v.muted = true; v.play(); } catch (e) {}
-                        });
-                    """)
+                    cookies = []
+                    with open(COOKIES_FILE, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line or line.startswith('#'):
+                                continue
+                            parts = line.split('\t')
+                            if len(parts) < 7:
+                                continue
+                            dom, _, pth, sec, exp, name, value = parts[:7]
+                            try:
+                                exp_val = int(exp) if exp and exp != '0' else -1
+                            except ValueError:
+                                exp_val = -1
+                            cookies.append({
+                                'name': name,
+                                'value': value,
+                                'domain': dom,
+                                'path': pth or '/',
+                                'secure': sec.upper() == 'TRUE',
+                                'expires': exp_val,
+                            })
+                    if cookies:
+                        context.add_cookies(cookies)
+                except Exception as e:
+                    logger.debug(f"[Sniff] Cookie load failed: {e}")
+
+            page = context.new_page()
+            order_counter = [0]
+
+            def is_junk_url(url):
+                low = url.lower()
+                path = urlparse(url).path.lower()
+                for skip in SKIP_PATTERNS:
+                    if skip in low:
+                        return True
+                for ad in AD_DOMAINS:
+                    if ad in low:
+                        return True
+                if '_hls_msn' in low or '_hls_part' in low:
+                    return True
+                if re.search(r'_part\d+\.mp4', path):
+                    return True
+                if 'init_' in path and path.endswith('.mp4'):
+                    return True
+                if 'ping.m3u8' in low:
+                    return True
+                for bad in ['.riv', '.svg', '.json', '.webmanifest',
+                            '.woff2', '.woff', '.ttf', '.eot', '.otf']:
+                    if path.endswith(bad):
+                        return True
+                return False
+
+            def on_response(response):
+                try:
+                    url = response.url
+                    mime = (response.headers.get('content-type', '') or '').lower()
+                    if not (any(m in mime for m in VIDEO_MIME_MARKERS)
+                            or _is_video_url(url)):
+                        return
+                    if is_junk_url(url):
+                        return
+                    try:
+                        cl = response.headers.get('content-length')
+                        size = int(cl) if cl else 0
+                    except Exception:
+                        size = 0
+                    if 0 < size < 100:
+                        return
+                    order_counter[0] += 1
+                    captured.append({
+                        'url': url,
+                        'mime': mime,
+                        'size': size,
+                        'is_thumbnail': _is_thumbnail(url),
+                        'order': order_counter[0],
+                    })
+                    logger.info(f"[Sniff] 📼 {url[:110]}")
                 except Exception:
                     pass
 
-                # Wait for ads to play then real video to load
-                page.wait_for_timeout(SNIFF_WAIT_AFTER_PLAY_MS)
+            page.on('response', on_response)
 
-                # Scroll a bit to trigger any lazy loaders
+            logger.info(f"[Sniff] Navigating to {page_url}")
+            try:
+                page.goto(page_url, timeout=30000, wait_until='domcontentloaded')
+            except Exception as e:
+                logger.warning(f"[Sniff] goto failed: {e}")
+
+            page.wait_for_timeout(SNIFF_WAIT_BEFORE_PLAY_MS)
+
+            # Click play buttons
+            for sel in [
+                'button[aria-label*="play" i]',
+                'button[title*="play" i]',
+                '.play-button',
+                '.vjs-big-play-button',
+                '.plyr__control--overlaid',
+                'button:has-text("Play")',
+                'video',
+            ]:
+                try:
+                    page.click(sel, timeout=1500)
+                    logger.info(f"[Sniff] Clicked: {sel}")
+                    page.wait_for_timeout(1500)
+                    break
+                except Exception:
+                    pass
+
+            # Force <video> tags to play
+            try:
+                page.evaluate("""
+                    document.querySelectorAll('video').forEach(v => {
+                        try { v.muted = true; v.play(); } catch (e) {}
+                    });
+                """)
+            except Exception:
+                pass
+
+            # Auto-skip ads
+            def try_skip_ads():
+                for sel in [
+                    '.skip-button',
+                    '.skip-ad',
+                    '.videoAdUiSkipButton',
+                    'button[aria-label*="skip" i]',
+                    'button:has-text("Skip Ad")',
+                    'button:has-text("Skip")',
+                    '.ytp-ad-skip-button',
+                ]:
+                    try:
+                        page.click(sel, timeout=300)
+                        logger.info(f"[Sniff] Skipped ad: {sel}")
+                        return True
+                    except Exception:
+                        pass
+                return False
+
+            # Wait in 2s slices, trying to skip ads each time
+            total_wait = SNIFF_WAIT_AFTER_PLAY_MS
+            slice_ms = 2000
+            elapsed = 0
+            while elapsed < total_wait:
+                if stop_event.is_set():
+                    logger.info("[Sniff] Stop requested — shutting down early")
+                    break
+                page.wait_for_timeout(slice_ms)
+                elapsed += slice_ms
+                try_skip_ads()
+
+            if not stop_event.is_set():
                 try:
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
                     page.wait_for_timeout(2000)
@@ -686,15 +702,30 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
         except Exception as e:
             logger.error(f"[Sniff] Fatal error: {e}")
         finally:
-            hard_cleanup()
+            # Graceful shutdown
+            for closer, name in ((context, 'context'), (browser, 'browser'), (pw, 'playwright')):
+                if closer is None:
+                    continue
+                try:
+                    if name == 'playwright':
+                        closer.stop()
+                    else:
+                        closer.close()
+                except Exception:
+                    pass
 
-    t = threading.Thread(target=run_sync, daemon=True)
+    t = threading.Thread(target=run_sync, daemon=True, name="sniff-thread")
     t.start()
-    t.join(timeout=timeout + 10)
+    t.join(timeout=timeout)
 
     if t.is_alive():
-        logger.warning("[Sniff] Sniff timed out — force killing browser")
-        hard_cleanup()
+        logger.warning("[Sniff] Timed out — requesting clean shutdown")
+        stop_event.set()
+        t.join(timeout=10)
+
+    if t.is_alive():
+        logger.warning("[Sniff] Thread still alive — force killing processes")
+        _cleanup_playwright_processes()
         t.join(timeout=5)
 
     try:
@@ -708,55 +739,7 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
         logger.info("[Sniff] No media streams detected")
         return []
 
-    # ---- Rank ----
-    def score(item):
-        s = 0
-        u = item['url'].lower()
-        if item['is_thumbnail']:
-            s -= 100
-
-        # Master playlists — the best signal
-        if '/master/' in u or '/master.' in u:
-            s += 150
-        if 'auto.m3u8' in u:
-            s += 100
-
-        # Any remaining .m3u8 is a real variant
-        if '.m3u8' in u:
-            s += 50
-        if '.mpd' in u:
-            s += 40
-
-        # Direct mp4s — size matters
-        if u.endswith('.mp4'):
-            if item['size'] > 10_000_000:
-                s += 60
-            elif item['size'] > 1_000_000:
-                s += 20
-            else:
-                s -= 40
-
-        # MIME bonus
-        if 'video/mp4' in item['mime']:
-            s += 15
-        elif 'mpegurl' in item['mime']:
-            s += 25
-
-        # Later requests usually = post-ad video
-        s += min(item['order'], 10)
-
-        # Cross-domain CDN bonus
-        try:
-            if urlparse(item['url']).netloc != urlparse(page_url).netloc:
-                s += 5
-        except Exception:
-            pass
-
-        return s
-
-    ranked = sorted(captured, key=score, reverse=True)
-
-    # ---- Collapse low-latency rolling URLs into one entry each ----
+    # ---- Dedupe by normalizing low-latency rolling URLs ----
     def normalize_key(url):
         try:
             parsed = urlparse(url)
@@ -770,24 +753,87 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
         except Exception:
             return url
 
+    deduped = []
     seen_keys = set()
-    out = []
-    for item in ranked:
+    for item in captured:
         key = normalize_key(item['url'])
         if key in seen_keys:
             continue
         seen_keys.add(key)
+        deduped.append(item)
+
+    # ---- Probe durations for m3u8/mpd candidates (top 5) ----
+    hls_candidates = [c for c in deduped
+                      if '.m3u8' in c['url'].lower()
+                      or '.mpd' in c['url'].lower()]
+    duration_map = {}
+    for c in hls_candidates[:5]:
+        try:
+            dur = _probe_hls_duration(c['url'])
+            duration_map[c['url']] = dur
+            if dur:
+                logger.info(f"[Sniff] Duration {dur}s for {c['url'][:90]}")
+        except Exception:
+            pass
+
+    # ---- Rank ----
+    def score(item):
+        s = 0
+        u = item['url'].lower()
+        dur = duration_map.get(item['url'], 0)
+
+        if item['is_thumbnail']:
+            s -= 100
+
+        # Duration is the strongest signal
+        if dur >= 120:
+            s += 200
+        elif dur >= 60:
+            s += 100
+        elif dur > 0 and dur < 45:
+            s -= 150
+
+        if '/master/' in u or '/master.' in u:
+            s += 60
+        if 'auto.m3u8' in u:
+            s += 40
+        if '.m3u8' in u:
+            s += 30
+        if '.mpd' in u:
+            s += 25
+
+        if u.endswith('.mp4'):
+            if item['size'] > 10_000_000:
+                s += 60
+            elif item['size'] > 1_000_000:
+                s += 20
+            else:
+                s -= 40
+
+        if 'video/mp4' in item['mime']:
+            s += 10
+        elif 'mpegurl' in item['mime']:
+            s += 15
+
+        s += min(item['order'], 5)
+
+        return s
+
+    ranked = sorted(deduped, key=score, reverse=True)
+
+    out = []
+    for item in ranked:
         out.append({
             'url': item['url'],
             'mime': item['mime'],
             'size': item['size'],
             'is_thumbnail': item['is_thumbnail'],
+            'duration': duration_map.get(item['url'], 0),
         })
 
     MAX_CANDIDATES = 6
     out = out[:MAX_CANDIDATES]
-
-    logger.info(f"[Sniff] {len(captured)} raw → {len(out)} clean candidate(s)")
+    logger.info(f"[Sniff] {len(captured)} raw → {len(deduped)} deduped → {len(out)} clean candidate(s)")
     return out
 
 
