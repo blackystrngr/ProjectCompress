@@ -42,7 +42,7 @@ apt-get install -y \
     wget curl git tar xz-utils unzip \
     python3 python3-pip python3-dev \
     build-essential libssl-dev libffi-dev \
-    ca-certificates gnupg lsb-release software-properties-common
+    ca-certificates gnupg lsb-release software-properties-common python3-libtorrent
 playwright install chromium
 
 ok "Base packages installed."
