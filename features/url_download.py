@@ -24,6 +24,13 @@ Handles:
       13. API endpoint guessing (Vidsonic, Vixeo, Doodstream, etc.)
       14. ** Network sniffing with Playwright (Video DownloadHelper style) **
       15. Output verification via ffprobe
+
+Playwright lifecycle
+--------------------
+The sniffer ALWAYS closes the browser context, the browser, and the
+Playwright driver in a try/finally.  After every sniff, orphaned
+headless_shell processes are killed via _cleanup_playwright_processes().
+This prevents the "1 MB/s background download forever" leak.
 """
 
 import os
@@ -120,7 +127,6 @@ SKIP_PATTERNS = [
     'pa-', 'gtm.', 'fbevents',
 ]
 
-# URLs that match these are preview thumbnails, not the main video
 THUMBNAIL_PATTERNS = [
     '/thumbnails/', '/thumbs/', '/preview/', '/poster/',
     'thumb.jpg', 'preview.mp4', 'sprite', '/sprite/',
@@ -145,7 +151,6 @@ USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
 
 MIN_VIDEO_SIZE = 10_000  # 10 KB
 
-# Content-Type markers that indicate a video stream
 VIDEO_MIME_MARKERS = [
     'video/',
     'audio/',
@@ -162,6 +167,93 @@ SNIFF_WAIT_AFTER_PLAY_MS = 6000
 
 class DownloadCancelled(Exception):
     pass
+
+
+# ============================================================
+# PLAYWRIGHT ORPHAN CLEANUP
+# ============================================================
+# This is the fix for the "network speed goes to 1 MB/s forever" bug.
+# Playwright can leak headless_shell processes when a sniff times out,
+# when the page hangs, or when the thread is abandoned. Those orphan
+# browsers keep downloading background video pre-rolls / ads / analytics
+# at full speed even though nothing is being downloaded by the user.
+#
+# app.py already calls _cleanup_playwright_processes() at startup, but
+# this function did not previously exist in this module — the import
+# was silently failing. Now it exists and is called after every sniff.
+# ============================================================
+
+def _cleanup_playwright_processes(verbose=False):
+    """
+    Kill orphaned Playwright / Chromium / headless_shell processes.
+
+    Only targets processes whose command line or executable name clearly
+    belongs to Playwright, so a user's normal Chrome is not touched.
+    Returns the number of processes killed.
+    """
+    killed = 0
+
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        psutil = None
+
+    if psutil is None:
+        # Fallback: use taskkill / pkill by image name.
+        if sys.platform.startswith('win'):
+            try:
+                subprocess.run(
+                    ['taskkill', '/F', '/IM', 'headless_shell.exe'],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                )
+                killed += 1
+            except Exception:
+                pass
+        else:
+            for pattern in ('ms-playwright', 'headless_shell'):
+                try:
+                    r = subprocess.run(
+                        ['pkill', '-f', pattern],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=10,
+                    )
+                    if r.returncode == 0:
+                        killed += 1
+                except Exception:
+                    pass
+        if verbose and killed:
+            logger.info(f"[Cleanup] Killed ~{killed} orphan browser process(es)")
+        return killed
+
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            info = proc.info
+            cmdline = info.get('cmdline') or []
+            cmd = ' '.join(cmdline).lower()
+            name = (info.get('name') or '').lower()
+
+            if (
+                'ms-playwright' in cmd
+                or 'headless_shell' in cmd
+                or 'playwright' in cmd
+                or name == 'headless_shell'
+                or name == 'headless_shell.exe'
+                or name.startswith('chromium') and 'playwright' in cmd
+            ):
+                proc.kill()
+                killed += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+        except Exception:
+            pass
+
+    if verbose and killed:
+        logger.info(f"[Cleanup] Killed {killed} orphan browser process(es)")
+
+    return killed
 
 
 # ============================================================
@@ -761,176 +853,223 @@ def _crack_apis(page_url):
 # ============================================================
 # CRACKER: #14 Network Sniffing (Video DownloadHelper style)
 # ============================================================
+# ------------------------------------------------------------------
+# FIX SUMMARY
+# ------------------------------------------------------------------
+# 1. Uses sync_playwright().start() + .stop() instead of `with` so the
+#    Playwright driver can be stopped in finally even if the thread
+#    is abandoned by the join() timeout.
+# 2. Browser and context are ALWAYS closed in finally.
+# 3. After the sniff returns, _cleanup_playwright_processes() is
+#    called to kill any headless_shell that survived a crash.
+# 4. NO request blocking, NO route.abort — every media stream is
+#    allowed to load and can be captured.
+# ------------------------------------------------------------------
 def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
     """
     Launch a headless Chromium via Playwright, navigate to the page,
     and intercept every network response that looks like a video stream.
 
     Mirrors how Video DownloadHelper detects streams.
-    Returns a list of candidate URLs, ranked by likelihood of being the main video.
+
+    Guarantees the browser is closed and the Playwright driver is
+    stopped, even if the sniff times out or the page crashes.
     """
     if not PLAYWRIGHT_AVAILABLE:
         logger.info("[Sniff] Playwright not installed — skipping network sniff")
         return []
 
     logger.info("[Sniff] Launching headless Chromium...")
-    captured = []  # list of dicts {url, mime, size, order}
+    captured = []  # list of dicts {url, mime, size, thumb, order}
+    _sniff_deadline = time.time() + max(10, timeout)
 
     def run_sync():
+        pw = None
+        browser = None
+        context = None
         try:
-            with sync_playwright() as pw:
-                browser = pw.chromium.launch(
-                    headless=True,
-                    args=[
-                        '--no-sandbox',
-                        '--disable-dev-shm-usage',
-                        '--disable-blink-features=AutomationControlled',
-                        '--autoplay-policy=no-user-gesture-required',
-                    ]
-                )
-                context = browser.new_context(
-                    user_agent=USER_AGENT,
-                    viewport={'width': 1280, 'height': 720},
-                    # Accept all media
-                    extra_http_headers={
-                        'Accept-Language': 'en-US,en;q=0.9',
-                    }
-                )
-
-                # Load cookies
-                if os.path.exists(COOKIES_FILE):
-                    try:
-                        cookies = []
-                        with open(COOKIES_FILE, 'r', encoding='utf-8') as f:
-                            for line in f:
-                                line = line.strip()
-                                if not line or line.startswith('#'):
-                                    continue
-                                parts = line.split('\t')
-                                if len(parts) < 7:
-                                    continue
-                                dom, _, pth, sec, exp, name, value = parts[:7]
-                                try:
-                                    exp_val = int(exp) if exp and exp != '0' else -1
-                                except ValueError:
-                                    exp_val = -1
-                                cookies.append({
-                                    'name': name,
-                                    'value': value,
-                                    'domain': dom.lstrip('.') if not dom.startswith('.') else dom,
-                                    'path': pth or '/',
-                                    'secure': sec.upper() == 'TRUE',
-                                    'expires': exp_val,
-                                })
-                        if cookies:
-                            context.add_cookies(cookies)
-                            logger.info(f"[Sniff] Loaded {len(cookies)} cookies")
-                    except Exception as e:
-                        logger.debug(f"[Sniff] Cookie load failed: {e}")
-
-                page = context.new_page()
-
-                order_counter = [0]  # mutable counter
-
-                def on_response(response):
-                    try:
-                        url = response.url
-                        mime = (response.headers.get('content-type', '') or '').lower()
-                        # Reject obvious junk
-                        if any(skip in url.lower() for skip in SKIP_PATTERNS):
-                            return
-                        if not (any(m in mime for m in VIDEO_MIME_MARKERS)
-                                or _is_video_url(url)):
-                            return
-                        # Reject thumbnails unless they're a m3u8 preview
-                        # (Video DownloadHelper also shows these; keep them but rank low)
-                        is_thumb = _is_thumbnail(url)
-                        try:
-                            cl = response.headers.get('content-length')
-                            size = int(cl) if cl else 0
-                        except Exception:
-                            size = 0
-                        order_counter[0] += 1
-                        captured.append({
-                            'url': url,
-                            'mime': mime,
-                            'size': size,
-                            'thumb': is_thumb,
-                            'order': order_counter[0],
-                        })
-                        tag = "📼" if not is_thumb else "🖼️"
-                        logger.info(f"[Sniff] {tag} {url[:110]}")
-                    except Exception:
-                        pass
-
-                page.on('response', on_response)
-
-                logger.info(f"[Sniff] Navigating to {page_url}")
-                try:
-                    page.goto(page_url, timeout=30000,
-                              wait_until='domcontentloaded')
-                except Exception as e:
-                    logger.warning(f"[Sniff] goto failed: {e}")
-
-                # Give the page time to load + fetch initial assets
-                page.wait_for_timeout(4000)
-
-                # Try clicking play buttons
-                play_selectors = [
-                    'button[aria-label*="play" i]',
-                    'button[title*="play" i]',
-                    '.play-button',
-                    '.vjs-big-play-button',
-                    '.plyr__control--overlaid',
-                    '[class*="play" i]:not(script)',
-                    'button:has-text("Play")',
-                    'video',
+            pw = sync_playwright().start()
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-blink-features=AutomationControlled',
+                    '--autoplay-policy=no-user-gesture-required',
                 ]
-                for sel in play_selectors:
-                    try:
-                        page.click(sel, timeout=1500)
-                        logger.info(f"[Sniff] Clicked: {sel}")
-                        page.wait_for_timeout(1500)
-                        break
-                    except Exception:
-                        pass
+            )
+            context = browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={'width': 1280, 'height': 720},
+                extra_http_headers={
+                    'Accept-Language': 'en-US,en;q=0.9',
+                }
+            )
 
-                # Try to force-play any <video> tags
+            # Load cookies (site auth / age-gated content)
+            if os.path.exists(COOKIES_FILE):
                 try:
-                    page.evaluate("""
-                        document.querySelectorAll('video').forEach(v => {
-                            try { v.muted = true; v.play(); } catch (e) {}
-                        });
-                    """)
+                    cookies = []
+                    with open(COOKIES_FILE, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line or line.startswith('#'):
+                                continue
+                            parts = line.split('\t')
+                            if len(parts) < 7:
+                                continue
+                            dom, _, pth, sec, exp, name, value = parts[:7]
+                            try:
+                                exp_val = int(exp) if exp and exp != '0' else -1
+                            except ValueError:
+                                exp_val = -1
+                            cookies.append({
+                                'name': name,
+                                'value': value,
+                                'domain': dom.lstrip('.') if not dom.startswith('.') else dom,
+                                'path': pth or '/',
+                                'secure': sec.upper() == 'TRUE',
+                                'expires': exp_val,
+                            })
+                    if cookies:
+                        context.add_cookies(cookies)
+                        logger.info(f"[Sniff] Loaded {len(cookies)} cookies")
+                except Exception as e:
+                    logger.debug(f"[Sniff] Cookie load failed: {e}")
+
+            page = context.new_page()
+            order_counter = [0]
+
+            def on_response(response):
+                try:
+                    url = response.url
+                    mime = (response.headers.get('content-type', '') or '').lower()
+                    if any(skip in url.lower() for skip in SKIP_PATTERNS):
+                        return
+                    if not (any(m in mime for m in VIDEO_MIME_MARKERS)
+                            or _is_video_url(url)):
+                        return
+                    is_thumb = _is_thumbnail(url)
+                    try:
+                        cl = response.headers.get('content-length')
+                        size = int(cl) if cl else 0
+                    except Exception:
+                        size = 0
+                    order_counter[0] += 1
+                    captured.append({
+                        'url': url,
+                        'mime': mime,
+                        'size': size,
+                        'thumb': is_thumb,
+                        'order': order_counter[0],
+                    })
+                    tag = "📼" if not is_thumb else "🖼️"
+                    logger.info(f"[Sniff] {tag} {url[:110]}")
                 except Exception:
                     pass
 
-                # Wait for the player to spin up streams
-                page.wait_for_timeout(SNIFF_WAIT_AFTER_PLAY_MS)
+            page.on('response', on_response)
 
-                # Scroll a bit to trigger lazy-loaded players
+            logger.info(f"[Sniff] Navigating to {page_url}")
+            try:
+                page.goto(page_url, timeout=30000,
+                          wait_until='domcontentloaded')
+            except Exception as e:
+                logger.warning(f"[Sniff] goto failed: {e}")
+
+            # Give the page time to load + fetch initial assets
+            page.wait_for_timeout(4000)
+
+            # Try clicking play buttons
+            play_selectors = [
+                'button[aria-label*="play" i]',
+                'button[title*="play" i]',
+                '.play-button',
+                '.vjs-big-play-button',
+                '.plyr__control--overlaid',
+                '[class*="play" i]:not(script)',
+                'button:has-text("Play")',
+                'video',
+            ]
+            for sel in play_selectors:
+                if time.time() > _sniff_deadline:
+                    break
                 try:
+                    page.click(sel, timeout=1500)
+                    logger.info(f"[Sniff] Clicked: {sel}")
+                    page.wait_for_timeout(1500)
+                    break
+                except Exception:
+                    pass
+
+            # Force-play any <video> tags
+            try:
+                page.evaluate("""
+                    document.querySelectorAll('video').forEach(v => {
+                        try { v.muted = true; v.play(); } catch (e) {}
+                    });
+                """)
+            except Exception:
+                pass
+
+            # Wait for the player to spin up streams (bounded)
+            remaining = max(0, int(_sniff_deadline - time.time()))
+            wait_ms = min(SNIFF_WAIT_AFTER_PLAY_MS, remaining * 1000)
+            if wait_ms > 0:
+                page.wait_for_timeout(wait_ms)
+
+            # Scroll a bit to trigger lazy-loaded players
+            try:
+                if time.time() < _sniff_deadline:
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
                     page.wait_for_timeout(2000)
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
-                browser.close()
         except Exception as e:
             logger.error(f"[Sniff] Fatal error: {e}")
 
+        finally:
+            # ---- GUARANTEED CLEANUP ----
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            if pw is not None:
+                try:
+                    pw.stop()
+                except Exception:
+                    pass
+            # Kill anything that survived a crash or a timed-out thread.
+            _cleanup_playwright_processes(verbose=False)
+
     # Run Playwright's sync API in a dedicated thread so we don't fight
-    # Flask's event loop or need asyncio.run here
+    # Flask's event loop or need asyncio.run here.
     t = threading.Thread(target=run_sync, daemon=True)
     t.start()
-    t.join(timeout=timeout + 10)
+    t.join(timeout=timeout + 15)
+
+    if t.is_alive():
+        # Thread stuck (e.g. page is hanging). Kill orphans from the main
+        # thread so the browser can't keep downloading forever.
+        logger.warning("[Sniff] Sniff thread timed out — killing orphans")
+        _cleanup_playwright_processes(verbose=True)
+    else:
+        # Even on success, sweep any stray process. Cheap, and stops the
+        # "1 MB/s forever" leak if Playwright left a helper behind.
+        _cleanup_playwright_processes(verbose=False)
 
     if not captured:
         logger.info("[Sniff] No video streams detected")
         return []
 
     # ---- Rank captured URLs ----
-    # Higher score = more likely the main video
     def score(item):
         s = 0
         u = item['url'].lower()
@@ -950,9 +1089,7 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
             s += 10
         if 'video' in item['mime']:
             s += 15
-        # Later requests are usually the real stream (after teaser)
         s += min(item['order'], 10)
-        # Prefer URLs NOT on the page host (real stream is usually on a CDN)
         try:
             if urlparse(item['url']).netloc != urlparse(page_url).netloc:
                 s += 5
@@ -1087,7 +1224,7 @@ def crack_video_urls(page_url, deep=True, save_debug_to=None):
     except Exception as e:
         logger.debug(f"[Crack] API guess failed: {e}")
 
-    # ---- Strategy 14: Network sniffing (only if nothing useful found) ----
+    # Strategy 14: Network sniffing (only if nothing useful found)
     if not candidates and deep:
         try:
             logger.info("[Crack] Falling back to network sniffing...")
@@ -1719,6 +1856,12 @@ def process_url_download(task_id, url, quality='best', range_start=1, range_end=
             task['status'] = 'error'
             task['error_msg'] = str(e)
             save_task(task_id, task)
+    finally:
+        # Sweep any Playwright leftovers from this task's sniffing.
+        try:
+            _cleanup_playwright_processes(verbose=False)
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -1981,11 +2124,15 @@ def _cli_main():
     url = sys.argv[1]
     use_sniff = '--sniff' in sys.argv
 
-    if use_sniff:
-        urls = _sniff_network(url)
-    else:
-        urls = crack_video_urls(url, deep=True,
-                                 save_debug_to='/tmp/crack_debug')
+    try:
+        if use_sniff:
+            urls = _sniff_network(url)
+        else:
+            urls = crack_video_urls(url, deep=True,
+                                     save_debug_to='/tmp/crack_debug')
+    finally:
+        # Always sweep, even if the CLI exits abnormally.
+        _cleanup_playwright_processes(verbose=True)
 
     print()
     print("=" * 70)
