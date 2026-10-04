@@ -7,30 +7,20 @@ Handles:
   - Direct file URLs (.mp4, .pdf, .zip, etc.)
   - yt-dlp supported sites (YouTube, Vimeo, TikTok, etc.)
   - Playlists with resume
-  - Torrents (magnet + .torrent)
-  - Any media page via 15-strategy video cracking:
-      1.  Direct URL detection
-      2.  yt-dlp --get-url (native site extractors)
-      3.  HTML tags (<video>, <source>, <object>, <embed>)
-      4.  Meta tags (og:video, twitter:player, schema.org)
-      5.  JSON-LD (contentUrl, embedUrl)
-      6.  JSON script blocks (Next.js __NEXT_DATA__, Vidsonic)
-      7.  Player configs (Plyr, Video.js, JW Player, DPlayer, etc.)
-      8.  Inline JS patterns
-      9.  Obfuscated payloads (Base64, hex, packed, ROT13)
-      10. Raw URL regex anywhere
-      11. Known streaming hosts (Lulustream, Doodstream, etc.)
-      12. Iframes (recursive)
-      13. API endpoint guessing (Vidsonic, Vixeo, Doodstream, etc.)
-      14. ** Network sniffing with Playwright (Video DownloadHelper style) **
-      15. Output verification via ffprobe
+  - Torrents (magnet + .torrent) — with DHT, public trackers, timeouts
+  - Any media page via 15-strategy video cracking
 
 Playwright lifecycle
 --------------------
 The sniffer ALWAYS closes the browser context, the browser, and the
-Playwright driver in a try/finally.  After every sniff, orphaned
+Playwright driver in a try/finally. After every sniff, orphaned
 headless_shell processes are killed via _cleanup_playwright_processes().
-This prevents the "1 MB/s background download forever" leak.
+
+Torrent lifecycle
+-----------------
+Every torrent session enables DHT, LSD, UPnP, NAT-PMP and adds public
+trackers. Metadata fetch has a hard 5-min timeout; download loop has a
+2-min stall detector. No more infinite hangs on dead magnets.
 """
 
 import os
@@ -48,7 +38,7 @@ import requests
 import subprocess
 import shutil
 import signal
-from urllib.parse import urlparse, unquote, parse_qs, urljoin
+from urllib.parse import urlparse, unquote, parse_qs, urljoin, quote
 from typing import List, Optional, Tuple
 
 from flask import request, jsonify
@@ -165,6 +155,35 @@ SNIFF_TIMEOUT_SEC = 45
 SNIFF_WAIT_AFTER_PLAY_MS = 6000
 
 
+# ============================================================
+# TORRENT CONSTANTS
+# ============================================================
+PUBLIC_TRACKERS = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.tracker.cl:1337/announce",
+    "udp://9.rarbg.com:2810/announce",
+    "udp://tracker.openbittorrent.com:6969/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.moeking.me:6969/announce",
+    "udp://explodie.org:6969/announce",
+    "udp://tracker1.bt.moack.co.kr:80/announce",
+    "udp://tracker.tiny-vps.com:6969/announce",
+    "udp://p4p.arenabg.com:1337/announce",
+]
+
+DHT_ROUTERS = [
+    ("router.bittorrent.com", 6881),
+    ("router.utorrent.com", 6881),
+    ("router.bitcomet.com", 6881),
+    ("dht.transmissionbt.com", 6881),
+]
+
+METADATA_TIMEOUT_SEC = 300     # max 5 min to fetch magnet metadata
+STALL_TIMEOUT_SEC = 120        # 2 min with 0 peers = give up and report
+
+
 class DownloadCancelled(Exception):
     pass
 
@@ -172,24 +191,11 @@ class DownloadCancelled(Exception):
 # ============================================================
 # PLAYWRIGHT ORPHAN CLEANUP
 # ============================================================
-# This is the fix for the "network speed goes to 1 MB/s forever" bug.
-# Playwright can leak headless_shell processes when a sniff times out,
-# when the page hangs, or when the thread is abandoned. Those orphan
-# browsers keep downloading background video pre-rolls / ads / analytics
-# at full speed even though nothing is being downloaded by the user.
-#
-# app.py already calls _cleanup_playwright_processes() at startup, but
-# this function did not previously exist in this module — the import
-# was silently failing. Now it exists and is called after every sniff.
-# ============================================================
-
 def _cleanup_playwright_processes(verbose=False):
     """
     Kill orphaned Playwright / Chromium / headless_shell processes.
-
-    Only targets processes whose command line or executable name clearly
-    belongs to Playwright, so a user's normal Chrome is not touched.
-    Returns the number of processes killed.
+    Only targets processes whose command line clearly belongs to
+    Playwright, so a user's normal Chrome is not touched.
     """
     killed = 0
 
@@ -199,7 +205,6 @@ def _cleanup_playwright_processes(verbose=False):
         psutil = None
 
     if psutil is None:
-        # Fallback: use taskkill / pkill by image name.
         if sys.platform.startswith('win'):
             try:
                 subprocess.run(
@@ -241,7 +246,7 @@ def _cleanup_playwright_processes(verbose=False):
                 or 'playwright' in cmd
                 or name == 'headless_shell'
                 or name == 'headless_shell.exe'
-                or name.startswith('chromium') and 'playwright' in cmd
+                or (name.startswith('chromium') and 'playwright' in cmd)
             ):
                 proc.kill()
                 killed += 1
@@ -853,34 +858,13 @@ def _crack_apis(page_url):
 # ============================================================
 # CRACKER: #14 Network Sniffing (Video DownloadHelper style)
 # ============================================================
-# ------------------------------------------------------------------
-# FIX SUMMARY
-# ------------------------------------------------------------------
-# 1. Uses sync_playwright().start() + .stop() instead of `with` so the
-#    Playwright driver can be stopped in finally even if the thread
-#    is abandoned by the join() timeout.
-# 2. Browser and context are ALWAYS closed in finally.
-# 3. After the sniff returns, _cleanup_playwright_processes() is
-#    called to kill any headless_shell that survived a crash.
-# 4. NO request blocking, NO route.abort — every media stream is
-#    allowed to load and can be captured.
-# ------------------------------------------------------------------
 def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
-    """
-    Launch a headless Chromium via Playwright, navigate to the page,
-    and intercept every network response that looks like a video stream.
-
-    Mirrors how Video DownloadHelper detects streams.
-
-    Guarantees the browser is closed and the Playwright driver is
-    stopped, even if the sniff times out or the page crashes.
-    """
     if not PLAYWRIGHT_AVAILABLE:
         logger.info("[Sniff] Playwright not installed — skipping network sniff")
         return []
 
     logger.info("[Sniff] Launching headless Chromium...")
-    captured = []  # list of dicts {url, mime, size, thumb, order}
+    captured = []
     _sniff_deadline = time.time() + max(10, timeout)
 
     def run_sync():
@@ -906,7 +890,6 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
                 }
             )
 
-            # Load cookies (site auth / age-gated content)
             if os.path.exists(COOKIES_FILE):
                 try:
                     cookies = []
@@ -977,10 +960,8 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
             except Exception as e:
                 logger.warning(f"[Sniff] goto failed: {e}")
 
-            # Give the page time to load + fetch initial assets
             page.wait_for_timeout(4000)
 
-            # Try clicking play buttons
             play_selectors = [
                 'button[aria-label*="play" i]',
                 'button[title*="play" i]',
@@ -1002,7 +983,6 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
                 except Exception:
                     pass
 
-            # Force-play any <video> tags
             try:
                 page.evaluate("""
                     document.querySelectorAll('video').forEach(v => {
@@ -1012,13 +992,11 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
             except Exception:
                 pass
 
-            # Wait for the player to spin up streams (bounded)
             remaining = max(0, int(_sniff_deadline - time.time()))
             wait_ms = min(SNIFF_WAIT_AFTER_PLAY_MS, remaining * 1000)
             if wait_ms > 0:
                 page.wait_for_timeout(wait_ms)
 
-            # Scroll a bit to trigger lazy-loaded players
             try:
                 if time.time() < _sniff_deadline:
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
@@ -1030,7 +1008,6 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
             logger.error(f"[Sniff] Fatal error: {e}")
 
         finally:
-            # ---- GUARANTEED CLEANUP ----
             if context is not None:
                 try:
                     context.close()
@@ -1046,30 +1023,22 @@ def _sniff_network(page_url, timeout=SNIFF_TIMEOUT_SEC):
                     pw.stop()
                 except Exception:
                     pass
-            # Kill anything that survived a crash or a timed-out thread.
             _cleanup_playwright_processes(verbose=False)
 
-    # Run Playwright's sync API in a dedicated thread so we don't fight
-    # Flask's event loop or need asyncio.run here.
     t = threading.Thread(target=run_sync, daemon=True)
     t.start()
     t.join(timeout=timeout + 15)
 
     if t.is_alive():
-        # Thread stuck (e.g. page is hanging). Kill orphans from the main
-        # thread so the browser can't keep downloading forever.
         logger.warning("[Sniff] Sniff thread timed out — killing orphans")
         _cleanup_playwright_processes(verbose=True)
     else:
-        # Even on success, sweep any stray process. Cheap, and stops the
-        # "1 MB/s forever" leak if Playwright left a helper behind.
         _cleanup_playwright_processes(verbose=False)
 
     if not captured:
         logger.info("[Sniff] No video streams detected")
         return []
 
-    # ---- Rank captured URLs ----
     def score(item):
         s = 0
         u = item['url'].lower()
@@ -1162,7 +1131,6 @@ def crack_video_urls(page_url, deep=True, save_debug_to=None):
         logger.info("[Crack] Input is already a direct video URL")
         return [page_url]
 
-    # Strategy 2: yt-dlp
     try:
         ytdlp_urls = _crack_ytdlp_geturl(page_url)
         if ytdlp_urls:
@@ -1173,7 +1141,6 @@ def crack_video_urls(page_url, deep=True, save_debug_to=None):
     except Exception as e:
         logger.debug(f"[Crack] yt-dlp failed: {e}")
 
-    # Fetch HTML
     html, final_url = None, page_url
     try:
         html, final_url = _fetch_page_html(page_url)
@@ -1218,13 +1185,11 @@ def crack_video_urls(page_url, deep=True, save_debug_to=None):
             except Exception:
                 pass
 
-    # Strategy 13: API guessing
     try:
         add(_crack_apis(final_url), "api-guess")
     except Exception as e:
         logger.debug(f"[Crack] API guess failed: {e}")
 
-    # Strategy 14: Network sniffing (only if nothing useful found)
     if not candidates and deep:
         try:
             logger.info("[Crack] Falling back to network sniffing...")
@@ -1332,7 +1297,6 @@ def download_direct_file(url, task_id):
                         save_task(task_id, task)
                     last_update = now
 
-        # ---- Verify ----
         final_ext = os.path.splitext(output_path)[1].lower()
         if final_ext in MEDIA_EXTS or final_ext in VIDEO_STREAM_EXTS:
             final_size = os.path.getsize(temp_path)
@@ -1857,7 +1821,6 @@ def process_url_download(task_id, url, quality='best', range_start=1, range_end=
             task['error_msg'] = str(e)
             save_task(task_id, task)
     finally:
-        # Sweep any Playwright leftovers from this task's sniffing.
         try:
             _cleanup_playwright_processes(verbose=False)
         except Exception:
@@ -1865,78 +1828,215 @@ def process_url_download(task_id, url, quality='best', range_start=1, range_end=
 
 
 # ============================================================
-# TORRENT
+# TORRENT DOWNLOADER
 # ============================================================
+def _build_torrent_session():
+    """Create a libtorrent session with DHT/LSD/UPnP enabled and DHT routers set."""
+    try:
+        ses = lt.session({
+            'listen_interfaces': '0.0.0.0:6881,[::]:6881',
+            'enable_dht': True,
+            'enable_lsd': True,
+            'enable_upnp': True,
+            'enable_natpmp': True,
+            'alert_mask': 0x7fffffff,
+        })
+    except Exception as e:
+        logger.warning(f"session(settings) failed, using defaults: {e}")
+        ses = lt.session()
+        try:
+            ses.listen_on(6881, 6891)
+        except Exception:
+            pass
+
+    for host, port in DHT_ROUTERS:
+        try:
+            ses.add_dht_router(host, port)
+        except Exception:
+            pass
+    return ses
+
+
+def _append_public_trackers(magnet_uri):
+    """Add public trackers to a magnet URI that has none of its own."""
+    if '&tr=' in magnet_uri or '?tr=' in magnet_uri:
+        return magnet_uri
+    sep = '&' if '?' in magnet_uri else '?'
+    trs = '&'.join(f"tr={quote(tr, safe='')}" for tr in PUBLIC_TRACKERS)
+    return magnet_uri + sep + trs
+
+
 def download_torrent(torrent_input, task_id, save_path):
     if not TORRENT_AVAILABLE:
         raise Exception("libtorrent not installed")
-    ses = lt.session()
-    ses.listen_on(6881, 6891)
+
+    is_magnet = torrent_input.startswith('magnet:')
+
+    ses = _build_torrent_session()
+
     atp = lt.add_torrent_params()
     atp.save_path = save_path
-    if torrent_input.startswith('magnet:'):
-        atp.url = torrent_input
+
+    if is_magnet:
+        atp.url = _append_public_trackers(torrent_input)
     else:
-        atp.ti = lt.torrent_info(torrent_input)
+        try:
+            atp.ti = lt.torrent_info(torrent_input)
+        except TypeError:
+            atp.ti = lt.torrent_info(torrent_input, save_path)
+
     handle = ses.add_torrent(atp)
+
     task = load_task(task_id)
     if task:
-        task['status'] = 'downloading'
+        task['status'] = 'metadata'
+        task['download_progress'] = 0
+        task['progress'] = 0
+        task['download_speed'] = 0
+        task['peers'] = 0
+        task['seeds'] = 0
         save_task(task_id, task)
+
+    # ---------- Wait for metadata (with timeout) ----------
+    meta_deadline = time.time() + METADATA_TIMEOUT_SEC
+    last_report = 0
 
     while not handle.has_metadata():
         if load_task(task_id).get('cancelled', False):
             ses.remove_torrent(handle)
             raise DownloadCancelled("Cancelled")
+
+        if time.time() > meta_deadline:
+            ses.remove_torrent(handle)
+            raise Exception(
+                f"No metadata after {METADATA_TIMEOUT_SEC}s "
+                "— magnet has no reachable peers. Try a different torrent."
+            )
+
+        st = handle.status()
+        now = time.time()
+        if now - last_report >= 2:
+            t = load_task(task_id)
+            if t:
+                t['peers'] = st.num_peers
+                t['seeds'] = st.num_seeds
+                t['status'] = f'metadata (peers:{st.num_peers})'
+                save_task(task_id, t)
+            logger.info(f"[Torrent {task_id}] fetching metadata: "
+                        f"peers={st.num_peers} seeds={st.num_seeds}")
+            last_report = now
         time.sleep(1)
 
+    # ---------- Metadata ready ----------
     torrent_name = handle.name()
-    files = handle.get_torrent_info().files()
-    total_size = sum(f.size for f in files)
+
+    try:
+        ti = handle.torrent_file()
+        files = ti.files()
+        total_size = sum(files.file_size(i) for i in range(files.num_files()))
+        num_files = files.num_files()
+    except Exception:
+        total_size = handle.status().total_wanted
+        num_files = 1
+
     task = load_task(task_id)
     if task:
         task['total_size'] = total_size
+        task['torrent_name'] = torrent_name
+        task['status'] = 'downloading'
+        task['file_count'] = num_files
         save_task(task_id, task)
 
-    output_filename = (files.file_path(0) if files.num_files() == 1
-                       else torrent_name + '.mp4')
-    full_output_path = os.path.join(save_path, output_filename)
+    logger.info(f"[Torrent {task_id}] metadata OK — '{torrent_name}', "
+                f"{num_files} file(s), {total_size/1024/1024:.1f} MB")
 
-    while not handle.is_seed():
+    # ---------- Download loop with stall detection ----------
+    last_done = 0
+    last_done_time = time.time()
+    last_report = 0
+
+    while True:
         if load_task(task_id).get('cancelled', False):
             ses.remove_torrent(handle)
             raise DownloadCancelled("Cancelled")
-        status = handle.status()
-        progress = int(status.progress * 100)
-        downloaded = status.total_download
-        speed = int(status.download_rate / 1024)
-        task = load_task(task_id)
-        if task:
-            task['progress'] = progress
-            task['downloaded_size'] = downloaded
-            task['download_speed'] = speed
-            task['download_progress'] = progress
-            save_task(task_id, task)
+
+        st = handle.status()
+
+        if st.is_seeding or st.progress >= 1.0:
+            break
+
+        now = time.time()
+        done = st.total_done
+
+        if done > last_done:
+            last_done = done
+            last_done_time = now
+
+        if (now - last_done_time) > STALL_TIMEOUT_SEC and st.num_peers == 0:
+            ses.remove_torrent(handle)
+            raise Exception(
+                f"Stalled: 0 peers for {STALL_TIMEOUT_SEC}s. "
+                "No seeders, or trackers unreachable."
+            )
+
+        if now - last_report >= 1:
+            t = load_task(task_id)
+            if t:
+                t['progress'] = int(st.progress * 100)
+                t['download_progress'] = int(st.progress * 100)
+                t['downloaded_size'] = done
+                t['total_size'] = total_size
+                t['download_speed'] = int(st.download_rate / 1024)
+                t['peers'] = st.num_peers
+                t['seeds'] = st.num_seeds
+                save_task(task_id, t)
+            last_report = now
+
         time.sleep(1)
 
+    # ---------- Finalize ----------
     ses.remove_torrent(handle)
-    if not os.path.exists(full_output_path):
-        for root, _, files in os.walk(save_path):
-            for f in files:
-                if torrent_name in f:
-                    full_output_path = os.path.join(root, f)
-                    break
+
+    video_exts = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv',
+                  '.m4v', '.ts', '.wmv')
+    candidates = []
+    for root, _, filenames in os.walk(save_path):
+        for fn in filenames:
+            full = os.path.join(root, fn)
+            try:
+                sz = os.path.getsize(full)
+            except OSError:
+                continue
+            if sz > 1_000_000:
+                candidates.append((full, sz))
+
+    if not candidates:
+        raise Exception("Torrent finished but no output files found")
+
+    vids = [c for c in candidates if c[0].lower().endswith(video_exts)]
+    full_output_path, _ = max(vids or candidates, key=lambda c: c[1])
+
     final_name = _get_unique_filename(os.path.basename(full_output_path))
     final_path = os.path.join(UPLOAD_FOLDER, final_name)
-    if full_output_path != final_path:
-        os.rename(full_output_path, final_path)
+    if os.path.abspath(full_output_path) != os.path.abspath(final_path):
+        try:
+            shutil.move(full_output_path, final_path)
+        except Exception as e:
+            logger.warning(f"Move failed: {e}")
+            final_name = os.path.basename(full_output_path)
+
     task = load_task(task_id)
     if task:
         task['status'] = 'done'
         task['output_file'] = final_name
+        task['progress'] = 100
         task['download_progress'] = 100
         task['download_speed'] = 0
+        task['peers'] = 0
+        task['seeds'] = 0
         save_task(task_id, task)
+
+    logger.info(f"Torrent {task_id} done: {final_name}")
 
 
 def process_torrent_download(task_id, torrent_input):
@@ -1948,6 +2048,7 @@ def process_torrent_download(task_id, torrent_input):
             task['status'] = 'cancelled'
             save_task(task_id, task)
     except Exception as e:
+        logger.exception(f"Torrent task {task_id} failed")
         task = load_task(task_id)
         if task:
             task['status'] = 'error'
@@ -2067,7 +2168,6 @@ def register_routes(app):
 
     @app.route('/sniff/url', methods=['POST'])
     def sniff_url():
-        """Network-sniffing only endpoint (VDH-style)."""
         page_url = request.form.get('url', '').strip()
         if not page_url:
             return jsonify({'error': 'URL required'}), 400
@@ -2131,7 +2231,6 @@ def _cli_main():
             urls = crack_video_urls(url, deep=True,
                                      save_debug_to='/tmp/crack_debug')
     finally:
-        # Always sweep, even if the CLI exits abnormally.
         _cleanup_playwright_processes(verbose=True)
 
     print()
