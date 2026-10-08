@@ -1,5 +1,5 @@
 <div class="card">
-    <h2><i class="fas fa-cut"></i> Video Clipper, Summarizer, Frame Extractor & Face Swap</h2>
+    <h2><i class="fas fa-cut"></i> Video Clipper, Summarizer, Frame Extractor, Trim & Face Swap</h2>
 
     <!-- ========== Random Clips ========== -->
     <div style="margin-bottom: 2rem; padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
@@ -41,7 +41,7 @@
         <div id="summaryResult" class="empty-state">Select a video and click Generate.</div>
     </div>
 
-    <!-- ========== Frame Extractor (NEW) ========== -->
+    <!-- ========== Frame Extractor ========== -->
     <div style="margin-bottom: 2rem; padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
         <h3><i class="fas fa-images"></i> Extract Frames</h3>
         <p>Extract one frame every N seconds from the video. All frames are saved in a ZIP file.</p>
@@ -62,6 +62,51 @@
         </div>
         <div id="frameStatus" class="help-text"></div>
         <div id="frameResult" class="empty-state">Select a video and click Extract Frames.</div>
+    </div>
+
+    <!-- ========== Trim / Crop from Timestamp (NEW) ========== -->
+    <div style="margin-bottom: 2rem; padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
+        <h3><i class="fas fa-scissors"></i> Crop / Trim by Timestamp</h3>
+        <p>Cut an exact segment from the video by entering a start and end time.
+           Accepts <code>HH:MM:SS</code>, <code>MM:SS</code>, or plain seconds
+           (<code>90</code> = 1m 30s).</p>
+
+        <div class="input-group" style="flex-wrap: wrap; gap: 0.6rem;">
+            <div style="flex:2; min-width:220px;">
+                <div style="font-size:0.7rem; color:#aaa;">Source video</div>
+                <select id="trimVideoSelect" style="width:100%;">
+                    <option>Loading videos...</option>
+                </select>
+            </div>
+            <div style="width:130px;">
+                <div style="font-size:0.7rem; color:#aaa;">Start</div>
+                <input type="text" id="trimStart" placeholder="00:01:30"
+                       style="width:100%; font-family: monospace;">
+            </div>
+            <div style="width:130px;">
+                <div style="font-size:0.7rem; color:#aaa;">End</div>
+                <input type="text" id="trimEnd" placeholder="00:02:45"
+                       style="width:100%; font-family: monospace;">
+            </div>
+            <div style="width:150px;">
+                <div style="font-size:0.7rem; color:#aaa;">Mode</div>
+                <select id="trimMode" style="width:100%;">
+                    <option value="copy">Fast (stream copy)</option>
+                    <option value="precise">Precise (re-encode)</option>
+                </select>
+            </div>
+            <div style="align-self:flex-end;">
+                <button id="trimBtn" class="primary">
+                    <i class="fas fa-scissors"></i> Trim
+                </button>
+            </div>
+        </div>
+
+        <div id="trimInfo" class="help-text" style="font-size:0.72rem;"></div>
+        <div id="trimStatus" class="help-text"></div>
+        <div id="trimResult" class="empty-state">
+            Select a video, enter start and end times, then click Trim.
+        </div>
     </div>
 
     <!-- ========== Face Swap ========== -->
@@ -103,7 +148,9 @@ async function loadAllVideos() {
     try {
         const resp = await fetch('/clipper/list_videos');
         const videos = await resp.json();
-        const selects = ['randomVideoSelect', 'summaryVideoSelect', 'faceSwapVideoSelect', 'frameVideoSelect'];
+        const selects = ['randomVideoSelect', 'summaryVideoSelect',
+                         'faceSwapVideoSelect', 'frameVideoSelect',
+                         'trimVideoSelect'];
         selects.forEach(id => {
             const sel = document.getElementById(id);
             if (!sel) return;
@@ -141,7 +188,6 @@ document.getElementById('randomBtn').onclick = async () => {
     const data = await resp.json();
     if (data.error) { alert(data.error); return; }
     randomTaskId = data.task_id;
-    // Store for persistence
     if (typeof storeTaskId === 'function') {
         storeTaskId('random_clips', randomTaskId);
     } else {
@@ -255,6 +301,140 @@ document.getElementById('extractFramesBtn').onclick = async () => {
         }
     }, 2000);
 };
+
+// ========== Trim / Crop by Timestamp ==========
+(function() {
+    const trimSelect = document.getElementById('trimVideoSelect');
+    const trimStart  = document.getElementById('trimStart');
+    const trimEnd    = document.getElementById('trimEnd');
+    const trimMode   = document.getElementById('trimMode');
+    const trimBtn    = document.getElementById('trimBtn');
+    const trimInfo   = document.getElementById('trimInfo');
+    const trimStatus = document.getElementById('trimStatus');
+    const trimResult = document.getElementById('trimResult');
+
+    let trimTaskId = null;
+    let trimTimer = null;
+
+    // Parse timestamps to seconds (mirrors backend)
+    function parseTs(s) {
+        if (!s) return null;
+        s = String(s).trim();
+        if (s.startsWith('-')) return null;
+        const parts = s.split(':');
+        try {
+            if (parts.length === 1) return parseFloat(parts[0]);
+            if (parts.length === 2) return parseFloat(parts[0])*60 + parseFloat(parts[1]);
+            if (parts.length === 3) return parseFloat(parts[0])*3600
+                                       + parseFloat(parts[1])*60
+                                       + parseFloat(parts[2]);
+        } catch(e) { return null; }
+        return null;
+    }
+
+    // Live duration preview
+    function updateInfo() {
+        const a = parseTs(trimStart.value);
+        const b = parseTs(trimEnd.value);
+        if (a === null || b === null) {
+            trimInfo.textContent = '';
+            return;
+        }
+        if (b <= a) {
+            trimInfo.innerHTML = '<span style="color:#ff8a8a;">'
+                + 'End must be after start</span>';
+            return;
+        }
+        const d = b - a;
+        const m = Math.floor(d / 60);
+        const s = (d % 60).toFixed(2);
+        trimInfo.innerHTML = `<i class="fas fa-clock"></i> `
+            + `Duration: <b>${m}m ${s}s</b> (${d.toFixed(2)}s)`;
+    }
+    trimStart.addEventListener('input', updateInfo);
+    trimEnd.addEventListener('input', updateInfo);
+
+    trimBtn.onclick = async () => {
+        const video = trimSelect.value;
+        if (!video) { showToast('Select a video', true); return; }
+        const a = parseTs(trimStart.value);
+        const b = parseTs(trimEnd.value);
+        if (a === null) { showToast('Invalid start time', true); return; }
+        if (b === null) { showToast('Invalid end time', true); return; }
+        if (b <= a) { showToast('End must be after start', true); return; }
+
+        const body = new URLSearchParams();
+        body.append('video_file', video);
+        body.append('start', trimStart.value.trim());
+        body.append('end', trimEnd.value.trim());
+        body.append('mode', trimMode.value);
+
+        try {
+            const resp = await fetch('/clipper/trim', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: body
+            });
+            const data = await resp.json();
+            if (data.error) throw new Error(data.error);
+
+            trimTaskId = data.task_id;
+            trimStatus.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> '
+                + `Trimming (${data.mode})...`;
+            trimResult.innerHTML = '<div class="empty-state">Processing...</div>';
+
+            if (trimTimer) clearInterval(trimTimer);
+            trimTimer = setInterval(pollTrim, 1500);
+        } catch (err) {
+            showToast(err.message, true);
+        }
+    };
+
+    async function pollTrim() {
+        if (!trimTaskId) return;
+        try {
+            const r = await fetch(`/progress/${trimTaskId}`);
+            const t = await r.json();
+            if (t.status === 'done') {
+                clearInterval(trimTimer);
+                const fname = t.output_file;
+                const sizeMB = t.output_size ? (t.output_size/1024/1024).toFixed(2) : '?';
+                const dur = t.output_duration ? t.output_duration.toFixed(2) : '?';
+                trimStatus.innerHTML = `✅ Done! ${sizeMB} MB, ${dur}s`;
+                trimResult.innerHTML =
+                    `<div class="empty-state">✅ `
+                    + `<a href="/download_file?path=${encodeURIComponent(fname)}" target="_blank">`
+                    + `${escapeHtml(fname)}</a> `
+                    + `&nbsp;<button class="trim-preview-btn primary" `
+                    + `style="padding:0.2rem 0.7rem; font-size:0.7rem;" `
+                    + `data-path="${escapeHtml(fname)}" `
+                    + `data-name="${escapeHtml(fname)}">`
+                    + `<i class="fas fa-play"></i> Preview</button>`
+                    + `</div>`;
+                const btn = trimResult.querySelector('.trim-preview-btn');
+                if (btn && typeof window.openPreview === 'function') {
+                    btn.onclick = () => window.openPreview(
+                        btn.dataset.path, btn.dataset.name);
+                }
+            } else if (t.status === 'error') {
+                clearInterval(trimTimer);
+                trimStatus.innerHTML = `<span style="color:#ff8a8a;">❌ `
+                    + `${escapeHtml(t.error_msg || 'error')}</span>`;
+                trimResult.innerHTML = '<div class="empty-state">Trim failed.</div>';
+            } else if (t.status === 'cancelled') {
+                clearInterval(trimTimer);
+                trimStatus.innerHTML = '⛔ Cancelled';
+                trimResult.innerHTML = '<div class="empty-state">Cancelled.</div>';
+            } else {
+                const p = t.progress || 0;
+                trimStatus.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> `
+                    + `${escapeHtml(t.status)} (${p}%)`;
+                trimResult.innerHTML = `<div class="empty-state">`
+                    + `Trimming ${p}%...</div>`;
+            }
+        } catch (e) { console.error(e); }
+    }
+})();
 
 // ========== Face Swap ==========
 let swapTaskId = null, swapTimer = null;
