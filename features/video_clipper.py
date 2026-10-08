@@ -14,6 +14,11 @@ from config import UPLOAD_FOLDER
 
 logger = logging.getLogger(__name__)
 
+# Small log helper aliases used by some paths below
+def log_info(m):    logger.info(m)
+def log_warning(m): logger.warning(m)
+
+
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
@@ -34,12 +39,14 @@ def get_video_duration(video_path):
     return float(result.stdout.strip())
 
 def has_video_stream(file_path):
-    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_type',
+    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+           '-show_entries', 'stream=codec_type',
            '-of', 'default=noprint_wrappers=1:nokey=1', file_path]
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.returncode == 0 and result.stdout.strip() == 'video'
 
-def extract_clip_with_fallback(video_path, start_time, clip_duration, output_path, task_id=None, idx=None, total=None):
+def extract_clip_with_fallback(video_path, start_time, clip_duration, output_path,
+                               task_id=None, idx=None, total=None):
     # try stream copy first
     cmd_copy = ['ffmpeg', '-ss', str(start_time), '-i', video_path,
                 '-t', str(clip_duration),
@@ -105,6 +112,7 @@ def merge_clips(clip_files, output_path, task_id):
         if os.path.exists(clip):
             os.remove(clip)
 
+
 # ------------------------------------------------------------
 # Random Clips
 # ------------------------------------------------------------
@@ -156,6 +164,7 @@ def process_random_clips(video_path, segment_duration, clip_duration, output_pat
     task['output_file'] = os.path.basename(output_path)
     save_task(task_id, task)
 
+
 # ------------------------------------------------------------
 # AI Summarizer
 # ------------------------------------------------------------
@@ -196,8 +205,9 @@ def process_summarizer(video_path, target_duration_sec, clip_duration_sec, outpu
     task['output_file'] = os.path.basename(output_path)
     save_task(task_id, task)
 
+
 # ------------------------------------------------------------
-# Frame Extractor (NEW)
+# Frame Extractor
 # ------------------------------------------------------------
 def extract_frames_task(video_path, interval_sec, task_id, output_format='jpg'):
     task = load_task(task_id)
@@ -269,6 +279,182 @@ def extract_frames_task(video_path, interval_sec, task_id, output_format='jpg'):
             save_task(task_id, task)
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ------------------------------------------------------------
+# Trim / Crop from timestamp range
+# ------------------------------------------------------------
+def _parse_timestamp(val):
+    """
+    Accept 'HH:MM:SS', 'MM:SS', 'SS', or a float/integer string.
+    Returns seconds as float, or None if unparseable.
+    """
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    if s.startswith('-'):
+        return None
+    parts = s.split(':')
+    try:
+        if len(parts) == 1:
+            return float(parts[0])
+        if len(parts) == 2:
+            return float(parts[0]) * 60 + float(parts[1])
+        if len(parts) == 3:
+            return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+    except ValueError:
+        return None
+    return None
+
+
+def process_trim_task(video_path, start_sec, end_sec, output_path,
+                      mode, task_id):
+    """
+    Extract [start_sec, end_sec] from video_path into output_path.
+    mode = 'copy'    → stream copy, fast, keyframe-snapped
+    mode = 'precise' → re-encode with libx264 ultrafast CRF 20, exact trim
+    """
+    task = load_task(task_id)
+    if not task:
+        return
+    task['status'] = 'trimming'
+    task['progress'] = 0
+    task['mode'] = mode
+    task['start_sec'] = start_sec
+    task['end_sec'] = end_sec
+    task['duration'] = end_sec - start_sec
+    save_task(task_id, task)
+
+    try:
+        total_duration = get_video_duration(video_path)
+        if total_duration is None:
+            raise Exception("Cannot read source duration")
+
+        if start_sec < 0:
+            raise Exception("start must be >= 0")
+        if end_sec <= start_sec:
+            raise Exception("end must be greater than start")
+        if start_sec >= total_duration:
+            raise Exception(f"start ({start_sec:.2f}s) is past the end "
+                            f"of video ({total_duration:.2f}s)")
+        if end_sec > total_duration:
+            log_warning(f"end clamped {end_sec:.2f}s → {total_duration:.2f}s")
+            end_sec = total_duration
+
+        trim_dur = end_sec - start_sec
+        log_info(f"Trim: {video_path} [{start_sec:.3f}s → {end_sec:.3f}s] "
+                 f"({trim_dur:.2f}s) mode={mode}")
+
+        task = load_task(task_id)
+        task['total_duration_source'] = total_duration
+        task['duration'] = trim_dur
+        save_task(task_id, task)
+
+        if mode == 'copy':
+            cmd = [
+                'ffmpeg',
+                '-ss', f'{start_sec:.3f}',
+                '-i', video_path,
+                '-t', f'{trim_dur:.3f}',
+                '-map', '0:v:0', '-map', '0:a:0?',
+                '-c', 'copy',
+                '-avoid_negative_ts', 'make_zero',
+                '-reset_timestamps', '1',
+                '-movflags', '+faststart',
+                '-y', output_path
+            ]
+        else:
+            cmd = [
+                'ffmpeg',
+                '-i', video_path,
+                '-ss', f'{start_sec:.3f}',
+                '-t', f'{trim_dur:.3f}',
+                '-map', '0:v:0', '-map', '0:a:0?',
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-crf', '20',
+                '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-ac', '2',
+                '-movflags', '+faststart',
+                '-avoid_negative_ts', 'make_zero',
+                '-y', output_path
+            ]
+
+        log_info(f"ffmpeg: {' '.join(cmd)}")
+
+        pct_re = re.compile(r'out_time_us=(\d+)')
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            bufsize=1,
+        )
+
+        last_update = 0
+        for line in proc.stdout:
+            line = line.strip()
+            m = pct_re.search(line)
+            if m and trim_dur > 0:
+                cur_sec = int(m.group(1)) / 1_000_000
+                pct = min(99, int(100 * cur_sec / trim_dur))
+                now = time.time()
+                if now - last_update >= 0.5:
+                    task = load_task(task_id)
+                    if task:
+                        task['progress'] = pct
+                        save_task(task_id, task)
+                    last_update = now
+            t = load_task(task_id)
+            if t and t.get('cancelled', False):
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                raise Exception("Cancelled by user")
+
+        proc.wait()
+
+        if proc.returncode != 0:
+            raise Exception(f"ffmpeg exited with code {proc.returncode}")
+
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            raise Exception("Trim output is empty")
+
+        if not has_video_stream(output_path):
+            raise Exception("Trim output has no video stream")
+
+        actual_dur = get_video_duration(output_path)
+        out_size = os.path.getsize(output_path)
+
+        task = load_task(task_id)
+        if task:
+            task['status'] = 'done'
+            task['progress'] = 100
+            task['output_file'] = os.path.basename(output_path)
+            task['output_size'] = out_size
+            task['output_duration'] = actual_dur
+            save_task(task_id, task)
+        log_info(f"Trim done: {os.path.basename(output_path)} "
+                 f"({out_size / 1024 / 1024:.2f} MB)")
+
+    except Exception as e:
+        logger.exception(f"Trim failed for {task_id}")
+        task = load_task(task_id)
+        if task:
+            task['status'] = 'error'
+            task['error_msg'] = str(e)
+            save_task(task_id, task)
+        try:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+        except Exception:
+            pass
+
 
 # ------------------------------------------------------------
 # Flask Routes
@@ -356,7 +542,6 @@ def register_routes(app):
         threading.Thread(target=run, daemon=True).start()
         return jsonify({'task_id': task_id})
 
-    # ---------- NEW: Frame Extractor ----------
     @app.route('/clipper/extract_frames', methods=['POST'])
     def clipper_extract_frames():
         if not check_ffmpeg():
@@ -384,8 +569,74 @@ def register_routes(app):
             'total_frames': 0
         }
         save_task(task_id, task_data)
-
         def run():
             extract_frames_task(video_path, interval, task_id, format_)
         threading.Thread(target=run, daemon=True).start()
         return jsonify({'task_id': task_id})
+
+    # ---------- Trim / Crop from timestamp ----------
+    @app.route('/clipper/trim', methods=['POST'])
+    def clipper_trim():
+        if not check_ffmpeg():
+            return jsonify({'error': 'ffmpeg not installed'}), 500
+
+        video_file = request.form.get('video_file')
+        start_raw  = request.form.get('start', '')
+        end_raw    = request.form.get('end', '')
+        mode       = request.form.get('mode', 'copy').lower()
+        if mode not in ('copy', 'precise'):
+            mode = 'copy'
+
+        if not video_file:
+            return jsonify({'error': 'Video file required'}), 400
+
+        video_path = os.path.join(UPLOAD_FOLDER, video_file)
+        if not os.path.exists(video_path):
+            return jsonify({'error': 'Video not found'}), 404
+
+        start_sec = _parse_timestamp(start_raw)
+        end_sec   = _parse_timestamp(end_raw)
+
+        if start_sec is None:
+            return jsonify({'error': f'Invalid start time: {start_raw!r}'}), 400
+        if end_sec is None:
+            return jsonify({'error': f'Invalid end time: {end_raw!r}'}), 400
+        if end_sec <= start_sec:
+            return jsonify({'error': 'end must be after start'}), 400
+
+        base = os.path.splitext(os.path.basename(video_file))[0]
+        tag = f"{int(start_sec):05d}_{int(end_sec):05d}"
+        out_name = f"{base}_trim_{tag}.mp4"
+        i = 1
+        while os.path.exists(os.path.join(UPLOAD_FOLDER, out_name)):
+            out_name = f"{base}_trim_{tag}_{i}.mp4"
+            i += 1
+        out_path = os.path.join(UPLOAD_FOLDER, out_name)
+
+        task_id = str(uuid.uuid4())
+        task_data = {
+            'task_id': task_id,
+            'status': 'queued',
+            'progress': 0,
+            'created_at': time.time(),
+            'cancelled': False,
+            'video_file': video_file,
+            'mode': mode,
+            'start': start_sec,
+            'end': end_sec,
+            'duration': end_sec - start_sec,
+            'output_file': out_name,
+        }
+        save_task(task_id, task_data)
+
+        def run():
+            process_trim_task(video_path, start_sec, end_sec,
+                              out_path, mode, task_id)
+        threading.Thread(target=run, daemon=True).start()
+
+        return jsonify({
+            'task_id': task_id,
+            'output_file': out_name,
+            'duration': end_sec - start_sec,
+            'mode': mode,
+        })
