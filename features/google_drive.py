@@ -1,4 +1,5 @@
 import os
+import glob
 import uuid
 import threading
 import time
@@ -10,41 +11,101 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from googleapiclient.errors import HttpError
 from tasks import save_task, load_task
-from config import UPLOAD_FOLDER, DRIVE_FOLDER_ID, TOKEN_FILE
+from config import UPLOAD_FOLDER, DRIVE_FOLDER_ID, BASE_DIR
 
 logger = logging.getLogger(__name__)
 
 
-def get_drive_service():
-    """Authenticate and return Drive service."""
-    try:
-        creds = None
-        if os.path.exists(TOKEN_FILE):
+# ============================================================
+# Multi-account token discovery + service cache
+# ============================================================
+def discover_accounts():
+    """
+    Return dict {account_name: token_path} by scanning token*.json
+    in the project root.
+      - token.json       → account name "default"
+      - token_alice.json → account name "alice"
+      - token_bob.json   → account name "bob"
+    """
+    out = {}
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for path in sorted(glob.glob(os.path.join(base, 'token*.json'))):
+        name = os.path.splitext(os.path.basename(path))[0]
+        if name == 'token':
+            out['default'] = path
+        elif name.startswith('token_'):
+            out[name[len('token_'):]] = path
+    return out
+
+
+_service_cache = {}          # account_name -> service object
+_email_cache = {}            # account_name -> email
+_quota_cache = {}            # account_name -> (limit, usage)
+_cache_lock = threading.Lock()
+
+
+def _load_credentials(token_path):
+    creds = Credentials.from_authorized_user_file(
+        token_path, ['https://www.googleapis.com/auth/drive'])
+    if not creds.valid:
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
             try:
-                creds = Credentials.from_authorized_user_file(
-                    TOKEN_FILE, ['https://www.googleapis.com/auth/drive']
-                )
+                with open(token_path, 'w') as f:
+                    f.write(creds.to_json())
+                logger.info(f"Refreshed token: {os.path.basename(token_path)}")
             except Exception as e:
-                logger.error(f"Failed to read token.json: {e}")
-                raise Exception("Google Drive token file is corrupt.")
+                logger.warning(f"Could not persist refreshed token: {e}")
+        else:
+            raise Exception(f"Token invalid and cannot be refreshed: {token_path}")
+    return creds
 
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                try:
-                    creds.refresh(Request())
-                    with open(TOKEN_FILE, 'w') as token:
-                        token.write(creds.to_json())
-                    logger.info("Google Drive token refreshed")
-                except Exception as e:
-                    logger.error(f"Token refresh failed: {e}")
-                    raise Exception("Google Drive token expired. Please re-authorize.")
-            else:
-                raise Exception("token.json missing or invalid. Please re-authorize.")
 
-        return build('drive', 'v3', credentials=creds)
-    except Exception as e:
-        logger.error(f"Drive service error: {e}")
-        raise
+def get_drive_service(account='default'):
+    """
+    Return a Drive service for the given account name.
+    Cached per account. Raises if account not found.
+    """
+    with _cache_lock:
+        if account in _service_cache:
+            return _service_cache[account]
+
+    accounts = discover_accounts()
+    if account not in accounts:
+        raise Exception(
+            f"Drive account '{account}' not found. "
+            f"Available: {sorted(accounts.keys())}. "
+            f"Add token_<name>.json to the project root."
+        )
+
+    token_path = accounts[account]
+    creds = _load_credentials(token_path)
+    service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+
+    # Fetch email once for display
+    try:
+        about = service.about().get(fields='user,storageQuota').execute()
+        email = about.get('user', {}).get('emailAddress', 'unknown')
+        q = about.get('storageQuota', {})
+        _quota_cache[account] = (
+            int(q.get('limit', 0) or 0),
+            int(q.get('usage', 0) or 0),
+        )
+    except Exception:
+        email = 'unknown'
+
+    with _cache_lock:
+        _service_cache[account] = service
+        _email_cache[account] = email
+
+    logger.info(f"Drive service loaded for account '{account}' ({email})")
+    return service
+
+
+def _request_account():
+    """Read account name from query string or form. Defaults to 'default'."""
+    acct = request.args.get('account') or request.form.get('account')
+    return acct if acct else 'default'
 
 
 def _format_size(size_bytes):
@@ -52,63 +113,41 @@ def _format_size(size_bytes):
         size = int(size_bytes)
     except Exception:
         return "—"
-    if size < 1024:
-        return f"{size} B"
-    if size < 1024 ** 2:
-        return f"{size / 1024:.1f} KB"
-    if size < 1024 ** 3:
-        return f"{size / (1024 ** 2):.1f} MB"
-    return f"{size / (1024 ** 3):.2f} GB"
+    if size < 1024:    return f"{size} B"
+    if size < 1024**2: return f"{size / 1024:.1f} KB"
+    if size < 1024**3: return f"{size / (1024**2):.1f} MB"
+    return f"{size / (1024**3):.2f} GB"
 
 
 def _get_breadcrumbs(service, folder_id, root_id):
-    """
-    Build breadcrumb trail from root to current folder.
-    Returns list of {id, name} from root down to current folder.
-    """
     if folder_id == root_id:
         return [{'id': root_id, 'name': 'My Drive / Root'}]
-
     crumbs = []
     current = folder_id
-    visited = set()  # prevent infinite loops from circular parents
-
+    visited = set()
     while current and current not in visited and len(crumbs) < 50:
         visited.add(current)
         try:
             meta = service.files().get(
-                fileId=current, fields='id,name,parents'
-            ).execute()
+                fileId=current, fields='id,name,parents').execute()
         except HttpError:
             break
-
         crumbs.insert(0, {'id': meta['id'], 'name': meta.get('name', 'Unknown')})
         parents = meta.get('parents', [])
         current = parents[0] if parents else None
-
-    # Add root at the top
     crumbs.insert(0, {'id': root_id, 'name': 'Root'})
     return crumbs
 
 
 def _list_folder(service, folder_id):
-    """
-    List files AND subfolders in a folder.
-    Returns dict with files, folders, parent_id.
-    """
     query = f"'{folder_id}' in parents and trashed = false"
     fields = ("files(id, name, size, modifiedTime, mimeType, "
               "parents, iconLink, webViewLink)")
-
     results = service.files().list(
-        q=query,
-        fields=fields,
-        orderBy="folder, name",
-        pageSize=1000
+        q=query, fields=fields, orderBy="folder, name", pageSize=1000
     ).execute()
 
     all_items = results.get('files', [])
-
     folders = []
     files = []
     FOLDER_MIME = 'application/vnd.google-apps.folder'
@@ -133,13 +172,10 @@ def _list_folder(service, folder_id):
                 'is_folder': False,
             })
 
-    # Get parent folder ID (for "up" button)
     parent_id = None
     if folder_id != DRIVE_FOLDER_ID:
         try:
-            meta = service.files().get(
-                fileId=folder_id, fields='parents'
-            ).execute()
+            meta = service.files().get(fileId=folder_id, fields='parents').execute()
             parents = meta.get('parents', [])
             parent_id = parents[0] if parents else None
         except HttpError:
@@ -162,15 +198,18 @@ def _get_unique_filename(filename):
     return new_name
 
 
-def process_colab(task_id, input_path, original_filename):
-    logger.info(f"Colab task {task_id}: input={input_path}")
+# ============================================================
+# Colab upload job (Google Drive -> Drive av1 output)
+# ============================================================
+def process_colab(task_id, input_path, original_filename, account='default'):
+    logger.info(f"Colab task {task_id}: input={input_path} account={account}")
     try:
         task = load_task(task_id)
         task['status'] = 'uploading'
         task['upload_progress'] = 0
         save_task(task_id, task)
 
-        service = get_drive_service()
+        service = get_drive_service(account)
         file_metadata = {'name': original_filename, 'parents': [DRIVE_FOLDER_ID]}
         media = MediaFileUpload(input_path, resumable=True, chunksize=10 * 1024 * 1024)
         request = service.files().create(body=file_metadata, media_body=media, fields='id')
@@ -197,14 +236,16 @@ def process_colab(task_id, input_path, original_filename):
         timeout = 7200
 
         while time.time() - start_time < timeout:
-            query = f"'{DRIVE_FOLDER_ID}' in parents and name = '{output_name}' and trashed = false"
+            query = (f"'{DRIVE_FOLDER_ID}' in parents and name = '{output_name}' "
+                     f"and trashed = false")
             results = service.files().list(q=query, fields="files(id, name)").execute()
             files = results.get('files', [])
             if files:
                 file_id = files[0]['id']
                 request = service.files().get_media(fileId=file_id)
                 with open(local_output, 'wb') as f:
-                    downloader = MediaIoBaseDownload(f, request, chunksize=10 * 1024 * 1024)
+                    downloader = MediaIoBaseDownload(f, request,
+                                                     chunksize=10 * 1024 * 1024)
                     done = False
                     while not done:
                         status, done = downloader.next_chunk()
@@ -229,29 +270,50 @@ def process_colab(task_id, input_path, original_filename):
     except Exception as e:
         logger.error(f"Colab error for task {task_id}: {e}")
         task = load_task(task_id)
-        task['status'] = 'error'
-        task['error_msg'] = str(e)
-        save_task(task_id, task)
+        if task:
+            task['status'] = 'error'
+            task['error_msg'] = str(e)
+            save_task(task_id, task)
 
 
+# ============================================================
+# Routes
+# ============================================================
 def register_routes(app):
+
+    @app.route('/drive/accounts')
+    def drive_accounts():
+        """
+        List all available token_*.json accounts with email + quota.
+        Optional ?probe=1 to fetch email for each (slower).
+        """
+        accounts = discover_accounts()
+        probe = request.args.get('probe', '0') == '1'
+        out = []
+        for name in sorted(accounts.keys()):
+            entry = {'name': name, 'email': None, 'free_bytes': None}
+            if probe:
+                try:
+                    svc = get_drive_service(name)
+                    entry['email'] = _email_cache.get(name)
+                    limit, usage = _quota_cache.get(name, (0, 0))
+                    if limit > 0:
+                        entry['free_bytes'] = max(0, limit - usage)
+                except Exception as e:
+                    entry['error'] = str(e)
+            out.append(entry)
+        return jsonify({'accounts': out, 'default': out[0]['name'] if out else None})
 
     @app.route('/drive/list')
     def drive_list():
-        """
-        List files + folders in a Drive folder.
-        Query param: ?folder_id=xxx (defaults to root DRIVE_FOLDER_ID)
-        """
+        account = _request_account()
         folder_id = request.args.get('folder_id', DRIVE_FOLDER_ID)
 
-        # Validate: must be a folder ID (basic check)
         if not folder_id or len(folder_id) < 10:
             return jsonify({'error': 'Invalid folder_id'}), 400
 
         try:
-            service = get_drive_service()
-
-            # Get the current folder's metadata (to validate it exists)
+            service = get_drive_service(account)
             try:
                 meta = service.files().get(
                     fileId=folder_id,
@@ -265,13 +327,12 @@ def register_routes(app):
             if meta.get('mimeType') != 'application/vnd.google-apps.folder':
                 return jsonify({'error': 'Not a folder'}), 400
 
-            # List contents
             listing = _list_folder(service, folder_id)
-
-            # Build breadcrumbs
             breadcrumbs = _get_breadcrumbs(service, folder_id, DRIVE_FOLDER_ID)
 
             return jsonify({
+                'account': account,
+                'account_email': _email_cache.get(account, 'unknown'),
                 'current_folder_id': folder_id,
                 'current_folder_name': meta.get('name', 'Root'),
                 'parent_id': listing['parent_id'],
@@ -282,11 +343,12 @@ def register_routes(app):
             })
 
         except Exception as e:
-            logger.error(f"Drive list error: {e}")
+            logger.error(f"Drive list error [{account}]: {e}")
             return jsonify({'error': str(e)}), 500
 
     @app.route('/drive/download_to_server', methods=['POST'])
     def drive_download_to_server():
+        account = _request_account()
         file_id = request.form.get('file_id')
         file_name = request.form.get('file_name')
         if not file_id or not file_name:
@@ -295,7 +357,8 @@ def register_routes(app):
         task_id = str(uuid.uuid4())
         task_data = {
             'task_id': task_id, 'status': 'queued', 'download_progress': 0,
-            'created_at': time.time(), 'cancelled': False
+            'created_at': time.time(), 'cancelled': False,
+            'account': account,
         }
         save_task(task_id, task_data)
 
@@ -305,12 +368,14 @@ def register_routes(app):
             save_task(task_id, task)
             temp_path = None
             try:
-                service = get_drive_service()
+                service = get_drive_service(account)
                 request = service.files().get_media(fileId=file_id)
                 final_name = _get_unique_filename(file_name)
-                temp_path = os.path.join(UPLOAD_FOLDER, f"{task_id}_temp_{final_name}")
+                temp_path = os.path.join(UPLOAD_FOLDER,
+                                          f"{task_id}_temp_{final_name}")
                 with open(temp_path, 'wb') as f:
-                    downloader = MediaIoBaseDownload(f, request, chunksize=10 * 1024 * 1024)
+                    downloader = MediaIoBaseDownload(f, request,
+                                                     chunksize=10 * 1024 * 1024)
                     done = False
                     while not done:
                         status, done = downloader.next_chunk()
@@ -328,7 +393,7 @@ def register_routes(app):
                 task['output_file'] = final_name
                 save_task(task_id, task)
             except Exception as e:
-                logger.error(f"Drive download error: {e}")
+                logger.error(f"Drive download error [{account}]: {e}")
                 task = load_task(task_id)
                 task['status'] = 'error'
                 task['error_msg'] = str(e)
@@ -337,20 +402,22 @@ def register_routes(app):
                     os.remove(temp_path)
 
         threading.Thread(target=run, daemon=True).start()
-        return jsonify({'task_id': task_id})
+        return jsonify({'task_id': task_id, 'account': account})
 
     @app.route('/drive/delete/<file_id>', methods=['DELETE'])
     def drive_delete(file_id):
+        account = _request_account()
         try:
-            service = get_drive_service()
+            service = get_drive_service(account)
             service.files().delete(fileId=file_id).execute()
-            return jsonify({'success': True})
+            return jsonify({'success': True, 'account': account})
         except Exception as e:
-            logger.error(f"Drive delete error: {e}")
+            logger.error(f"Drive delete error [{account}]: {e}")
             return jsonify({'error': str(e)}), 500
 
     @app.route('/colab_process', methods=['POST'])
     def colab_process():
+        account = _request_account()
         try:
             file_path = request.form.get('file_path')
             filename = request.form.get('filename')
@@ -373,15 +440,16 @@ def register_routes(app):
             task_id = str(uuid.uuid4())
             task_data = {
                 'task_id': task_id, 'status': 'queued', 'upload_progress': 0,
-                'download_progress': 0, 'created_at': time.time(), 'cancelled': False
+                'download_progress': 0, 'created_at': time.time(),
+                'cancelled': False, 'account': account,
             }
             save_task(task_id, task_data)
             threading.Thread(
                 target=process_colab,
-                args=(task_id, full_path, original_filename),
+                args=(task_id, full_path, original_filename, account),
                 daemon=True
             ).start()
-            return jsonify({'task_id': task_id})
+            return jsonify({'task_id': task_id, 'account': account})
         except Exception as e:
             logger.exception("Colab process error")
             return jsonify({'error': str(e)}), 500
