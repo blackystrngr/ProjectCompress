@@ -1,24 +1,103 @@
 <div class="card">
-    <h2><i class="fas fa-cut"></i> Video Clipper, Summarizer, Frame Extractor, Trim, Compress & Face Swap</h2>
+    <h2><i class="fas fa-cut"></i> Video Clipper, Summarizer, Frame Extractor, Trim & Face Swap</h2>
 
-    <!-- ========== Random Clips ========== -->
+    <!-- ========== Random Clips + Compress (unified) ========== -->
     <div style="margin-bottom: 2rem; padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
-        <h3><i class="fas fa-random"></i> Random Clips</h3>
-        <p>Divides video into segments, picks a random clip from each, and merges them.</p>
+        <h3><i class="fas fa-film"></i> Random Clips</h3>
+        <p>Divides video into segments, picks a random clip from each, and merges them.
+           Tick <b>Compress</b> to re-encode the merged result with H.265 or AV1.</p>
+
         <div class="input-group" style="flex-wrap: wrap;">
-            <div style="flex:2; min-width:150px;"><div style="font-size:0.7rem; color:#aaa;">Video file</div>
-                <select id="randomVideoSelect" style="width:100%;"><option>Loading videos...</option></select>
+            <div style="flex:2; min-width:180px;">
+                <div style="font-size:0.7rem; color:#aaa;">Video file</div>
+                <select id="clipsVideoSelect" style="width:100%;">
+                    <option>Loading videos...</option>
+                </select>
             </div>
-            <div style="width:100px;"><div style="font-size:0.7rem; color:#aaa;">Segment (sec)</div>
-                <input type="number" id="segmentSec" placeholder="30" value="30" style="width:100%;">
+            <div style="width:110px;">
+                <div style="font-size:0.7rem; color:#aaa;">Segment (s)</div>
+                <input type="number" id="clipsSegment" value="10" min="1" style="width:100%;">
             </div>
-            <div style="width:100px;"><div style="font-size:0.7rem; color:#aaa;">Clip (sec)</div>
-                <input type="number" id="randomClipSec" placeholder="5" value="5" style="width:100%;">
+            <div style="width:110px;">
+                <div style="font-size:0.7rem; color:#aaa;">Clip (s)</div>
+                <input type="number" id="clipsLength" value="5" min="1" style="width:100%;">
             </div>
-            <div style="align-self:flex-end;"><button id="randomBtn" class="primary"><i class="fas fa-play"></i> Generate Random Clips</button></div>
+            <div style="width:110px;">
+                <div style="font-size:0.7rem; color:#aaa;">Tail (s)</div>
+                <input type="number" id="clipsTail" value="120" min="0" style="width:100%;"
+                       title="Keep the last N seconds uncut">
+            </div>
+            <div style="align-self:flex-end; display:flex; align-items:center; gap:0.5rem;">
+                <label style="display:flex; align-items:center; gap:0.4rem; font-size:0.85rem; cursor:pointer;">
+                    <input type="checkbox" id="clipsCompressToggle" style="accent-color:#5f8fe0;">
+                    Compress
+                </label>
+                <button id="clipsBtn" class="primary">
+                    <i class="fas fa-play"></i> Extract
+                </button>
+            </div>
         </div>
-        <div id="randomStatus" class="help-text"></div>
-        <div id="randomResult" class="empty-state">Select a video and click Generate.</div>
+
+        <!-- Compress options (hidden until ticked) -->
+        <div id="clipsCompressPanel" style="display:none; margin-top:0.8rem; padding:0.8rem;
+             background: rgba(20,28,45,0.6); border-radius:1rem; border:1px solid #2a3248;">
+            <div style="font-size:0.75rem; color:#7cc3ff; margin-bottom:0.5rem;">
+                <i class="fas fa-cog"></i> Compression settings
+            </div>
+            <div class="input-group" style="flex-wrap: wrap; gap:0.6rem;">
+                <div style="width:120px;">
+                    <div style="font-size:0.7rem; color:#aaa;">Codec</div>
+                    <select id="clipsCodec" style="width:100%;">
+                        <option value="x265" selected>H.265 (x265)</option>
+                        <option value="av1">AV1 (SVT)</option>
+                    </select>
+                </div>
+                <div style="width:100px;">
+                    <div style="font-size:0.7rem; color:#aaa;">Resolution</div>
+                    <select id="clipsResolution" style="width:100%;">
+                        <option value="360">360p</option>
+                        <option value="480">480p</option>
+                        <option value="720" selected>720p</option>
+                        <option value="1080">1080p</option>
+                    </select>
+                </div>
+                <div style="width:80px;">
+                    <div style="font-size:0.7rem; color:#aaa;">CRF</div>
+                    <input type="number" id="clipsCRF" value="27" min="10" max="45"
+                           style="width:100%;">
+                </div>
+                <div style="width:160px;">
+                    <div style="font-size:0.7rem; color:#aaa;">Preset</div>
+                    <select id="clipsPresetX265" style="width:100%;">
+                        <option value="ultrafast">ultrafast</option>
+                        <option value="superfast">superfast</option>
+                        <option value="veryfast" selected>veryfast</option>
+                        <option value="faster">faster</option>
+                        <option value="fast">fast</option>
+                        <option value="medium">medium</option>
+                    </select>
+                    <select id="clipsPresetAV1" style="width:100%; display:none;">
+                        <option value="8">8 (slow, best)</option>
+                        <option value="9">9</option>
+                        <option value="10">10</option>
+                        <option value="11">11</option>
+                        <option value="12" selected>12 (fast)</option>
+                        <option value="13">13 (fastest)</option>
+                    </select>
+                </div>
+            </div>
+            <div class="help-text" style="font-size:0.72rem; margin-top:0.4rem;">
+                <i class="fas fa-info-circle"></i>
+                x265 CRF: <b>24</b> high quality, <b>27</b> balanced, <b>30</b> small.
+                AV1 CRF: <b>28</b> high quality, <b>32</b> balanced, <b>35</b> small.
+                AV1 is ~30% smaller but 3–5× slower.
+            </div>
+        </div>
+
+        <div id="clipsStatus" class="help-text" style="margin-top:0.6rem;"></div>
+        <div id="clipsResult" class="empty-state">
+            Select a video and click Extract.
+        </div>
     </div>
 
     <!-- ========== AI Summarizer ========== -->
@@ -68,8 +147,7 @@
     <div style="margin-bottom: 2rem; padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
         <h3><i class="fas fa-scissors"></i> Crop / Trim by Timestamp</h3>
         <p>Cut an exact segment from the video by entering a start and end time.
-           Accepts <code>HH:MM:SS</code>, <code>MM:SS</code>, or plain seconds
-           (<code>90</code> = 1m 30s).</p>
+           Accepts <code>HH:MM:SS</code>, <code>MM:SS</code>, or plain seconds.</p>
 
         <div class="input-group" style="flex-wrap: wrap; gap: 0.6rem;">
             <div style="flex:2; min-width:220px;">
@@ -106,62 +184,6 @@
         <div id="trimStatus" class="help-text"></div>
         <div id="trimResult" class="empty-state">
             Select a video, enter start and end times, then click Trim.
-        </div>
-    </div>
-
-    <!-- ========== x265 CPU Compress (NEW) ========== -->
-    <div style="margin-bottom: 2rem; padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
-        <h3><i class="fas fa-compress-arrows-alt"></i> Compress to H.265 (x265)</h3>
-        <p>Re-encode the full video with libx265 at a target resolution.
-           No clipping, no trimming — just smaller H.265 output.</p>
-
-        <div class="input-group" style="flex-wrap: wrap; gap: 0.6rem;">
-            <div style="flex:2; min-width:200px;">
-                <div style="font-size:0.7rem; color:#aaa;">Source video</div>
-                <select id="x265VideoSelect" style="width:100%;">
-                    <option>Loading videos...</option>
-                </select>
-            </div>
-            <div style="width:110px;">
-                <div style="font-size:0.7rem; color:#aaa;">Resolution</div>
-                <select id="x265Resolution" style="width:100%;">
-                    <option value="360">360p</option>
-                    <option value="480">480p</option>
-                    <option value="720" selected>720p</option>
-                    <option value="1080">1080p</option>
-                </select>
-            </div>
-            <div style="width:90px;">
-                <div style="font-size:0.7rem; color:#aaa;">CRF</div>
-                <input type="number" id="x265CRF" value="27" min="10" max="45"
-                       style="width:100%;" title="Lower = better quality / larger file">
-            </div>
-            <div style="width:140px;">
-                <div style="font-size:0.7rem; color:#aaa;">Preset</div>
-                <select id="x265Preset" style="width:100%;">
-                    <option value="ultrafast">ultrafast (fastest)</option>
-                    <option value="superfast">superfast</option>
-                    <option value="veryfast" selected>veryfast (balanced)</option>
-                    <option value="faster">faster</option>
-                    <option value="fast">fast</option>
-                    <option value="medium">medium (slow)</option>
-                </select>
-            </div>
-            <div style="align-self:flex-end;">
-                <button id="x265Btn" class="primary">
-                    <i class="fas fa-play"></i> Compress
-                </button>
-            </div>
-        </div>
-
-        <div class="help-text" style="font-size:0.72rem; margin-top:0.3rem;">
-            <i class="fas fa-info-circle"></i>
-            CRF guide: <b>22–24</b> high quality, <b>25–27</b> balanced, <b>28–30</b> small file.
-            Presets move left = faster but larger files.
-        </div>
-        <div id="x265Status" class="help-text"></div>
-        <div id="x265Result" class="empty-state">
-            Select a video and click Compress.
         </div>
     </div>
 
@@ -204,9 +226,9 @@ async function loadAllVideos() {
     try {
         const resp = await fetch('/clipper/list_videos');
         const videos = await resp.json();
-        const selects = ['randomVideoSelect', 'summaryVideoSelect',
+        const selects = ['clipsVideoSelect', 'summaryVideoSelect',
                          'faceSwapVideoSelect', 'frameVideoSelect',
-                         'trimVideoSelect', 'x265VideoSelect'];
+                         'trimVideoSelect'];
         selects.forEach(id => {
             const sel = document.getElementById(id);
             if (!sel) return;
@@ -229,49 +251,154 @@ async function loadAllVideos() {
 }
 loadAllVideos();
 
-// ========== Random Clips ==========
-let randomTaskId = null, randomTimer = null;
-document.getElementById('randomBtn').onclick = async () => {
-    const video = document.getElementById('randomVideoSelect').value;
-    if (!video) { alert('Select a video'); return; }
-    const seg = parseInt(document.getElementById('segmentSec').value);
-    const clip = parseInt(document.getElementById('randomClipSec').value);
-    if (isNaN(seg) || seg < 1) { alert('Segment duration invalid'); return; }
-    if (isNaN(clip) || clip < 1) { alert('Clip duration invalid'); return; }
-    if (clip > seg) { alert('Clip cannot be longer than segment'); return; }
-    const body = `video_file=${encodeURIComponent(video)}&segment_duration=${seg}&clip_duration=${clip}`;
-    const resp = await fetch('/clipper/random', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body });
-    const data = await resp.json();
-    if (data.error) { alert(data.error); return; }
-    randomTaskId = data.task_id;
-    if (typeof storeTaskId === 'function') {
-        storeTaskId('random_clips', randomTaskId);
-    } else {
-        localStorage.setItem('random_clips_task_id', randomTaskId);
+// ========== Unified Clips + Compress ==========
+(function() {
+    const videoSelect = document.getElementById('clipsVideoSelect');
+    const segInput = document.getElementById('clipsSegment');
+    const lenInput = document.getElementById('clipsLength');
+    const tailInput = document.getElementById('clipsTail');
+    const compressToggle = document.getElementById('clipsCompressToggle');
+    const compressPanel = document.getElementById('clipsCompressPanel');
+    const codecSel = document.getElementById('clipsCodec');
+    const resSel = document.getElementById('clipsResolution');
+    const crfInput = document.getElementById('clipsCRF');
+    const presetX265 = document.getElementById('clipsPresetX265');
+    const presetAV1 = document.getElementById('clipsPresetAV1');
+    const btn = document.getElementById('clipsBtn');
+    const statusEl = document.getElementById('clipsStatus');
+    const resultEl = document.getElementById('clipsResult');
+
+    let taskId = null;
+    let timer = null;
+
+    function toggleCompressPanel() {
+        compressPanel.style.display = compressToggle.checked ? 'block' : 'none';
+        btn.innerHTML = compressToggle.checked
+            ? '<i class="fas fa-play"></i> Extract &amp; Compress'
+            : '<i class="fas fa-play"></i> Extract';
     }
-    const st = document.getElementById('randomStatus'), res = document.getElementById('randomResult');
-    st.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Processing...';
-    res.innerHTML = '<div class="empty-state">Please wait...</div>';
-    if (randomTimer) clearInterval(randomTimer);
-    randomTimer = setInterval(async () => {
-        const prog = await fetch(`/progress/${randomTaskId}`);
-        const t = await prog.json();
-        if (t.status === 'done') {
-            clearInterval(randomTimer);
-            st.innerHTML = `✅ Done! <a href="/download/${t.output_file}" target="_blank">Download</a>`;
-            res.innerHTML = `<div class="empty-state">✅ Ready: <a href="/download/${t.output_file}">${t.output_file}</a></div>`;
-            localStorage.removeItem('random_clips_task_id');
-        } else if (t.status === 'error') {
-            clearInterval(randomTimer);
-            st.innerHTML = `❌ Error: ${t.error_msg}`;
-            res.innerHTML = '<div class="empty-state">Failed.</div>';
-            localStorage.removeItem('random_clips_task_id');
+    compressToggle.addEventListener('change', toggleCompressPanel);
+    toggleCompressPanel();
+
+    function toggleCodecFields() {
+        const isAV1 = codecSel.value === 'av1';
+        presetX265.style.display = isAV1 ? 'none' : 'block';
+        presetAV1.style.display = isAV1 ? 'block' : 'none';
+        // Set sensible CRF default when switching codec
+        const current = parseInt(crfInput.value) || 0;
+        if (isAV1 && current <= 30) crfInput.value = 32;
+        else if (!isAV1 && current > 30) crfInput.value = 27;
+    }
+    codecSel.addEventListener('change', toggleCodecFields);
+    toggleCodecFields();
+
+    btn.onclick = async () => {
+        const video = videoSelect.value;
+        if (!video) { showToast('Select a video', true); return; }
+
+        const seg = parseInt(segInput.value);
+        const len = parseInt(lenInput.value);
+        const tail = parseInt(tailInput.value) || 0;
+
+        if (isNaN(seg) || seg < 1) { showToast('Invalid segment duration', true); return; }
+        if (isNaN(len) || len < 1) { showToast('Invalid clip duration', true); return; }
+        if (len > seg) { showToast('Clip cannot exceed segment', true); return; }
+
+        const body = new URLSearchParams();
+        body.append('video_file', video);
+        body.append('segment_duration', seg);
+        body.append('clip_duration', len);
+        body.append('tail_seconds', tail);
+
+        if (compressToggle.checked) {
+            body.append('compress', 'true');
+            body.append('codec', codecSel.value);
+            body.append('resolution', resSel.value);
+            body.append('crf', crfInput.value);
+            if (codecSel.value === 'av1') {
+                body.append('preset', presetAV1.value);
+            } else {
+                body.append('preset', presetX265.value);
+            }
         } else {
-            st.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${t.status} (${t.progress||0}%)`;
-            res.innerHTML = `<div class="empty-state">Processing (${t.progress||0}%)...</div>`;
+            body.append('compress', 'false');
         }
-    }, 2000);
-};
+
+        try {
+            const resp = await fetch('/clipper/clips', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: body
+            });
+            const data = await resp.json();
+            if (data.error) throw new Error(data.error);
+
+            taskId = data.task_id;
+            const label = data.compress
+                ? `Extracting + compressing (${data.codec}, ${data.resolution}p)...`
+                : 'Extracting clips...';
+            statusEl.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> ' + label;
+            resultEl.innerHTML = '<div class="empty-state">Processing...</div>';
+
+            if (timer) clearInterval(timer);
+            timer = setInterval(pollTask, 2000);
+        } catch (err) {
+            showToast(err.message, true);
+        }
+    };
+
+    async function pollTask() {
+        if (!taskId) return;
+        try {
+            const r = await fetch(`/progress/${taskId}`);
+            const t = await r.json();
+
+            if (t.status === 'done') {
+                clearInterval(timer);
+                const fname = t.output_file;
+                const sizeMB = t.output_size ? (t.output_size/1024/1024).toFixed(2) : '?';
+                const dur = t.output_duration ? t.output_duration.toFixed(1) : '?';
+                const savings = t.savings_pct != null ? ` (${t.savings_pct}% smaller)` : '';
+                statusEl.innerHTML = `✅ Done! ${sizeMB} MB${savings}, ${dur}s`;
+                resultEl.innerHTML =
+                    `<div class="empty-state">✅ `
+                    + `<a href="/download_file?path=${encodeURIComponent(fname)}" target="_blank">`
+                    + `${escapeHtml(fname)}</a> `
+                    + `&nbsp;<button class="clips-preview-btn primary" `
+                    + `style="padding:0.2rem 0.7rem; font-size:0.7rem;" `
+                    + `data-path="${escapeHtml(fname)}" `
+                    + `data-name="${escapeHtml(fname)}">`
+                    + `<i class="fas fa-play"></i> Preview</button>`
+                    + `</div>`;
+                const pb = resultEl.querySelector('.clips-preview-btn');
+                if (pb && typeof window.openPreview === 'function') {
+                    pb.onclick = () => window.openPreview(
+                        pb.dataset.path, pb.dataset.name);
+                }
+            } else if (t.status === 'error') {
+                clearInterval(timer);
+                statusEl.innerHTML = `<span style="color:#ff8a8a;">❌ `
+                    + `${escapeHtml(t.error_msg || 'error')}</span>`;
+                resultEl.innerHTML = '<div class="empty-state">Failed.</div>';
+            } else if (t.status === 'cancelled') {
+                clearInterval(timer);
+                statusEl.innerHTML = '⛔ Cancelled';
+                resultEl.innerHTML = '<div class="empty-state">Cancelled.</div>';
+            } else {
+                const p = t.progress || 0;
+                const stage = t.status || 'processing';
+                let label = stage;
+                if (stage === 'extracting') label = 'Extracting clips';
+                else if (stage === 'compressing') label = `Compressing (${t.codec || ''})`;
+                else if (stage === 'merging') label = 'Merging clips';
+                statusEl.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> `
+                    + `${escapeHtml(label)} (${p}%)`;
+                resultEl.innerHTML = `<div class="empty-state">`
+                    + `${escapeHtml(label)} ${p}%</div>`;
+            }
+        } catch (e) { console.error(e); }
+    }
+})();
 
 // ========== AI Summarizer ==========
 let summaryTaskId = null, summaryTimer = null;
@@ -481,104 +608,6 @@ document.getElementById('extractFramesBtn').onclick = async () => {
                     + `${escapeHtml(t.status)} (${p}%)`;
                 trimResult.innerHTML = `<div class="empty-state">`
                     + `Trimming ${p}%...</div>`;
-            }
-        } catch (e) { console.error(e); }
-    }
-})();
-
-// ========== x265 CPU Compress ==========
-(function() {
-    const x265Select = document.getElementById('x265VideoSelect');
-    const x265Res    = document.getElementById('x265Resolution');
-    const x265CRF    = document.getElementById('x265CRF');
-    const x265Preset = document.getElementById('x265Preset');
-    const x265Btn    = document.getElementById('x265Btn');
-    const x265Status = document.getElementById('x265Status');
-    const x265Result = document.getElementById('x265Result');
-
-    let x265TaskId = null;
-    let x265Timer = null;
-
-    x265Btn.onclick = async () => {
-        const video = x265Select.value;
-        if (!video) { showToast('Select a video', true); return; }
-
-        const resolution = parseInt(x265Res.value, 10);
-        const crf = parseInt(x265CRF.value, 10);
-        const preset = x265Preset.value;
-
-        if (isNaN(crf) || crf < 10 || crf > 45) {
-            showToast('CRF must be between 10 and 45', true); return;
-        }
-
-        const body = new URLSearchParams();
-        body.append('video_file', video);
-        body.append('resolution', resolution);
-        body.append('crf', crf);
-        body.append('preset', preset);
-
-        try {
-            const resp = await fetch('/clipper/x265_compress', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                body: body
-            });
-            const data = await resp.json();
-            if (data.error) throw new Error(data.error);
-
-            x265TaskId = data.task_id;
-            x265Status.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> '
-                + `Compressing to ${resolution}p H.265 (CRF ${crf}, ${preset})...`;
-            x265Result.innerHTML = '<div class="empty-state">Processing...</div>';
-
-            if (x265Timer) clearInterval(x265Timer);
-            x265Timer = setInterval(pollX265, 2000);
-        } catch (err) { showToast(err.message, true); }
-    };
-
-    async function pollX265() {
-        if (!x265TaskId) return;
-        try {
-            const r = await fetch(`/progress/${x265TaskId}`);
-            const t = await r.json();
-
-            if (t.status === 'done') {
-                clearInterval(x265Timer);
-                const fname = t.output_file;
-                const sizeMB = t.output_size ? (t.output_size/1024/1024).toFixed(2) : '?';
-                const dur = t.output_duration ? t.output_duration.toFixed(1) : '?';
-                const savings = t.savings_pct != null ? `${t.savings_pct}%` : '?';
-                x265Status.innerHTML = `✅ Done! ${sizeMB} MB (${savings} smaller), ${dur}s`;
-                x265Result.innerHTML =
-                    `<div class="empty-state">✅ `
-                    + `<a href="/download_file?path=${encodeURIComponent(fname)}" target="_blank">`
-                    + `${escapeHtml(fname)}</a> `
-                    + `&nbsp;<button class="x265-preview-btn primary" `
-                    + `style="padding:0.2rem 0.7rem; font-size:0.7rem;" `
-                    + `data-path="${escapeHtml(fname)}" `
-                    + `data-name="${escapeHtml(fname)}">`
-                    + `<i class="fas fa-play"></i> Preview</button>`
-                    + `</div>`;
-                const btn = x265Result.querySelector('.x265-preview-btn');
-                if (btn && typeof window.openPreview === 'function') {
-                    btn.onclick = () => window.openPreview(
-                        btn.dataset.path, btn.dataset.name);
-                }
-            } else if (t.status === 'error') {
-                clearInterval(x265Timer);
-                x265Status.innerHTML = `<span style="color:#ff8a8a;">❌ `
-                    + `${escapeHtml(t.error_msg || 'error')}</span>`;
-                x265Result.innerHTML = '<div class="empty-state">Compress failed.</div>';
-            } else if (t.status === 'cancelled') {
-                clearInterval(x265Timer);
-                x265Status.innerHTML = '⛔ Cancelled';
-                x265Result.innerHTML = '<div class="empty-state">Cancelled.</div>';
-            } else {
-                const p = t.progress || 0;
-                x265Status.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> `
-                    + `Compressing (${p}%)`;
-                x265Result.innerHTML = `<div class="empty-state">`
-                    + `Encoding H.265... ${p}%</div>`;
             }
         } catch (e) { console.error(e); }
     }
