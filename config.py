@@ -35,3 +35,18 @@ TELEGRAM_PROXY = None   # Disable proxy for Telegram
 SECRET_KEY = os.environ.get('SECRET_KEY', 'your-secret-key-here')
 MAX_CONTENT_LENGTH = 2 * 1024 * 1024 * 1024  # 2 GB
 
+# Multi-account Drive tokens — each file is token_<name>.json in the project root.
+# Legacy token.json is treated as account name "default".
+import glob as _glob
+def discover_drive_accounts():
+    """Return {account_name: token_path}."""
+    out = {}
+    base = os.path.dirname(os.path.abspath(__file__))
+    for path in sorted(_glob.glob(os.path.join(base, 'token*.json'))):
+        name = os.path.splitext(os.path.basename(path))[0]
+        if name == 'token':
+            out['default'] = path
+        elif name.startswith('token_'):
+            out[name[len('token_'):]] = path
+    return out
+
