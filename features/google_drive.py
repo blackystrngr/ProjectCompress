@@ -5,15 +5,24 @@ import threading
 import time
 import logging
 from flask import request, jsonify
+from werkzeug.utils import secure_filename
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from googleapiclient.errors import HttpError
 from tasks import save_task, load_task
-from config import UPLOAD_FOLDER, DRIVE_FOLDER_ID, BASE_DIR
+from config import UPLOAD_FOLDER
 
 logger = logging.getLogger(__name__)
+
+# Google Drive uses the literal string "root" as an alias for the
+# authenticated user's My Drive top-level folder.
+MY_DRIVE_ROOT = 'root'
+
+# Folder used by Colab Processing (created on demand when uploading
+# Colab artifacts). For general browsing we show the whole drive.
+COLAB_FOLDER_NAME = "Colab_Processing"
 
 
 # ============================================================
@@ -21,11 +30,9 @@ logger = logging.getLogger(__name__)
 # ============================================================
 def discover_accounts():
     """
-    Return dict {account_name: token_path} by scanning token*.json
-    in the project root.
-      - token.json       → account name "default"
-      - token_alice.json → account name "alice"
-      - token_bob.json   → account name "bob"
+    Scan token*.json in project root.
+      token.json       → 'default'
+      token_alice.json → 'alice'
     """
     out = {}
     base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -38,9 +45,10 @@ def discover_accounts():
     return out
 
 
-_service_cache = {}          # account_name -> service object
+_service_cache = {}          # account_name -> service
 _email_cache = {}            # account_name -> email
 _quota_cache = {}            # account_name -> (limit, usage)
+_colab_folder_cache = {}     # account_name -> folder_id of Colab_Processing
 _cache_lock = threading.Lock()
 
 
@@ -62,10 +70,7 @@ def _load_credentials(token_path):
 
 
 def get_drive_service(account='default'):
-    """
-    Return a Drive service for the given account name.
-    Cached per account. Raises if account not found.
-    """
+    """Return cached Drive service for the account."""
     with _cache_lock:
         if account in _service_cache:
             return _service_cache[account]
@@ -82,7 +87,6 @@ def get_drive_service(account='default'):
     creds = _load_credentials(token_path)
     service = build('drive', 'v3', credentials=creds, cache_discovery=False)
 
-    # Fetch email once for display
     try:
         about = service.about().get(fields='user,storageQuota').execute()
         email = about.get('user', {}).get('emailAddress', 'unknown')
@@ -102,8 +106,19 @@ def get_drive_service(account='default'):
     return service
 
 
+def get_account_email(account='default'):
+    with _cache_lock:
+        if account in _email_cache:
+            return _email_cache[account]
+    try:
+        get_drive_service(account)
+    except Exception:
+        return 'unknown'
+    with _cache_lock:
+        return _email_cache.get(account, 'unknown')
+
+
 def _request_account():
-    """Read account name from query string or form. Defaults to 'default'."""
     acct = request.args.get('account') or request.form.get('account')
     return acct if acct else 'default'
 
@@ -119,12 +134,18 @@ def _format_size(size_bytes):
     return f"{size / (1024**3):.2f} GB"
 
 
-def _get_breadcrumbs(service, folder_id, root_id):
-    if folder_id == root_id:
-        return [{'id': root_id, 'name': 'My Drive / Root'}]
+def _get_breadcrumbs(service, folder_id):
+    """
+    Build a breadcrumb list from My Drive root down to folder_id.
+    Always starts with 'My Drive' (Google's root alias).
+    """
+    if folder_id == MY_DRIVE_ROOT:
+        return [{'id': MY_DRIVE_ROOT, 'name': 'My Drive'}]
+
     crumbs = []
     current = folder_id
     visited = set()
+
     while current and current not in visited and len(crumbs) < 50:
         visited.add(current)
         try:
@@ -135,11 +156,14 @@ def _get_breadcrumbs(service, folder_id, root_id):
         crumbs.insert(0, {'id': meta['id'], 'name': meta.get('name', 'Unknown')})
         parents = meta.get('parents', [])
         current = parents[0] if parents else None
-    crumbs.insert(0, {'id': root_id, 'name': 'Root'})
+
+    # Prepend My Drive
+    crumbs.insert(0, {'id': MY_DRIVE_ROOT, 'name': 'My Drive'})
     return crumbs
 
 
 def _list_folder(service, folder_id):
+    """List files + folders under folder_id. Works with 'root'."""
     query = f"'{folder_id}' in parents and trashed = false"
     fields = ("files(id, name, size, modifiedTime, mimeType, "
               "parents, iconLink, webViewLink)")
@@ -172,12 +196,14 @@ def _list_folder(service, folder_id):
                 'is_folder': False,
             })
 
+    # Parent folder — if we're at root, none
     parent_id = None
-    if folder_id != DRIVE_FOLDER_ID:
+    if folder_id != MY_DRIVE_ROOT:
         try:
-            meta = service.files().get(fileId=folder_id, fields='parents').execute()
+            meta = service.files().get(fileId=folder_id,
+                                        fields='parents').execute()
             parents = meta.get('parents', [])
-            parent_id = parents[0] if parents else None
+            parent_id = parents[0] if parents else MY_DRIVE_ROOT
         except HttpError:
             pass
 
@@ -198,8 +224,46 @@ def _get_unique_filename(filename):
     return new_name
 
 
+def _find_or_create_folder(service, name, parent_id=None):
+    """Locate a folder by name; create if missing. Used for Colab artifacts."""
+    try:
+        q = (f"name = '{name}' and "
+             f"mimeType = 'application/vnd.google-apps.folder' and "
+             f"trashed = false")
+        if parent_id:
+            q += f" and '{parent_id}' in parents"
+        res = service.files().list(q=q, fields="files(id,name)",
+                                    pageSize=10).execute()
+        if res.get('files'):
+            return res['files'][0]['id']
+        body = {'name': name, 'mimeType': 'application/vnd.google-apps.folder'}
+        if parent_id:
+            body['parents'] = [parent_id]
+        folder = service.files().create(body=body, fields='id').execute()
+        return folder['id']
+    except Exception as e:
+        logger.error(f"Folder resolve failed for '{name}': {e}")
+        return None
+
+
+def get_colab_folder_id(account='default'):
+    """Return the account's Colab_Processing folder ID (create if missing)."""
+    with _cache_lock:
+        if account in _colab_folder_cache:
+            return _colab_folder_cache[account]
+    try:
+        svc = get_drive_service(account)
+        fid = _find_or_create_folder(svc, COLAB_FOLDER_NAME)
+        with _cache_lock:
+            _colab_folder_cache[account] = fid
+        return fid
+    except Exception as e:
+        logger.error(f"Could not resolve Colab folder for {account}: {e}")
+        return None
+
+
 # ============================================================
-# Colab upload job (Google Drive -> Drive av1 output)
+# Colab upload job (uses the account's own Colab_Processing)
 # ============================================================
 def process_colab(task_id, input_path, original_filename, account='default'):
     logger.info(f"Colab task {task_id}: input={input_path} account={account}")
@@ -210,7 +274,11 @@ def process_colab(task_id, input_path, original_filename, account='default'):
         save_task(task_id, task)
 
         service = get_drive_service(account)
-        file_metadata = {'name': original_filename, 'parents': [DRIVE_FOLDER_ID]}
+        colab_folder = get_colab_folder_id(account)
+        if not colab_folder:
+            raise Exception(f"Cannot resolve Colab folder for {account}")
+
+        file_metadata = {'name': original_filename, 'parents': [colab_folder]}
         media = MediaFileUpload(input_path, resumable=True, chunksize=10 * 1024 * 1024)
         request = service.files().create(body=file_metadata, media_body=media, fields='id')
         response = None
@@ -236,7 +304,7 @@ def process_colab(task_id, input_path, original_filename, account='default'):
         timeout = 7200
 
         while time.time() - start_time < timeout:
-            query = (f"'{DRIVE_FOLDER_ID}' in parents and name = '{output_name}' "
+            query = (f"'{colab_folder}' in parents and name = '{output_name}' "
                      f"and trashed = false")
             results = service.files().list(q=query, fields="files(id, name)").execute()
             files = results.get('files', [])
@@ -283,10 +351,6 @@ def register_routes(app):
 
     @app.route('/drive/accounts')
     def drive_accounts():
-        """
-        List all available token_*.json accounts with email + quota.
-        Optional ?probe=1 to fetch email for each (slower).
-        """
         accounts = discover_accounts()
         probe = request.args.get('probe', '0') == '1'
         out = []
@@ -294,7 +358,7 @@ def register_routes(app):
             entry = {'name': name, 'email': None, 'free_bytes': None}
             if probe:
                 try:
-                    svc = get_drive_service(name)
+                    get_drive_service(name)
                     entry['email'] = _email_cache.get(name)
                     limit, usage = _quota_cache.get(name, (0, 0))
                     if limit > 0:
@@ -302,44 +366,54 @@ def register_routes(app):
                 except Exception as e:
                     entry['error'] = str(e)
             out.append(entry)
-        return jsonify({'accounts': out, 'default': out[0]['name'] if out else None})
+        return jsonify({'accounts': out,
+                        'default': out[0]['name'] if out else None})
 
     @app.route('/drive/list')
     def drive_list():
+        """
+        List contents of a folder in the given account's Drive.
+        ?folder_id=... defaults to 'root' (My Drive top level).
+        """
         account = _request_account()
-        folder_id = request.args.get('folder_id', DRIVE_FOLDER_ID)
+        folder_id = request.args.get('folder_id') or MY_DRIVE_ROOT
 
-        if not folder_id or len(folder_id) < 10:
+        if not folder_id:
             return jsonify({'error': 'Invalid folder_id'}), 400
 
         try:
             service = get_drive_service(account)
-            try:
-                meta = service.files().get(
-                    fileId=folder_id,
-                    fields='id,name,mimeType,parents'
-                ).execute()
-            except HttpError as e:
-                if e.resp.status == 404:
-                    return jsonify({'error': 'Folder not found'}), 404
-                raise
 
-            if meta.get('mimeType') != 'application/vnd.google-apps.folder':
-                return jsonify({'error': 'Not a folder'}), 400
+            # If not root, validate it's a folder
+            if folder_id != MY_DRIVE_ROOT:
+                try:
+                    meta = service.files().get(
+                        fileId=folder_id,
+                        fields='id,name,mimeType'
+                    ).execute()
+                except HttpError as e:
+                    if e.resp.status == 404:
+                        return jsonify({'error': 'Folder not found'}), 404
+                    raise
+                if meta.get('mimeType') != 'application/vnd.google-apps.folder':
+                    return jsonify({'error': 'Not a folder'}), 400
+                folder_name = meta.get('name', 'Folder')
+            else:
+                folder_name = 'My Drive'
 
             listing = _list_folder(service, folder_id)
-            breadcrumbs = _get_breadcrumbs(service, folder_id, DRIVE_FOLDER_ID)
+            breadcrumbs = _get_breadcrumbs(service, folder_id)
 
             return jsonify({
                 'account': account,
-                'account_email': _email_cache.get(account, 'unknown'),
+                'account_email': get_account_email(account),
                 'current_folder_id': folder_id,
-                'current_folder_name': meta.get('name', 'Root'),
+                'current_folder_name': folder_name,
                 'parent_id': listing['parent_id'],
                 'breadcrumbs': breadcrumbs,
                 'folders': listing['folders'],
                 'files': listing['files'],
-                'is_root': folder_id == DRIVE_FOLDER_ID,
+                'is_root': folder_id == MY_DRIVE_ROOT,
             })
 
         except Exception as e:
@@ -414,6 +488,86 @@ def register_routes(app):
         except Exception as e:
             logger.error(f"Drive delete error [{account}]: {e}")
             return jsonify({'error': str(e)}), 500
+
+    @app.route('/drive/upload', methods=['POST'])
+    def drive_upload():
+        """
+        Upload a file from local downloads/ into the current Drive folder.
+        Form: file (multipart), account, folder_id (optional, defaults to root)
+        """
+        account = _request_account()
+        folder_id = request.form.get('folder_id') or MY_DRIVE_ROOT
+
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file'}), 400
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'Empty filename'}), 400
+
+        safe_name = secure_filename(file.filename)
+        if not safe_name:
+            return jsonify({'error': 'Invalid filename'}), 400
+
+        temp_path = os.path.join(UPLOAD_FOLDER, f"_upload_{uuid.uuid4().hex}_{safe_name}")
+        try:
+            file.save(temp_path)
+        except Exception as e:
+            return jsonify({'error': f'Save failed: {e}'}), 500
+
+        task_id = str(uuid.uuid4())
+        task_data = {
+            'task_id': task_id, 'status': 'queued', 'upload_progress': 0,
+            'created_at': time.time(), 'cancelled': False,
+            'account': account, 'target_folder': folder_id,
+        }
+        save_task(task_id, task_data)
+
+        def run():
+            task = load_task(task_id)
+            task['status'] = 'uploading'
+            save_task(task_id, task)
+            try:
+                service = get_drive_service(account)
+                file_metadata = {'name': safe_name}
+                if folder_id:
+                    file_metadata['parents'] = [folder_id]
+                media = MediaFileUpload(temp_path, resumable=True,
+                                        chunksize=10 * 1024 * 1024)
+                request = service.files().create(
+                    body=file_metadata, media_body=media,
+                    fields='id,name,size')
+                response = None
+                while response is None:
+                    status, response = request.next_chunk()
+                    if status:
+                        pct = int(status.progress() * 100)
+                        t = load_task(task_id)
+                        if t:
+                            t['upload_progress'] = pct
+                            save_task(task_id, t)
+
+                task = load_task(task_id)
+                task['status'] = 'done'
+                task['upload_progress'] = 100
+                task['drive_file_id'] = response.get('id')
+                task['drive_file_name'] = response.get('name')
+                save_task(task_id, task)
+            except Exception as e:
+                logger.exception("Drive upload failed")
+                task = load_task(task_id)
+                task['status'] = 'error'
+                task['error_msg'] = str(e)
+                save_task(task_id, task)
+            finally:
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except Exception:
+                    pass
+
+        threading.Thread(target=run, daemon=True).start()
+        return jsonify({'task_id': task_id, 'account': account,
+                        'folder_id': folder_id})
 
     @app.route('/colab_process', methods=['POST'])
     def colab_process():
