@@ -1,5 +1,5 @@
 <div class="card">
-    <h2><i class="fas fa-cut"></i> Video Clipper, Summarizer, Frame Extractor, Trim & Face Swap</h2>
+    <h2><i class="fas fa-cut"></i> Video Clipper, Summarizer, Frame Extractor, Trim, Compress & Face Swap</h2>
 
     <!-- ========== Random Clips ========== -->
     <div style="margin-bottom: 2rem; padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
@@ -64,7 +64,7 @@
         <div id="frameResult" class="empty-state">Select a video and click Extract Frames.</div>
     </div>
 
-    <!-- ========== Trim / Crop from Timestamp (NEW) ========== -->
+    <!-- ========== Trim / Crop by Timestamp ========== -->
     <div style="margin-bottom: 2rem; padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
         <h3><i class="fas fa-scissors"></i> Crop / Trim by Timestamp</h3>
         <p>Cut an exact segment from the video by entering a start and end time.
@@ -109,6 +109,62 @@
         </div>
     </div>
 
+    <!-- ========== x265 CPU Compress (NEW) ========== -->
+    <div style="margin-bottom: 2rem; padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
+        <h3><i class="fas fa-compress-arrows-alt"></i> Compress to H.265 (x265)</h3>
+        <p>Re-encode the full video with libx265 at a target resolution.
+           No clipping, no trimming — just smaller H.265 output.</p>
+
+        <div class="input-group" style="flex-wrap: wrap; gap: 0.6rem;">
+            <div style="flex:2; min-width:200px;">
+                <div style="font-size:0.7rem; color:#aaa;">Source video</div>
+                <select id="x265VideoSelect" style="width:100%;">
+                    <option>Loading videos...</option>
+                </select>
+            </div>
+            <div style="width:110px;">
+                <div style="font-size:0.7rem; color:#aaa;">Resolution</div>
+                <select id="x265Resolution" style="width:100%;">
+                    <option value="360">360p</option>
+                    <option value="480">480p</option>
+                    <option value="720" selected>720p</option>
+                    <option value="1080">1080p</option>
+                </select>
+            </div>
+            <div style="width:90px;">
+                <div style="font-size:0.7rem; color:#aaa;">CRF</div>
+                <input type="number" id="x265CRF" value="27" min="10" max="45"
+                       style="width:100%;" title="Lower = better quality / larger file">
+            </div>
+            <div style="width:140px;">
+                <div style="font-size:0.7rem; color:#aaa;">Preset</div>
+                <select id="x265Preset" style="width:100%;">
+                    <option value="ultrafast">ultrafast (fastest)</option>
+                    <option value="superfast">superfast</option>
+                    <option value="veryfast" selected>veryfast (balanced)</option>
+                    <option value="faster">faster</option>
+                    <option value="fast">fast</option>
+                    <option value="medium">medium (slow)</option>
+                </select>
+            </div>
+            <div style="align-self:flex-end;">
+                <button id="x265Btn" class="primary">
+                    <i class="fas fa-play"></i> Compress
+                </button>
+            </div>
+        </div>
+
+        <div class="help-text" style="font-size:0.72rem; margin-top:0.3rem;">
+            <i class="fas fa-info-circle"></i>
+            CRF guide: <b>22–24</b> high quality, <b>25–27</b> balanced, <b>28–30</b> small file.
+            Presets move left = faster but larger files.
+        </div>
+        <div id="x265Status" class="help-text"></div>
+        <div id="x265Result" class="empty-state">
+            Select a video and click Compress.
+        </div>
+    </div>
+
     <!-- ========== Face Swap ========== -->
     <div style="padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
         <h3><i class="fas fa-exchange-alt"></i> Face Swap – Photo to Video</h3>
@@ -128,7 +184,7 @@
 </div>
 
 <script>
-// ========== Helper Functions ==========
+// ========== Helpers ==========
 function escapeHtml(str) {
     if (!str) return '';
     return str.replace(/[&<>]/g, function(m) {
@@ -150,7 +206,7 @@ async function loadAllVideos() {
         const videos = await resp.json();
         const selects = ['randomVideoSelect', 'summaryVideoSelect',
                          'faceSwapVideoSelect', 'frameVideoSelect',
-                         'trimVideoSelect'];
+                         'trimVideoSelect', 'x265VideoSelect'];
         selects.forEach(id => {
             const sel = document.getElementById(id);
             if (!sel) return;
@@ -316,7 +372,6 @@ document.getElementById('extractFramesBtn').onclick = async () => {
     let trimTaskId = null;
     let trimTimer = null;
 
-    // Parse timestamps to seconds (mirrors backend)
     function parseTs(s) {
         if (!s) return null;
         s = String(s).trim();
@@ -332,7 +387,6 @@ document.getElementById('extractFramesBtn').onclick = async () => {
         return null;
     }
 
-    // Live duration preview
     function updateInfo() {
         const a = parseTs(trimStart.value);
         const b = parseTs(trimEnd.value);
@@ -377,17 +431,13 @@ document.getElementById('extractFramesBtn').onclick = async () => {
             });
             const data = await resp.json();
             if (data.error) throw new Error(data.error);
-
             trimTaskId = data.task_id;
             trimStatus.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> '
                 + `Trimming (${data.mode})...`;
             trimResult.innerHTML = '<div class="empty-state">Processing...</div>';
-
             if (trimTimer) clearInterval(trimTimer);
             trimTimer = setInterval(pollTrim, 1500);
-        } catch (err) {
-            showToast(err.message, true);
-        }
+        } catch (err) { showToast(err.message, true); }
     };
 
     async function pollTrim() {
@@ -436,6 +486,104 @@ document.getElementById('extractFramesBtn').onclick = async () => {
     }
 })();
 
+// ========== x265 CPU Compress ==========
+(function() {
+    const x265Select = document.getElementById('x265VideoSelect');
+    const x265Res    = document.getElementById('x265Resolution');
+    const x265CRF    = document.getElementById('x265CRF');
+    const x265Preset = document.getElementById('x265Preset');
+    const x265Btn    = document.getElementById('x265Btn');
+    const x265Status = document.getElementById('x265Status');
+    const x265Result = document.getElementById('x265Result');
+
+    let x265TaskId = null;
+    let x265Timer = null;
+
+    x265Btn.onclick = async () => {
+        const video = x265Select.value;
+        if (!video) { showToast('Select a video', true); return; }
+
+        const resolution = parseInt(x265Res.value, 10);
+        const crf = parseInt(x265CRF.value, 10);
+        const preset = x265Preset.value;
+
+        if (isNaN(crf) || crf < 10 || crf > 45) {
+            showToast('CRF must be between 10 and 45', true); return;
+        }
+
+        const body = new URLSearchParams();
+        body.append('video_file', video);
+        body.append('resolution', resolution);
+        body.append('crf', crf);
+        body.append('preset', preset);
+
+        try {
+            const resp = await fetch('/clipper/x265_compress', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: body
+            });
+            const data = await resp.json();
+            if (data.error) throw new Error(data.error);
+
+            x265TaskId = data.task_id;
+            x265Status.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> '
+                + `Compressing to ${resolution}p H.265 (CRF ${crf}, ${preset})...`;
+            x265Result.innerHTML = '<div class="empty-state">Processing...</div>';
+
+            if (x265Timer) clearInterval(x265Timer);
+            x265Timer = setInterval(pollX265, 2000);
+        } catch (err) { showToast(err.message, true); }
+    };
+
+    async function pollX265() {
+        if (!x265TaskId) return;
+        try {
+            const r = await fetch(`/progress/${x265TaskId}`);
+            const t = await r.json();
+
+            if (t.status === 'done') {
+                clearInterval(x265Timer);
+                const fname = t.output_file;
+                const sizeMB = t.output_size ? (t.output_size/1024/1024).toFixed(2) : '?';
+                const dur = t.output_duration ? t.output_duration.toFixed(1) : '?';
+                const savings = t.savings_pct != null ? `${t.savings_pct}%` : '?';
+                x265Status.innerHTML = `✅ Done! ${sizeMB} MB (${savings} smaller), ${dur}s`;
+                x265Result.innerHTML =
+                    `<div class="empty-state">✅ `
+                    + `<a href="/download_file?path=${encodeURIComponent(fname)}" target="_blank">`
+                    + `${escapeHtml(fname)}</a> `
+                    + `&nbsp;<button class="x265-preview-btn primary" `
+                    + `style="padding:0.2rem 0.7rem; font-size:0.7rem;" `
+                    + `data-path="${escapeHtml(fname)}" `
+                    + `data-name="${escapeHtml(fname)}">`
+                    + `<i class="fas fa-play"></i> Preview</button>`
+                    + `</div>`;
+                const btn = x265Result.querySelector('.x265-preview-btn');
+                if (btn && typeof window.openPreview === 'function') {
+                    btn.onclick = () => window.openPreview(
+                        btn.dataset.path, btn.dataset.name);
+                }
+            } else if (t.status === 'error') {
+                clearInterval(x265Timer);
+                x265Status.innerHTML = `<span style="color:#ff8a8a;">❌ `
+                    + `${escapeHtml(t.error_msg || 'error')}</span>`;
+                x265Result.innerHTML = '<div class="empty-state">Compress failed.</div>';
+            } else if (t.status === 'cancelled') {
+                clearInterval(x265Timer);
+                x265Status.innerHTML = '⛔ Cancelled';
+                x265Result.innerHTML = '<div class="empty-state">Cancelled.</div>';
+            } else {
+                const p = t.progress || 0;
+                x265Status.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> `
+                    + `Compressing (${p}%)`;
+                x265Result.innerHTML = `<div class="empty-state">`
+                    + `Encoding H.265... ${p}%</div>`;
+            }
+        } catch (e) { console.error(e); }
+    }
+})();
+
 // ========== Face Swap ==========
 let swapTaskId = null, swapTimer = null;
 const startSwapBtn = document.getElementById('startSwapBtn');
@@ -475,7 +623,7 @@ startSwapBtn.onclick = async () => {
         } else {
             localStorage.setItem('face_swap_task_id', swapTaskId);
         }
-        swapStatus.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Face swap started (may take several minutes)...';
+        swapStatus.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Face swap started...';
         swapResult.innerHTML = '<div class="empty-state">Processing...</div>';
         if (swapTimer) clearInterval(swapTimer);
         swapTimer = setInterval(async () => {
