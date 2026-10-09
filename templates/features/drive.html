@@ -1,3 +1,4 @@
+<!-- templates/features/drive.html -->
 <div class="card">
     <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem;">
         <h2><i class="fab fa-google-drive"></i> Google Drive</h2>
@@ -12,7 +13,12 @@
             <button id="driveUpBtn" title="Go to parent folder">
                 <i class="fas fa-level-up-alt"></i> Up
             </button>
-            <button id="driveUploadBtn" title="Upload file here">
+            <button id="driveColabBtn"
+                    title="Jump to Colab_Processing (created if missing)">
+                <i class="fas fa-folder-open"></i> Colab_Processing
+            </button>
+            <button id="driveUploadBtn"
+                    title="Uploads always go to Colab_Processing (created if missing)">
                 <i class="fas fa-upload"></i> Upload
             </button>
             <input type="file" id="driveUploadInput" style="display:none;">
@@ -62,6 +68,7 @@ let driveFiles = [];
 let selectedDriveIds = new Set();
 let driveCurrentAccount = null;
 let driveIsRoot = true;
+let driveColabFolderId = null;    // cached Colab_Processing id per account
 
 // ============================================================
 // Accounts
@@ -128,6 +135,9 @@ async function loadDriveFolder(folderId) {
         driveCurrentFolderId = data.current_folder_id;
         driveParentId = data.parent_id;
         driveIsRoot = data.is_root;
+        if (data.colab_folder_id) {
+            driveColabFolderId = data.colab_folder_id;
+        }
 
         if (data.account_email) {
             document.getElementById('driveAccountEmail').textContent
@@ -318,6 +328,7 @@ document.getElementById('driveAccountSelect').addEventListener('change', (e) => 
     driveCurrentFolderId = 'root';
     driveParentId = null;
     driveIsRoot = true;
+    driveColabFolderId = null;
     selectedDriveIds.clear();
     probeAccountEmail(driveCurrentAccount);
     loadDriveFolder('root');
@@ -329,6 +340,15 @@ document.getElementById('driveAccountSelect').addEventListener('change', (e) => 
 document.getElementById('driveUpBtn').onclick = () => {
     if (driveParentId) loadDriveFolder(driveParentId);
     else if (!driveIsRoot) loadDriveFolder('root');
+};
+
+document.getElementById('driveColabBtn').onclick = () => {
+    if (driveColabFolderId) {
+        loadDriveFolder(driveColabFolderId);
+    } else {
+        // Fallback: go to root and hope the folder shows up
+        loadDriveFolder('root');
+    }
 };
 
 document.getElementById('refreshDriveBtn').onclick = () => {
@@ -379,7 +399,7 @@ document.getElementById('deleteSelectedDriveBtn').onclick = async () => {
 };
 
 // ============================================================
-// Upload
+// Upload — always targets Colab_Processing
 // ============================================================
 const uploadInput = document.getElementById('driveUploadInput');
 document.getElementById('driveUploadBtn').onclick = () => uploadInput.click();
@@ -391,12 +411,12 @@ uploadInput.onchange = async () => {
     const formData = new FormData();
     formData.append('file', file);
     if (driveCurrentAccount) formData.append('account', driveCurrentAccount);
-    formData.append('folder_id', driveCurrentFolderId || 'root');
+    // NOTE: no folder_id sent — backend always targets Colab_Processing
 
     const statusEl = document.getElementById('driveUploadStatus');
     const textEl = document.getElementById('driveUploadText');
     statusEl.style.display = 'block';
-    textEl.textContent = `Uploading ${file.name}…`;
+    textEl.textContent = `Uploading ${file.name} to Colab_Processing…`;
 
     try {
         const resp = await fetch('/drive/upload', {method: 'POST', body: formData});
@@ -405,7 +425,6 @@ uploadInput.onchange = async () => {
 
         const taskId = data.task_id;
 
-        // Poll progress
         const interval = setInterval(async () => {
             try {
                 const r = await fetch(`/progress/${taskId}`);
@@ -413,7 +432,8 @@ uploadInput.onchange = async () => {
                 if (t.status === 'done') {
                     clearInterval(interval);
                     statusEl.style.display = 'none';
-                    showToast(`Uploaded: ${file.name}`);
+                    showToast(`Uploaded to Colab_Processing: ${file.name}`);
+                    // Refresh current view (in case we're inside Colab_Processing)
                     loadDriveFolder(driveCurrentFolderId);
                 } else if (t.status === 'error') {
                     clearInterval(interval);
@@ -421,7 +441,8 @@ uploadInput.onchange = async () => {
                     showToast(t.error_msg || 'Upload failed', true);
                 } else {
                     const pct = t.upload_progress || 0;
-                    textEl.textContent = `Uploading ${file.name}… ${pct}%`;
+                    textEl.textContent =
+                        `Uploading ${file.name} to Colab_Processing… ${pct}%`;
                 }
             } catch (e) { /* silent */ }
         }, 1000);
