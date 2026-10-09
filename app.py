@@ -8,6 +8,7 @@ import logging
 import psutil
 import threading
 import queue
+import re
 import shutil
 from flask import Flask, render_template, jsonify, request, Response, stream_with_context
 from waitress import serve
@@ -38,6 +39,7 @@ _net_sample_lock = threading.Lock()
 
 COOKIE_UPLOAD_TOKEN = os.environ.get('COOKIE_UPLOAD_TOKEN', 'whyyouleftme')
 COOKIES_SAVE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
+TOKEN_UPLOAD_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def create_app():
@@ -51,7 +53,7 @@ def create_app():
     @app.errorhandler(NotFound)
     def handle_not_found(e):
         if request.path.startswith(('/api', '/get_tasks', '/progress', '/system_stats',
-                                     '/upload_cookies')):
+                                     '/upload_cookies', '/upload_token')):
             return jsonify({'error': 'Endpoint not found'}), 404
         return render_template('index.html'), 404
 
@@ -188,36 +190,36 @@ def create_app():
         if not token or token != COOKIE_UPLOAD_TOKEN:
             logger.warning("Cookie upload: invalid or missing token")
             return jsonify({'error': 'Unauthorized'}), 401
-    
+
         content = request.get_data(as_text=True)
         if not content or len(content) < 50:
             return jsonify({'error': 'Empty or too-short cookie data'}), 400
-    
+
         # ---- (REMOVED the "youtube.com required" check) ----
-    
+
         try:
             if os.path.exists(COOKIES_SAVE_PATH):
                 shutil.copy(COOKIES_SAVE_PATH, COOKIES_SAVE_PATH + '.bak')
-    
+
             if not content.lstrip().startswith('# Netscape HTTP Cookie File'):
                 content = '# Netscape HTTP Cookie File\n# Uploaded by extension\n' + content
-    
+
             with open(COOKIES_SAVE_PATH, 'w', encoding='utf-8') as f:
                 f.write(content)
-    
+
             cookie_lines = [l for l in content.splitlines()
                             if l and not l.startswith('#') and '\t' in l]
-    
+
             # Count unique domains
             domains = set()
             for line in cookie_lines:
                 parts = line.split('\t')
                 if parts:
                     domains.add(parts[0])
-    
+
             logger.info(f"Cookies updated: {len(cookie_lines)} entries across "
                         f"{len(domains)} domains ({len(content)} bytes)")
-    
+
             return jsonify({
                 'status': 'ok',
                 'cookies': len(cookie_lines),
@@ -228,7 +230,82 @@ def create_app():
         except Exception as e:
             logger.exception("Failed to save cookies")
             return jsonify({'error': str(e)}), 500
-            
+
+    @app.route('/upload_token', methods=['POST'])
+    def upload_token():
+        token_header = request.headers.get('X-Upload-Token', '')
+        if not token_header or token_header != COOKIE_UPLOAD_TOKEN:
+            logger.warning("Token upload: invalid or missing token")
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        account = (request.headers.get('X-Account-Name') or 'default').strip()
+        if not re.match(r'^[a-zA-Z0-9_-]{1,40}$', account):
+            return jsonify({'error': 'Invalid account name '
+                                     '(letters, digits, _ and - only)'}), 400
+
+        content = request.get_data(as_text=True)
+        if not content or len(content) < 50:
+            return jsonify({'error': 'Empty or too-short token data'}), 400
+
+        try:
+            data = json.loads(content)
+        except Exception:
+            return jsonify({'error': 'Not valid JSON'}), 400
+
+        # Accept OAuth user tokens OR service account keys
+        required_oauth = {'client_id', 'client_secret', 'refresh_token'}
+        required_sa = {'type', 'private_key', 'client_email'}
+        keys = set(data.keys())
+        if not (required_oauth.issubset(keys) or required_sa.issubset(keys)):
+            return jsonify({'error':
+                'Not a valid OAuth user token or service account key'}), 400
+
+        filename = 'token.json' if account == 'default' else f'token_{account}.json'
+        save_path = os.path.join(TOKEN_UPLOAD_DIR, filename)
+
+        if os.path.exists(save_path):
+            try:
+                shutil.copy(save_path, save_path + '.bak')
+            except Exception as e:
+                logger.warning(f"Token backup failed: {e}")
+
+        try:
+            with open(save_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+        except Exception as e:
+            logger.exception("Failed to write token file")
+            return jsonify({'error': str(e)}), 500
+
+        # Invalidate cached Drive service so next request uses the new token
+        email = None
+        try:
+            from features.google_drive import (
+                _service_cache, _email_cache, _quota_cache, _cache_lock,
+                get_drive_service
+            )
+            with _cache_lock:
+                _service_cache.pop(account, None)
+                _email_cache.pop(account, None)
+                _quota_cache.pop(account, None)
+            # Verify + grab email
+            svc = get_drive_service(account)
+            about = svc.about().get(fields='user').execute()
+            email = about['user']['emailAddress']
+        except Exception as e:
+            logger.warning(f"Token saved but verify failed: {e}")
+
+        logger.info(f"Token uploaded: account={account} file={filename} "
+                    f"email={email} bytes={len(content)}")
+
+        return jsonify({
+            'status': 'ok',
+            'account': account,
+            'filename': filename,
+            'bytes': len(content),
+            'email': email,
+            'saved_at': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
+        })
+
     @app.route('/')
     def index():
         return render_template('index.html')
@@ -244,10 +321,10 @@ if __name__ == '__main__':
     # Cleanup old terminal task files (older than 1 day)
     try:
         cleanup_old_tasks(max_age_seconds=86400)
-    except Exception as e: 
+    except Exception as e:
         logger.warning(f"cleanup_old_tasks failed: {e}")
 
-        # ---- Kill any orphan playwright/chromium from previous runs ----
+    # ---- Kill any orphan playwright/chromium from previous runs ----
     try:
         from features.url_download import _cleanup_playwright_processes
         killed = _cleanup_playwright_processes(verbose=True)
@@ -256,7 +333,6 @@ if __name__ == '__main__':
     except Exception as e:
         logger.debug(f"Startup browser cleanup failed: {e}")
 
-    
     app = create_app()
     logger.info("Starting server on 0.0.0.0:5000")
     serve(
