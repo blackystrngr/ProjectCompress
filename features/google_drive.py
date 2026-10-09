@@ -1,3 +1,4 @@
+# features/google_drive.py
 import os
 import glob
 import uuid
@@ -20,9 +21,9 @@ logger = logging.getLogger(__name__)
 # authenticated user's My Drive top-level folder.
 MY_DRIVE_ROOT = 'root'
 
-# Folder used by Colab Processing (created on demand when uploading
-# Colab artifacts). For general browsing we show the whole drive.
+# Folder name where the pipeline reads/writes. Auto-created on demand.
 COLAB_FOLDER_NAME = "Colab_Processing"
+COLAB_OUTPUT_SUBFOLDER = "Processed"
 
 
 # ============================================================
@@ -31,8 +32,8 @@ COLAB_FOLDER_NAME = "Colab_Processing"
 def discover_accounts():
     """
     Scan token*.json in project root.
-      token.json       → 'default'
-      token_alice.json → 'alice'
+      token.json       -> 'default'
+      token_alice.json -> 'alice'
     """
     out = {}
     base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -136,8 +137,7 @@ def _format_size(size_bytes):
 
 def _get_breadcrumbs(service, folder_id):
     """
-    Build a breadcrumb list from My Drive root down to folder_id.
-    Always starts with 'My Drive' (Google's root alias).
+    Build breadcrumb from My Drive down to folder_id.
     """
     if folder_id == MY_DRIVE_ROOT:
         return [{'id': MY_DRIVE_ROOT, 'name': 'My Drive'}]
@@ -157,7 +157,6 @@ def _get_breadcrumbs(service, folder_id):
         parents = meta.get('parents', [])
         current = parents[0] if parents else None
 
-    # Prepend My Drive
     crumbs.insert(0, {'id': MY_DRIVE_ROOT, 'name': 'My Drive'})
     return crumbs
 
@@ -196,7 +195,6 @@ def _list_folder(service, folder_id):
                 'is_folder': False,
             })
 
-    # Parent folder — if we're at root, none
     parent_id = None
     if folder_id != MY_DRIVE_ROOT:
         try:
@@ -225,21 +223,36 @@ def _get_unique_filename(filename):
 
 
 def _find_or_create_folder(service, name, parent_id=None):
-    """Locate a folder by name; create if missing. Used for Colab artifacts."""
+    """
+    Locate a folder by name; create if missing.
+    Uses exact name match and optional parent filter.
+    """
     try:
-        q = (f"name = '{name}' and "
+        escaped = name.replace("'", "\\'")
+        q = (f"name = '{escaped}' and "
              f"mimeType = 'application/vnd.google-apps.folder' and "
              f"trashed = false")
         if parent_id:
             q += f" and '{parent_id}' in parents"
-        res = service.files().list(q=q, fields="files(id,name)",
-                                    pageSize=10).execute()
+
+        res = service.files().list(
+            q=q, fields="files(id,name)",
+            pageSize=10,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+
         if res.get('files'):
             return res['files'][0]['id']
+
         body = {'name': name, 'mimeType': 'application/vnd.google-apps.folder'}
         if parent_id:
             body['parents'] = [parent_id]
-        folder = service.files().create(body=body, fields='id').execute()
+        folder = service.files().create(
+            body=body, fields='id',
+            supportsAllDrives=True,
+        ).execute()
+        logger.info(f"Created Drive folder '{name}' (id={folder['id']})")
         return folder['id']
     except Exception as e:
         logger.error(f"Folder resolve failed for '{name}': {e}")
@@ -247,23 +260,45 @@ def _find_or_create_folder(service, name, parent_id=None):
 
 
 def get_colab_folder_id(account='default'):
-    """Return the account's Colab_Processing folder ID (create if missing)."""
+    """
+    Return the account's Colab_Processing folder ID.
+    Creates it if missing. Cached per account.
+    """
     with _cache_lock:
         if account in _colab_folder_cache:
             return _colab_folder_cache[account]
+
     try:
         svc = get_drive_service(account)
         fid = _find_or_create_folder(svc, COLAB_FOLDER_NAME)
-        with _cache_lock:
-            _colab_folder_cache[account] = fid
+        if fid:
+            with _cache_lock:
+                _colab_folder_cache[account] = fid
         return fid
     except Exception as e:
         logger.error(f"Could not resolve Colab folder for {account}: {e}")
         return None
 
 
+def get_colab_output_folder_id(account='default'):
+    """
+    Return account's Colab_Processing/Processed folder ID.
+    Creates both if missing.
+    """
+    try:
+        svc = get_drive_service(account)
+        root_id = _find_or_create_folder(svc, COLAB_FOLDER_NAME)
+        if not root_id:
+            return None
+        out_id = _find_or_create_folder(svc, COLAB_OUTPUT_SUBFOLDER, root_id)
+        return out_id
+    except Exception as e:
+        logger.error(f"Could not resolve Colab output folder for {account}: {e}")
+        return None
+
+
 # ============================================================
-# Colab upload job (uses the account's own Colab_Processing)
+# Colab upload job
 # ============================================================
 def process_colab(task_id, input_path, original_filename, account='default'):
     logger.info(f"Colab task {task_id}: input={input_path} account={account}")
@@ -384,7 +419,6 @@ def register_routes(app):
         try:
             service = get_drive_service(account)
 
-            # If not root, validate it's a folder
             if folder_id != MY_DRIVE_ROOT:
                 try:
                     meta = service.files().get(
@@ -404,6 +438,13 @@ def register_routes(app):
             listing = _list_folder(service, folder_id)
             breadcrumbs = _get_breadcrumbs(service, folder_id)
 
+            # Include Colab_Processing folder id so frontend can shortcut
+            colab_id = None
+            try:
+                colab_id = get_colab_folder_id(account)
+            except Exception:
+                pass
+
             return jsonify({
                 'account': account,
                 'account_email': get_account_email(account),
@@ -414,6 +455,7 @@ def register_routes(app):
                 'folders': listing['folders'],
                 'files': listing['files'],
                 'is_root': folder_id == MY_DRIVE_ROOT,
+                'colab_folder_id': colab_id,
             })
 
         except Exception as e:
@@ -492,11 +534,12 @@ def register_routes(app):
     @app.route('/drive/upload', methods=['POST'])
     def drive_upload():
         """
-        Upload a file from local downloads/ into the current Drive folder.
-        Form: file (multipart), account, folder_id (optional, defaults to root)
+        Upload a file into the account's Colab_Processing folder.
+        The folder is created on demand if it doesn't exist.
+        Ignores any folder_id sent by the client — always targets
+        Colab_Processing.
         """
         account = _request_account()
-        folder_id = request.form.get('folder_id') or MY_DRIVE_ROOT
 
         if 'file' not in request.files:
             return jsonify({'error': 'No file'}), 400
@@ -508,7 +551,15 @@ def register_routes(app):
         if not safe_name:
             return jsonify({'error': 'Invalid filename'}), 400
 
-        temp_path = os.path.join(UPLOAD_FOLDER, f"_upload_{uuid.uuid4().hex}_{safe_name}")
+        # Resolve (or create) Colab_Processing for this account
+        target_folder = get_colab_folder_id(account)
+        if not target_folder:
+            return jsonify({'error':
+                f'Cannot resolve/create Colab_Processing for account '
+                f'{account}'}), 500
+
+        temp_path = os.path.join(UPLOAD_FOLDER,
+                                  f"_upload_{uuid.uuid4().hex}_{safe_name}")
         try:
             file.save(temp_path)
         except Exception as e:
@@ -518,7 +569,8 @@ def register_routes(app):
         task_data = {
             'task_id': task_id, 'status': 'queued', 'upload_progress': 0,
             'created_at': time.time(), 'cancelled': False,
-            'account': account, 'target_folder': folder_id,
+            'account': account, 'target_folder': target_folder,
+            'target_folder_name': COLAB_FOLDER_NAME,
         }
         save_task(task_id, task_data)
 
@@ -528,9 +580,10 @@ def register_routes(app):
             save_task(task_id, task)
             try:
                 service = get_drive_service(account)
-                file_metadata = {'name': safe_name}
-                if folder_id:
-                    file_metadata['parents'] = [folder_id]
+                file_metadata = {
+                    'name': safe_name,
+                    'parents': [target_folder],
+                }
                 media = MediaFileUpload(temp_path, resumable=True,
                                         chunksize=10 * 1024 * 1024)
                 request = service.files().create(
@@ -551,6 +604,7 @@ def register_routes(app):
                 task['upload_progress'] = 100
                 task['drive_file_id'] = response.get('id')
                 task['drive_file_name'] = response.get('name')
+                task['drive_folder_id'] = target_folder
                 save_task(task_id, task)
             except Exception as e:
                 logger.exception("Drive upload failed")
@@ -566,8 +620,12 @@ def register_routes(app):
                     pass
 
         threading.Thread(target=run, daemon=True).start()
-        return jsonify({'task_id': task_id, 'account': account,
-                        'folder_id': folder_id})
+        return jsonify({
+            'task_id': task_id,
+            'account': account,
+            'target_folder': target_folder,
+            'target_folder_name': COLAB_FOLDER_NAME,
+        })
 
     @app.route('/colab_process', methods=['POST'])
     def colab_process():
