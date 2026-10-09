@@ -1,7 +1,7 @@
 <div class="card">
     <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem;">
         <h2><i class="fab fa-google-drive"></i> Google Drive</h2>
-        <div style="display: flex; gap: 0.5rem; align-items: center;">
+        <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
             <select id="driveAccountSelect" style="padding:0.4rem 0.8rem;
                     background:#1e2438; color:#eef2ff; border:1px solid #2a3248;
                     border-radius:1rem; font-size:0.85rem; max-width:220px;">
@@ -12,6 +12,10 @@
             <button id="driveUpBtn" title="Go to parent folder">
                 <i class="fas fa-level-up-alt"></i> Up
             </button>
+            <button id="driveUploadBtn" title="Upload file here">
+                <i class="fas fa-upload"></i> Upload
+            </button>
+            <input type="file" id="driveUploadInput" style="display:none;">
             <button id="refreshDriveBtn"><i class="fas fa-sync-alt"></i> Refresh</button>
         </div>
     </div>
@@ -30,8 +34,18 @@
             <button id="downloadSelectedDriveBtn" class="primary">
                 <i class="fas fa-download"></i> Download Selected
             </button>
+            <button id="deleteSelectedDriveBtn" class="danger">
+                <i class="fas fa-trash-alt"></i> Delete Selected
+            </button>
             <button id="deselectAllDriveBtn">Deselect All</button>
         </div>
+    </div>
+
+    <!-- Upload progress bar (hidden by default) -->
+    <div id="driveUploadStatus" style="display:none; margin-bottom:1rem;
+         padding:0.6rem 1rem; background:rgba(20,25,40,0.7); border-radius:1rem;
+         border:1px solid #2a3248; font-size:0.85rem;">
+        <i class="fas fa-spinner fa-pulse"></i> <span id="driveUploadText"></span>
     </div>
 
     <!-- File list -->
@@ -42,20 +56,20 @@
 // ============================================================
 // State
 // ============================================================
-let driveCurrentFolderId = null;
-let driveRootId = null;
+let driveCurrentFolderId = 'root';
 let driveParentId = null;
 let driveFiles = [];
 let selectedDriveIds = new Set();
-let driveCurrentAccount = null;    // account name string
+let driveCurrentAccount = null;
+let driveIsRoot = true;
 
 // ============================================================
-// Load accounts on startup
+// Accounts
 // ============================================================
 async function loadDriveAccounts() {
     const sel = document.getElementById('driveAccountSelect');
     try {
-        const resp = await fetch('/drive/accounts');
+        const resp = await fetch('/drive/accounts', {cache: 'no-store'});
         const data = await resp.json();
         const accounts = data.accounts || [];
         if (accounts.length === 0) {
@@ -66,9 +80,7 @@ async function loadDriveAccounts() {
         accounts.forEach((a, idx) => {
             const opt = document.createElement('option');
             opt.value = a.name;
-            // Account names like "default", "alice", "bob"
-            const label = a.name === 'default' ? 'Default' : a.name;
-            opt.textContent = label;
+            opt.textContent = a.name === 'default' ? 'Default' : a.name;
             if (idx === 0) opt.selected = true;
             sel.appendChild(opt);
         });
@@ -79,17 +91,14 @@ async function loadDriveAccounts() {
     }
 }
 
-// Probe account email lazily after selection
 async function probeAccountEmail(accountName) {
     const el = document.getElementById('driveAccountEmail');
     el.textContent = '';
     try {
-        const resp = await fetch(`/drive/accounts?probe=1`);
+        const resp = await fetch(`/drive/accounts?probe=1`, {cache: 'no-store'});
         const data = await resp.json();
         const found = (data.accounts || []).find(a => a.name === accountName);
-        if (found && found.email) {
-            el.textContent = `(${found.email})`;
-        }
+        if (found && found.email) el.textContent = `(${found.email})`;
     } catch (e) { /* silent */ }
 }
 
@@ -102,19 +111,23 @@ async function loadDriveFolder(folderId) {
         + '<i class="fas fa-spinner fa-pulse"></i> Loading...</div>';
 
     try {
-        let url = '/drive/list';
         const params = new URLSearchParams();
         if (folderId) params.append('folder_id', folderId);
         if (driveCurrentAccount) params.append('account', driveCurrentAccount);
-        if (params.toString()) url += '?' + params.toString();
+        const url = '/drive/list?' + params.toString();
 
-        const resp = await fetch(url);
+        const resp = await fetch(url, {cache: 'no-store'});
         const data = await resp.json();
         if (data.error) throw new Error(data.error);
 
+        console.log('[Drive]', url, '→', data.account,
+                    'root:', data.current_folder_id,
+                    'files:', (data.files||[]).length,
+                    'folders:', (data.folders||[]).length);
+
         driveCurrentFolderId = data.current_folder_id;
         driveParentId = data.parent_id;
-        if (!driveRootId) driveRootId = data.current_folder_id;
+        driveIsRoot = data.is_root;
 
         if (data.account_email) {
             document.getElementById('driveAccountEmail').textContent
@@ -139,7 +152,7 @@ async function loadDriveFolder(folderId) {
 function renderDriveBreadcrumbs(crumbs) {
     const el = document.getElementById('driveBreadcrumbs');
     if (!crumbs || crumbs.length === 0) {
-        el.innerHTML = '<i class="fas fa-folder"></i> Root';
+        el.innerHTML = '<i class="fas fa-folder"></i> My Drive';
         return;
     }
     let html = '<i class="fas fa-folder-open" style="color:#93c5fd;"></i> ';
@@ -164,7 +177,7 @@ function renderDriveBreadcrumbs(crumbs) {
 
 function updateDriveUpButton() {
     const btn = document.getElementById('driveUpBtn');
-    if (!driveParentId || driveCurrentFolderId === driveRootId) {
+    if (driveIsRoot || !driveParentId) {
         btn.disabled = true;
         btn.style.opacity = 0.4;
         btn.style.cursor = 'not-allowed';
@@ -265,13 +278,13 @@ function attachDriveEvents() {
 
     document.querySelectorAll('.drive-delete').forEach(btn => {
         btn.onclick = async () => {
-            if (!confirm('Permanently delete from Drive?')) return;
+            if (!confirm('Move to trash?')) return;
             const id = btn.dataset.id;
             const url = `/drive/delete/${id}` +
                 (driveCurrentAccount ? `?account=${encodeURIComponent(driveCurrentAccount)}` : '');
-            const resp = await fetch(url, { method: 'DELETE' });
+            const resp = await fetch(url, {method: 'DELETE'});
             if (resp.ok) {
-                showToast('Deleted');
+                showToast('Moved to trash');
                 loadDriveFolder(driveCurrentFolderId);
             } else {
                 const err = await resp.json().catch(() => ({}));
@@ -302,25 +315,24 @@ function updateDriveSelectionUI() {
 // ============================================================
 document.getElementById('driveAccountSelect').addEventListener('change', (e) => {
     driveCurrentAccount = e.target.value;
-    driveCurrentFolderId = null;
-    driveRootId = null;
+    driveCurrentFolderId = 'root';
     driveParentId = null;
+    driveIsRoot = true;
     selectedDriveIds.clear();
     probeAccountEmail(driveCurrentAccount);
-    loadDriveFolder(null);
+    loadDriveFolder('root');
 });
 
 // ============================================================
 // Buttons
 // ============================================================
 document.getElementById('driveUpBtn').onclick = () => {
-    if (driveParentId && driveCurrentFolderId !== driveRootId) {
-        loadDriveFolder(driveParentId);
-    }
+    if (driveParentId) loadDriveFolder(driveParentId);
+    else if (!driveIsRoot) loadDriveFolder('root');
 };
 
 document.getElementById('refreshDriveBtn').onclick = () => {
-    loadDriveFolder(driveCurrentFolderId || driveRootId);
+    loadDriveFolder(driveCurrentFolderId || 'root');
 };
 
 document.getElementById('deselectAllDriveBtn').onclick = () => {
@@ -351,12 +363,82 @@ document.getElementById('downloadSelectedDriveBtn').onclick = async () => {
     if (typeof fetchTasks === 'function') fetchTasks();
 };
 
+document.getElementById('deleteSelectedDriveBtn').onclick = async () => {
+    if (selectedDriveIds.size === 0) return;
+    if (!confirm(`Move ${selectedDriveIds.size} item(s) to trash?`)) return;
+    let ok = 0;
+    for (const id of selectedDriveIds) {
+        const url = `/drive/delete/${id}` +
+            (driveCurrentAccount ? `?account=${encodeURIComponent(driveCurrentAccount)}` : '');
+        const resp = await fetch(url, {method: 'DELETE'});
+        if (resp.ok) ok++;
+    }
+    showToast(`Deleted ${ok} item(s)`);
+    selectedDriveIds.clear();
+    loadDriveFolder(driveCurrentFolderId);
+};
+
+// ============================================================
+// Upload
+// ============================================================
+const uploadInput = document.getElementById('driveUploadInput');
+document.getElementById('driveUploadBtn').onclick = () => uploadInput.click();
+
+uploadInput.onchange = async () => {
+    if (!uploadInput.files.length) return;
+    const file = uploadInput.files[0];
+
+    const formData = new FormData();
+    formData.append('file', file);
+    if (driveCurrentAccount) formData.append('account', driveCurrentAccount);
+    formData.append('folder_id', driveCurrentFolderId || 'root');
+
+    const statusEl = document.getElementById('driveUploadStatus');
+    const textEl = document.getElementById('driveUploadText');
+    statusEl.style.display = 'block';
+    textEl.textContent = `Uploading ${file.name}…`;
+
+    try {
+        const resp = await fetch('/drive/upload', {method: 'POST', body: formData});
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+
+        const taskId = data.task_id;
+
+        // Poll progress
+        const interval = setInterval(async () => {
+            try {
+                const r = await fetch(`/progress/${taskId}`);
+                const t = await r.json();
+                if (t.status === 'done') {
+                    clearInterval(interval);
+                    statusEl.style.display = 'none';
+                    showToast(`Uploaded: ${file.name}`);
+                    loadDriveFolder(driveCurrentFolderId);
+                } else if (t.status === 'error') {
+                    clearInterval(interval);
+                    statusEl.style.display = 'none';
+                    showToast(t.error_msg || 'Upload failed', true);
+                } else {
+                    const pct = t.upload_progress || 0;
+                    textEl.textContent = `Uploading ${file.name}… ${pct}%`;
+                }
+            } catch (e) { /* silent */ }
+        }, 1000);
+    } catch (err) {
+        statusEl.style.display = 'none';
+        showToast(err.message, true);
+    } finally {
+        uploadInput.value = '';
+    }
+};
+
 // ============================================================
 // Initial load
 // ============================================================
 (async () => {
     await loadDriveAccounts();
     probeAccountEmail(driveCurrentAccount);
-    loadDriveFolder(null);
+    loadDriveFolder('root');
 })();
 </script>
