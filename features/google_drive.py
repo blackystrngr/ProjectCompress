@@ -120,8 +120,31 @@ def get_account_email(account='default'):
 
 
 def _request_account():
-    acct = request.args.get('account') or request.form.get('account')
-    return acct if acct else 'default'
+    """
+    Resolve the account name for this request.
+    Order: query string -> form -> first available account.
+
+    Falls back to the first available account when the caller didn't
+    specify one (or specified a name that isn't in discover_accounts()).
+    This fixes the "Send to Colab" button when only token_<name>.json
+    files exist and no token.json.
+    """
+    acct = (request.args.get('account')
+            or request.form.get('account')
+            or '').strip()
+
+    accounts = discover_accounts()
+
+    if acct and acct in accounts:
+        return acct
+
+    # Fall back to first available account (alphabetical)
+    if accounts:
+        return sorted(accounts.keys())[0]
+
+    # No accounts configured — return 'default' so downstream raises a
+    # clear error.
+    return 'default'
 
 
 def _format_size(size_bytes):
@@ -136,9 +159,7 @@ def _format_size(size_bytes):
 
 
 def _get_breadcrumbs(service, folder_id):
-    """
-    Build breadcrumb from My Drive down to folder_id.
-    """
+    """Build breadcrumb from My Drive down to folder_id."""
     if folder_id == MY_DRIVE_ROOT:
         return [{'id': MY_DRIVE_ROOT, 'name': 'My Drive'}]
 
@@ -406,10 +427,6 @@ def register_routes(app):
 
     @app.route('/drive/list')
     def drive_list():
-        """
-        List contents of a folder in the given account's Drive.
-        ?folder_id=... defaults to 'root' (My Drive top level).
-        """
         account = _request_account()
         folder_id = request.args.get('folder_id') or MY_DRIVE_ROOT
 
@@ -438,7 +455,6 @@ def register_routes(app):
             listing = _list_folder(service, folder_id)
             breadcrumbs = _get_breadcrumbs(service, folder_id)
 
-            # Include Colab_Processing folder id so frontend can shortcut
             colab_id = None
             try:
                 colab_id = get_colab_folder_id(account)
@@ -536,8 +552,6 @@ def register_routes(app):
         """
         Upload a file into the account's Colab_Processing folder.
         The folder is created on demand if it doesn't exist.
-        Ignores any folder_id sent by the client — always targets
-        Colab_Processing.
         """
         account = _request_account()
 
@@ -551,7 +565,6 @@ def register_routes(app):
         if not safe_name:
             return jsonify({'error': 'Invalid filename'}), 400
 
-        # Resolve (or create) Colab_Processing for this account
         target_folder = get_colab_folder_id(account)
         if not target_folder:
             return jsonify({'error':
