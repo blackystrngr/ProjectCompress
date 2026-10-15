@@ -1,4 +1,5 @@
 import logging
+from . import auth
 from . import url_download
 from . import telegram
 from . import google_drive
@@ -18,6 +19,7 @@ logger = logging.getLogger(__name__)
 def register_all_features(app):
     """Register all feature blueprints/routes."""
     logger.info("Registering features...")
+    auth.register_auth(app)
     url_download.register_routes(app)
     telegram.register_routes(app)
     google_drive.register_routes(app)
