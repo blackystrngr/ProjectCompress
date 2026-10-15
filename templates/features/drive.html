@@ -1,0 +1,601 @@
+<div class="card">
+    <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem;">
+        <h2><i class="fab fa-google-drive"></i> Google Drive</h2>
+        <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
+            <select id="driveAccountSelect" style="padding:0.4rem 0.8rem;
+                    background:#1e2438; color:#eef2ff; border:1px solid #2a3248;
+                    border-radius:1rem; font-size:0.85rem; max-width:220px;">
+                <option value="">Loading accounts…</option>
+            </select>
+            <span id="driveAccountEmail" style="font-size:0.75rem; color:#8a9bc0; max-width:180px;
+                  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+            <button id="driveUpBtn" title="Go to parent folder">
+                <i class="fas fa-level-up-alt"></i> Up
+            </button>
+            <button id="driveColabBtn"
+                    title="Jump to Colab_Processing (created if missing)">
+                <i class="fas fa-folder-open"></i> Colab_Processing
+            </button>
+            <button id="driveUploadBtn"
+                    title="Upload one or more files to Colab_Processing">
+                <i class="fas fa-upload"></i> Upload
+            </button>
+            <input type="file" id="driveUploadInput" multiple style="display:none;">
+            <button id="refreshDriveBtn"><i class="fas fa-sync-alt"></i> Refresh</button>
+        </div>
+    </div>
+
+    <div id="driveBreadcrumbs" style="margin: 0.8rem 0; font-size: 0.85rem;
+         word-break: break-all; padding: 0.5rem 0.8rem;
+         background: rgba(20,25,40,0.6); border-radius: 0.5rem;">
+        <i class="fas fa-folder"></i> Loading...
+    </div>
+
+    <div id="driveActionBar" class="action-bar" style="display: none;">
+        <span class="selected-info"><span id="driveSelectedCount">0</span> selected</span>
+        <div class="action-buttons">
+            <button id="downloadSelectedDriveBtn" class="primary">
+                <i class="fas fa-download"></i> Download Selected
+            </button>
+            <button id="deleteSelectedDriveBtn" class="danger">
+                <i class="fas fa-trash-alt"></i> Delete Selected
+            </button>
+            <button id="deselectAllDriveBtn">Deselect All</button>
+        </div>
+    </div>
+
+    <!-- Upload / batch progress banner -->
+    <div id="driveUploadStatus" style="display:none; margin-bottom:1rem;
+         padding:0.7rem 1rem; background:rgba(20,25,40,0.75); border-radius:1rem;
+         border:1px solid #2a3248; font-size:0.85rem;">
+        <div style="display:flex; align-items:center; gap:0.6rem;">
+            <i class="fas fa-spinner fa-pulse" id="driveUploadSpinner"></i>
+            <span id="driveUploadText" style="flex:1;"></span>
+            <span id="driveUploadPct" style="font-family:monospace; color:#93c5fd; min-width:45px; text-align:right;"></span>
+        </div>
+        <div class="progress-bar" style="margin-top:0.5rem;">
+            <div id="driveUploadBar" class="progress-fill" style="width:0%;"></div>
+        </div>
+        <div id="driveUploadDetail" style="font-size:0.72rem; color:#8a9bc0; margin-top:0.3rem;"></div>
+    </div>
+
+    <div id="driveFileList" class="file-grid empty-state">Loading Drive files...</div>
+</div>
+
+<script>
+// ============================================================
+// State
+// ============================================================
+let driveCurrentFolderId = 'root';
+let driveParentId = null;
+let driveFiles = [];
+let selectedDriveIds = new Set();
+let driveCurrentAccount = null;
+let driveIsRoot = true;
+let driveColabFolderId = null;
+
+// ============================================================
+// Accounts
+// ============================================================
+async function loadDriveAccounts() {
+    const sel = document.getElementById('driveAccountSelect');
+    try {
+        const resp = await fetch('/drive/accounts', {cache: 'no-store'});
+        const data = await resp.json();
+        const accounts = data.accounts || [];
+        if (accounts.length === 0) {
+            sel.innerHTML = '<option value="">No accounts</option>';
+            return;
+        }
+        sel.innerHTML = '';
+        accounts.forEach((a) => {
+            const opt = document.createElement('option');
+            opt.value = a.name;
+            let label = a.name === 'default' ? 'Default' : a.name;
+            if (a.email) label += ` — ${a.email}`;
+            opt.textContent = label;
+            sel.appendChild(opt);
+        });
+
+        const shared = window.selectedDriveAccount;
+        if (shared && accounts.find(a => a.name === shared)) {
+            sel.value = shared;
+            driveCurrentAccount = shared;
+        } else {
+            driveCurrentAccount = sel.value;
+            if (typeof window.setDriveAccount === 'function') {
+                window.setDriveAccount(driveCurrentAccount);
+            }
+        }
+    } catch (err) {
+        console.error('loadDriveAccounts error:', err);
+        sel.innerHTML = '<option value="">Error loading</option>';
+    }
+}
+
+window.addEventListener('driveAccountChanged', (e) => {
+    const name = e.detail;
+    if (!name || name === driveCurrentAccount) return;
+    const sel = document.getElementById('driveAccountSelect');
+    if (sel) sel.value = name;
+    driveCurrentAccount = name;
+    driveCurrentFolderId = 'root';
+    driveParentId = null;
+    driveIsRoot = true;
+    driveColabFolderId = null;
+    selectedDriveIds.clear();
+    loadDriveFolder('root');
+});
+
+// ============================================================
+// Load folder
+// ============================================================
+async function loadDriveFolder(folderId) {
+    const listEl = document.getElementById('driveFileList');
+    listEl.innerHTML = '<div class="empty-state">'
+        + '<i class="fas fa-spinner fa-pulse"></i> Loading...</div>';
+
+    try {
+        const params = new URLSearchParams();
+        if (folderId) params.append('folder_id', folderId);
+        if (driveCurrentAccount) params.append('account', driveCurrentAccount);
+        const url = '/drive/list?' + params.toString();
+
+        const resp = await fetch(url, {cache: 'no-store'});
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+
+        driveCurrentFolderId = data.current_folder_id;
+        driveParentId = data.parent_id;
+        driveIsRoot = data.is_root;
+        if (data.colab_folder_id) {
+            driveColabFolderId = data.colab_folder_id;
+        }
+
+        const emailEl = document.getElementById('driveAccountEmail');
+        if (emailEl) {
+            emailEl.textContent = data.account_email ? `(${data.account_email})` : '';
+        }
+
+        driveFiles = [...(data.folders || []), ...(data.files || [])];
+
+        renderDriveBreadcrumbs(data.breadcrumbs);
+        renderDriveFileList();
+        updateDriveUpButton();
+
+        selectedDriveIds.clear();
+        updateDriveSelectionUI();
+    } catch (err) {
+        listEl.innerHTML = `<div class="empty-state" style="color:#ff8a8a;">
+            Error: ${escapeHtml(err.message)}
+        </div>`;
+    }
+}
+
+function renderDriveBreadcrumbs(crumbs) {
+    const el = document.getElementById('driveBreadcrumbs');
+    if (!crumbs || crumbs.length === 0) {
+        el.innerHTML = '<i class="fas fa-folder"></i> My Drive';
+        return;
+    }
+    let html = '<i class="fas fa-folder-open" style="color:#93c5fd;"></i> ';
+    crumbs.forEach((c, i) => {
+        const isLast = i === crumbs.length - 1;
+        if (isLast) {
+            html += `<strong>${escapeHtml(c.name)}</strong>`;
+        } else {
+            html += `<a href="#" class="drive-crumb" data-folder-id="${escapeHtml(c.id)}"
+                        style="color:#5f8fe0; text-decoration:none;">${escapeHtml(c.name)}</a>`;
+            html += ' <span style="color:#4b5563;">/</span> ';
+        }
+    });
+    el.innerHTML = html;
+    el.querySelectorAll('.drive-crumb').forEach(a => {
+        a.addEventListener('click', (e) => {
+            e.preventDefault();
+            loadDriveFolder(a.dataset.folderId);
+        });
+    });
+}
+
+function updateDriveUpButton() {
+    const btn = document.getElementById('driveUpBtn');
+    if (driveIsRoot || !driveParentId) {
+        btn.disabled = true;
+        btn.style.opacity = 0.4;
+        btn.style.cursor = 'not-allowed';
+    } else {
+        btn.disabled = false;
+        btn.style.opacity = 1;
+        btn.style.cursor = 'pointer';
+    }
+}
+
+function renderDriveFileList() {
+    const listEl = document.getElementById('driveFileList');
+    if (!driveFiles.length) {
+        listEl.innerHTML = '<div class="empty-state">Empty folder.</div>';
+        return;
+    }
+
+    let html = '';
+    driveFiles.forEach(item => {
+        const isSel = selectedDriveIds.has(item.id);
+        const isFolder = item.is_folder;
+
+        if (isFolder) {
+            html += `<div class="file-card drive-folder-card" data-id="${item.id}" data-folder="true">
+                <div class="file-name" style="cursor:pointer;"
+                     onclick="loadDriveFolder('${item.id}')">
+                    <i class="fas fa-folder" style="color:#facc15; font-size:1.2rem;"></i>
+                    <span style="margin-left:4px;">${escapeHtml(item.name)}</span>
+                </div>
+                <div class="file-size" style="color:#93c5fd;">Folder</div>
+                <div class="file-actions">
+                    <button class="drive-open-folder" data-id="${item.id}">
+                        <i class="fas fa-folder-open"></i> Open
+                    </button>
+                </div>
+            </div>`;
+        } else {
+            html += `<div class="file-card ${isSel ? 'selected' : ''}" data-id="${item.id}" data-folder="false">
+                <input type="checkbox" class="file-checkbox drive-checkbox"
+                       data-id="${item.id}" ${isSel ? 'checked' : ''}>
+                <div class="file-name">
+                    <i class="fas fa-file"></i>
+                    ${escapeHtml(item.name)}
+                </div>
+                <div class="file-size">${escapeHtml(item.size_str || '—')}</div>
+                <div class="file-actions">
+                    <button class="drive-download-single"
+                            data-id="${item.id}"
+                            data-name="${escapeHtml(item.name)}">
+                        <i class="fas fa-download"></i> Download
+                    </button>
+                    <button class="drive-delete" data-id="${item.id}">
+                        <i class="fas fa-trash-alt"></i> Delete
+                    </button>
+                </div>
+            </div>`;
+        }
+    });
+
+    listEl.innerHTML = html;
+    attachDriveEvents();
+    updateDriveSelectionUI();
+}
+
+function attachDriveEvents() {
+    document.querySelectorAll('.drive-open-folder').forEach(btn => {
+        btn.onclick = () => loadDriveFolder(btn.dataset.id);
+    });
+
+    document.querySelectorAll('.drive-checkbox').forEach(cb => {
+        cb.onchange = () => {
+            const id = cb.dataset.id;
+            if (cb.checked) selectedDriveIds.add(id);
+            else selectedDriveIds.delete(id);
+            updateDriveSelectionUI();
+        };
+    });
+
+    document.querySelectorAll('.drive-download-single').forEach(btn => {
+        btn.onclick = async () => {
+            const id = btn.dataset.id;
+            const name = btn.dataset.name;
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Starting…';
+            try {
+                await startDriveDownload(id, name);
+                showToast(`Download started: ${name}`);
+            } catch (err) {
+                showToast(err.message, true);
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-download"></i> Download';
+            }
+        };
+    });
+
+    document.querySelectorAll('.drive-delete').forEach(btn => {
+        btn.onclick = async () => {
+            if (!confirm('Move to trash?')) return;
+            const id = btn.dataset.id;
+            const url = `/drive/delete/${id}` +
+                (driveCurrentAccount ? `?account=${encodeURIComponent(driveCurrentAccount)}` : '');
+            const resp = await fetch(url, {method: 'DELETE'});
+            if (resp.ok) {
+                showToast('Moved to trash');
+                loadDriveFolder(driveCurrentFolderId);
+            } else {
+                const err = await resp.json().catch(() => ({}));
+                showToast(err.error || 'Delete failed', true);
+            }
+        };
+    });
+}
+
+function updateDriveSelectionUI() {
+    const count = selectedDriveIds.size;
+    const actionBar = document.getElementById('driveActionBar');
+    if (count > 0) {
+        actionBar.style.display = 'flex';
+        document.getElementById('driveSelectedCount').textContent = count;
+    } else {
+        actionBar.style.display = 'none';
+    }
+    document.querySelectorAll('#driveFileList .file-card').forEach(card => {
+        const id = card.dataset.id;
+        if (selectedDriveIds.has(id)) card.classList.add('selected');
+        else card.classList.remove('selected');
+    });
+}
+
+// ============================================================
+// Account switch
+// ============================================================
+document.getElementById('driveAccountSelect').addEventListener('change', (e) => {
+    const name = e.target.value;
+    driveCurrentAccount = name;
+    if (typeof window.setDriveAccount === 'function') {
+        window.setDriveAccount(name);
+    }
+    driveCurrentFolderId = 'root';
+    driveParentId = null;
+    driveIsRoot = true;
+    driveColabFolderId = null;
+    selectedDriveIds.clear();
+    loadDriveFolder('root');
+});
+
+// ============================================================
+// Single-file download helper (used by batch)
+// ============================================================
+async function startDriveDownload(fileId, fileName) {
+    const body = new URLSearchParams();
+    body.append('file_id', fileId);
+    body.append('file_name', fileName);
+    if (driveCurrentAccount) body.append('account', driveCurrentAccount);
+
+    const resp = await fetch('/drive/download_to_server', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: body
+    });
+    const data = await resp.json();
+    if (!resp.ok || data.error) {
+        throw new Error(data.error || `HTTP ${resp.status}`);
+    }
+    return data.task_id;
+}
+
+// ============================================================
+// Buttons
+// ============================================================
+document.getElementById('driveUpBtn').onclick = () => {
+    if (driveParentId) loadDriveFolder(driveParentId);
+    else if (!driveIsRoot) loadDriveFolder('root');
+};
+
+document.getElementById('driveColabBtn').onclick = () => {
+    if (driveColabFolderId) loadDriveFolder(driveColabFolderId);
+    else loadDriveFolder('root');
+};
+
+document.getElementById('refreshDriveBtn').onclick = () => {
+    loadDriveFolder(driveCurrentFolderId || 'root');
+};
+
+document.getElementById('deselectAllDriveBtn').onclick = () => {
+    selectedDriveIds.clear();
+    updateDriveSelectionUI();
+    renderDriveFileList();
+};
+
+// -------- Download Selected (batch) --------
+document.getElementById('downloadSelectedDriveBtn').onclick = async () => {
+    if (selectedDriveIds.size === 0) return;
+
+    // Collect only files (skip folders)
+    const targets = [];
+    for (const id of selectedDriveIds) {
+        const file = driveFiles.find(f => f.id === id && !f.is_folder);
+        if (file) targets.push(file);
+    }
+
+    if (targets.length === 0) {
+        showToast('No files selected (folders ignored)', true);
+        return;
+    }
+
+    const btn = document.getElementById('downloadSelectedDriveBtn');
+    btn.disabled = true;
+
+    let started = 0, failed = 0;
+    for (let i = 0; i < targets.length; i++) {
+        const f = targets[i];
+        btn.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> Starting ${i+1}/${targets.length}…`;
+        try {
+            await startDriveDownload(f.id, f.name);
+            started++;
+        } catch (e) {
+            failed++;
+            console.error('Download failed for', f.name, e);
+        }
+    }
+
+    btn.disabled = false;
+    btn.innerHTML = '<i class="fas fa-download"></i> Download Selected';
+
+    if (failed) showToast(`Started ${started} download(s), ${failed} failed`, true);
+    else showToast(`Started ${started} download(s)`, false);
+
+    if (typeof fetchTasks === 'function') fetchTasks();
+};
+
+// -------- Delete Selected (batch) --------
+document.getElementById('deleteSelectedDriveBtn').onclick = async () => {
+    if (selectedDriveIds.size === 0) return;
+    if (!confirm(`Move ${selectedDriveIds.size} item(s) to trash?`)) return;
+
+    const btn = document.getElementById('deleteSelectedDriveBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Deleting…';
+
+    let ok = 0, failed = 0;
+    for (const id of selectedDriveIds) {
+        const url = `/drive/delete/${id}` +
+            (driveCurrentAccount ? `?account=${encodeURIComponent(driveCurrentAccount)}` : '');
+        try {
+            const resp = await fetch(url, {method: 'DELETE'});
+            if (resp.ok) ok++;
+            else failed++;
+        } catch (e) { failed++; }
+    }
+
+    btn.disabled = false;
+    btn.innerHTML = '<i class="fas fa-trash-alt"></i> Delete Selected';
+
+    if (failed) showToast(`Deleted ${ok}, ${failed} failed`, true);
+    else showToast(`Moved ${ok} item(s) to trash`, false);
+
+    selectedDriveIds.clear();
+    loadDriveFolder(driveCurrentFolderId);
+};
+
+// ============================================================
+// Multi-file upload — always targets Colab_Processing
+// ============================================================
+const uploadInput = document.getElementById('driveUploadInput');
+document.getElementById('driveUploadBtn').onclick = () => uploadInput.click();
+
+uploadInput.onchange = async () => {
+    if (!uploadInput.files.length) return;
+
+    const files = Array.from(uploadInput.files);
+    const total = files.length;
+
+    // Snapshot the account so mid-batch account switching doesn't
+    // send later files to a different Drive.
+    const targetAccount = driveCurrentAccount;
+
+    // Set up the progress banner
+    const statusEl = document.getElementById('driveUploadStatus');
+    const textEl = document.getElementById('driveUploadText');
+    const pctEl = document.getElementById('driveUploadPct');
+    const barEl = document.getElementById('driveUploadBar');
+    const detailEl = document.getElementById('driveUploadDetail');
+    const spinnerEl = document.getElementById('driveUploadSpinner');
+
+    statusEl.style.display = 'block';
+    spinnerEl.style.display = 'inline-block';
+
+    let succeeded = 0;
+    let failed = 0;
+    const failures = [];
+
+    for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const fileIndex = i + 1;
+
+        textEl.textContent = `Uploading ${fileIndex}/${total}: ${file.name}`;
+        pctEl.textContent = '0%';
+        barEl.style.width = '0%';
+        detailEl.textContent = '';
+
+        try {
+            await uploadOneDriveFile(file, targetAccount, (pct) => {
+                pctEl.textContent = `${pct}%`;
+                barEl.style.width = `${pct}%`;
+            });
+            succeeded++;
+        } catch (err) {
+            failed++;
+            failures.push(`${file.name}: ${err.message}`);
+            console.error('Upload failed for', file.name, err);
+        }
+
+        // Aggregate progress after each file
+        const overallPct = Math.round(((i + 1) / total) * 100);
+        barEl.style.width = `${overallPct}%`;
+        pctEl.textContent = `${overallPct}%`;
+    }
+
+    spinnerEl.style.display = 'none';
+
+    if (failed === 0) {
+        textEl.textContent = `✅ Uploaded ${succeeded} file(s) to Colab_Processing`;
+        detailEl.textContent = '';
+        setTimeout(() => { statusEl.style.display = 'none'; }, 3000);
+    } else if (succeeded === 0) {
+        textEl.textContent = `❌ All ${failed} upload(s) failed`;
+        detailEl.textContent = failures.slice(0, 3).join(' · ');
+    } else {
+        textEl.textContent = `⚠️ Uploaded ${succeeded}/${total}, ${failed} failed`;
+        detailEl.textContent = failures.slice(0, 3).join(' · ');
+        setTimeout(() => { statusEl.style.display = 'none'; }, 6000);
+    }
+
+    // Refresh the current view (in case we're inside Colab_Processing)
+    loadDriveFolder(driveCurrentFolderId);
+
+    // Clear the input so the same files can be selected again
+    uploadInput.value = '';
+};
+
+/**
+ * Upload one file to Colab_Processing via /drive/upload.
+ * onProgress(pct) called repeatedly with 0..100.
+ */
+async function uploadOneDriveFile(file, account, onProgress) {
+    return new Promise((resolve, reject) => {
+        const formData = new FormData();
+        formData.append('file', file);
+        if (account) formData.append('account', account);
+
+        fetch('/drive/upload', {method: 'POST', body: formData})
+            .then(async (resp) => {
+                const data = await resp.json();
+                if (!resp.ok || data.error) {
+                    throw new Error(data.error || `HTTP ${resp.status}`);
+                }
+
+                const taskId = data.task_id;
+                let lastStatus = null;
+
+                // Poll progress until done or error
+                const interval = setInterval(async () => {
+                    try {
+                        const r = await fetch(`/progress/${taskId}`);
+                        const t = await r.json();
+
+                        if (t.status === 'done') {
+                            clearInterval(interval);
+                            if (onProgress) onProgress(100);
+                            resolve(taskId);
+                        } else if (t.status === 'error') {
+                            clearInterval(interval);
+                            reject(new Error(t.error_msg || 'Upload failed'));
+                        } else {
+                            const pct = t.upload_progress || 0;
+                            if (onProgress) onProgress(pct);
+                            lastStatus = t.status;
+                        }
+                    } catch (e) {
+                        // Network hiccup — keep polling
+                        console.warn('progress poll error', e);
+                    }
+                }, 500);
+            })
+            .catch(reject);
+    });
+}
+
+// ============================================================
+// Initial load
+// ============================================================
+(async () => {
+    await loadDriveAccounts();
+    loadDriveFolder('root');
+})();
+</script>

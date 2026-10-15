@@ -1,0 +1,139 @@
+<div class="card">
+    <h2><i class="fas fa-network-wired"></i> Live Proxy Fetcher</h2>
+    <p>Fetch working HTTP/HTTPS/SOCKS4/SOCKS5 proxies from multiple sources. Tests each proxy against <code>httpbin.org/ip</code>.</p>
+    <div class="input-group">
+        <button id="startProxyFetchBtn" class="primary"><i class="fas fa-play"></i> Start New Fetch</button>
+        <button id="refreshProxyListBtn"><i class="fas fa-sync-alt"></i> Refresh Last Results</button>
+    </div>
+    <div id="proxyStatus" class="help-text"></div>
+    <div id="proxyActionBar" class="action-bar" style="display: none;">
+        <span class="selected-info"><span id="proxySelectedCount">0</span> selected</span>
+        <div class="action-buttons">
+            <button id="copySelectedProxiesBtn"><i class="fas fa-copy"></i> Copy Selected</button>
+            <button id="deselectAllProxiesBtn">Deselect All</button>
+        </div>
+    </div>
+    <div id="proxyListContainer" class="file-grid empty-state">No proxies loaded. Click "Start New Fetch".</div>
+</div>
+
+<script>
+let currentProxyTaskId = null, proxyPollInterval = null, currentProxies = [], selectedProxyIndices = new Set();
+const startProxyBtn = document.getElementById('startProxyFetchBtn'), refreshProxyBtn = document.getElementById('refreshProxyListBtn');
+const proxyStatusDiv = document.getElementById('proxyStatus'), proxyListDiv = document.getElementById('proxyListContainer');
+const proxyActionBar = document.getElementById('proxyActionBar'), proxySelectedSpan = document.getElementById('proxySelectedCount');
+const copySelectedBtn = document.getElementById('copySelectedProxiesBtn'), deselectAllProxiesBtn = document.getElementById('deselectAllProxiesBtn');
+
+startProxyBtn.onclick = async () => {
+    try {
+        const resp = await fetch('/proxy/fetch', { method: 'POST' });
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+        currentProxyTaskId = data.task_id;
+        proxyStatusDiv.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Task started. Fetching and testing proxies...';
+        proxyListDiv.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-pulse"></i> Please wait...</div>';
+        if (proxyPollInterval) clearInterval(proxyPollInterval);
+        proxyPollInterval = setInterval(pollProxyTask, 1500);
+    } catch (err) { showToast(err.message, true); }
+};
+
+refreshProxyBtn.onclick = async () => {
+    if (!currentProxyTaskId) { showToast('No active task. Start a new fetch first.', true); return; }
+    await loadProxyResults(currentProxyTaskId);
+};
+
+async function pollProxyTask() {
+    if (!currentProxyTaskId) return;
+    try {
+        const resp = await fetch(`/progress/${currentProxyTaskId}`);
+        const task = await resp.json();
+        if (task.error) { clearInterval(proxyPollInterval); proxyStatusDiv.innerHTML = `<span style="color:#ff8a8a;">Error: ${task.error}</span>`; return; }
+        if (task.status === 'done') {
+            clearInterval(proxyPollInterval);
+            proxyStatusDiv.innerHTML = `✅ Done. Found ${task.working_proxies} working proxies.`;
+            await loadProxyResults(currentProxyTaskId);
+        } else if (task.status === 'error') {
+            clearInterval(proxyPollInterval);
+            proxyStatusDiv.innerHTML = `<span style="color:#ff8a8a;">❌ Error: ${task.error_msg}</span>`;
+            proxyListDiv.innerHTML = '<div class="empty-state">Failed.</div>';
+        } else {
+            let msg = task.status === 'fetching' ? '🌐 Fetching proxy lists...' : `🔍 Testing: ${task.tested||0}/${task.total_proxies||0}`;
+            proxyStatusDiv.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${msg}`;
+        }
+    } catch (err) { console.error(err); }
+}
+
+async function loadProxyResults(taskId) {
+    try {
+        const resp = await fetch(`/proxy/results/${taskId}`);
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+        if (data.status === 'done') {
+            currentProxies = data.proxies || [];
+            renderProxyList(currentProxies);
+            proxyStatusDiv.innerHTML = `✅ ${currentProxies.length} working proxies.`;
+        } else {
+            proxyStatusDiv.innerHTML = `⏳ Still processing... (${data.status})`;
+        }
+    } catch (err) { showToast(err.message, true); proxyListDiv.innerHTML = '<div class="empty-state">Failed to load results.</div>'; }
+}
+
+function renderProxyList(proxies) {
+    if (!proxies.length) { proxyListDiv.innerHTML = '<div class="empty-state">No working proxies found.</div>'; proxyActionBar.style.display = 'none'; selectedProxyIndices.clear(); return; }
+    let html = '';
+    proxies.forEach((proxy, idx) => {
+        const isSel = selectedProxyIndices.has(idx);
+        html += `<div class="file-card ${isSel ? 'selected' : ''}" data-index="${idx}">
+                    <input type="checkbox" class="file-checkbox proxy-checkbox" data-index="${idx}" ${isSel ? 'checked' : ''}>
+                    <div class="file-name"><i class="fas fa-plug"></i> ${proxy.type.toUpperCase()} : ${proxy.ip}:${proxy.port}</div>
+                    <div class="file-size">⏱️ ${proxy.latency_ms} ms</div>
+                    <div class="file-actions">
+                        <button class="test-single-proxy" data-ip="${proxy.ip}" data-port="${proxy.port}" data-type="${proxy.type}"><i class="fas fa-vial"></i> Re-test</button>
+                        <button class="copy-single-proxy" data-proxy="${proxy.type}://${proxy.ip}:${proxy.port}"><i class="fas fa-copy"></i> Copy</button>
+                    </div>
+                </div>`;
+    });
+    proxyListDiv.innerHTML = html;
+    attachProxyEvents();
+    updateProxySelectionUI();
+}
+
+function attachProxyEvents() {
+    document.querySelectorAll('.proxy-checkbox').forEach(cb => {
+        cb.onchange = () => { const idx = parseInt(cb.dataset.index); if (cb.checked) selectedProxyIndices.add(idx); else selectedProxyIndices.delete(idx); updateProxySelectionUI(); };
+    });
+    document.querySelectorAll('.test-single-proxy').forEach(btn => {
+        btn.onclick = async () => {
+            const { ip, port, type } = btn.dataset;
+            btn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i>'; btn.disabled = true;
+            try {
+                const resp = await fetch('/proxy/test_single', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ip,port,type}) });
+                const data = await resp.json();
+                if (data.success) showToast(`Proxy ${type}://${ip}:${port} working (${data.latency_ms} ms)`);
+                else showToast(`Proxy ${type}://${ip}:${port} NOT working`, true);
+            } catch(err) { showToast(err.message, true); }
+            finally { btn.innerHTML = '<i class="fas fa-vial"></i> Re-test'; btn.disabled = false; }
+        };
+    });
+    document.querySelectorAll('.copy-single-proxy').forEach(btn => {
+        btn.onclick = () => { navigator.clipboard.writeText(btn.dataset.proxy); showToast('Copied'); };
+    });
+}
+
+function updateProxySelectionUI() {
+    const count = selectedProxyIndices.size;
+    if (count > 0) { proxyActionBar.style.display = 'flex'; proxySelectedSpan.textContent = count; }
+    else { proxyActionBar.style.display = 'none'; }
+    document.querySelectorAll('#proxyListContainer .file-card').forEach(card => {
+        const idx = parseInt(card.dataset.index);
+        if (selectedProxyIndices.has(idx)) card.classList.add('selected');
+        else card.classList.remove('selected');
+    });
+}
+
+copySelectedBtn.onclick = () => {
+    const selected = Array.from(selectedProxyIndices).map(idx => `${currentProxies[idx].type}://${currentProxies[idx].ip}:${currentProxies[idx].port}`).join('\n');
+    if (selected) { navigator.clipboard.writeText(selected); showToast(`Copied ${selectedProxyIndices.size} proxies`); }
+    else showToast('No proxies selected', true);
+};
+deselectAllProxiesBtn.onclick = () => { selectedProxyIndices.clear(); updateProxySelectionUI(); renderProxyList(currentProxies); };
+</script>

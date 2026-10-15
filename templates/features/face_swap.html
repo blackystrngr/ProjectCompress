@@ -1,0 +1,232 @@
+<div class="card">
+    <h2><i class="fas fa-cut"></i> Video Clipper, Summarizer & Face Swap</h2>
+
+    <!-- ========== Random Clips Section ========== -->
+    <div style="margin-bottom: 2rem; padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
+        <h3><i class="fas fa-random"></i> Random Clips</h3>
+        <p>Divides video into segments, picks a random clip from each, and merges them.</p>
+        <div class="input-group" style="flex-wrap: wrap;">
+            <div style="flex:2; min-width:150px;"><div style="font-size:0.7rem; color:#aaa;">Video file</div>
+                <select id="randomVideoSelect" style="width:100%;"><option>Loading videos...</option></select>
+            </div>
+            <div style="width:100px;"><div style="font-size:0.7rem; color:#aaa;">Segment (sec)</div>
+                <input type="number" id="segmentSec" placeholder="30" value="30" style="width:100%;">
+            </div>
+            <div style="width:100px;"><div style="font-size:0.7rem; color:#aaa;">Clip (sec)</div>
+                <input type="number" id="randomClipSec" placeholder="5" value="5" style="width:100%;">
+            </div>
+            <div style="align-self:flex-end;"><button id="randomBtn" class="primary"><i class="fas fa-play"></i> Generate Random Clips</button></div>
+        </div>
+        <div id="randomStatus" class="help-text"></div>
+        <div id="randomResult" class="empty-state">Select a video and click Generate.</div>
+    </div>
+
+    <!-- ========== AI Summarizer Section ========== -->
+    <div style="margin-bottom: 2rem; padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
+        <h3><i class="fas fa-magic"></i> AI Summarizer</h3>
+        <p>Evenly spaced clips to create a summary video.</p>
+        <div class="input-group" style="flex-wrap: wrap;">
+            <div style="flex:2; min-width:150px;"><div style="font-size:0.7rem; color:#aaa;">Video file</div>
+                <select id="summaryVideoSelect" style="width:100%;"><option>Loading videos...</option></select>
+            </div>
+            <div style="width:120px;"><div style="font-size:0.7rem; color:#aaa;">Target (sec)</div>
+                <input type="number" id="targetSec" placeholder="30" value="30" style="width:100%;">
+            </div>
+            <div style="width:100px;"><div style="font-size:0.7rem; color:#aaa;">Clip (sec)</div>
+                <input type="number" id="summaryClipSec" placeholder="2" value="2" style="width:100%;">
+            </div>
+            <div style="align-self:flex-end;"><button id="summaryBtn" class="primary"><i class="fas fa-magic"></i> Generate Summary</button></div>
+        </div>
+        <div id="summaryStatus" class="help-text"></div>
+        <div id="summaryResult" class="empty-state">Select a video and click Generate.</div>
+    </div>
+
+    <!-- ========== Face Swap Section (NEW) ========== -->
+    <div style="padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
+        <h3><i class="fas fa-exchange-alt"></i> Face Swap – Photo to Video</h3>
+        <p>Select a video and upload a face photo. The face will be swapped onto the video.</p>
+        <div class="input-group" style="flex-wrap: wrap;">
+            <div style="flex:2; min-width:150px;"><div style="font-size:0.7rem; color:#aaa;">Video file</div>
+                <select id="faceSwapVideoSelect" style="width:100%;"><option>Loading videos...</option></select>
+            </div>
+            <input type="file" id="photoInput" accept="image/jpeg,image/png,image/jpg" style="display: none;">
+            <button id="selectPhotoBtn" class="primary"><i class="fas fa-image"></i> Select Photo</button>
+            <span id="photoName" style="margin-left: 0.5rem; color: #aaa;">No photo chosen</span>
+            <div><button id="startSwapBtn" class="primary"><i class="fas fa-play"></i> Start Face Swap</button></div>
+        </div>
+        <div id="swapStatus" class="help-text"></div>
+        <div id="swapResult" class="empty-state">Select a video, choose a photo, then click Start.</div>
+    </div>
+</div>
+
+<script>
+// ========== Helper Functions (in case app.js not loaded) ==========
+function escapeHtml(str) {
+    if (!str) return '';
+    return str.replace(/[&<>]/g, function(m) {
+        if (m === '&') return '&amp;';
+        if (m === '<') return '&lt;';
+        if (m === '>') return '&gt;';
+        return m;
+    });
+}
+function showToast(msg, isErr) {
+    if (typeof window.showToast === 'function') window.showToast(msg, isErr);
+    else alert((isErr ? 'Error: ' : '') + msg);
+}
+
+// ========== Load videos for all three dropdowns ==========
+async function loadAllVideos() {
+    try {
+        const resp = await fetch('/clipper/list_videos');
+        const videos = await resp.json();
+        const selects = ['randomVideoSelect', 'summaryVideoSelect', 'faceSwapVideoSelect'];
+        selects.forEach(id => {
+            const sel = document.getElementById(id);
+            if (!sel) return;
+            sel.innerHTML = '<option value="">Select a video</option>';
+            if (videos.length === 0) {
+                sel.innerHTML = '<option value="">No videos found</option>';
+            } else {
+                videos.forEach(v => {
+                    const opt = document.createElement('option');
+                    opt.value = v.name;
+                    opt.textContent = v.name;
+                    sel.appendChild(opt);
+                });
+            }
+        });
+        console.log('Videos loaded for all clipper sections');
+    } catch (err) {
+        console.error('Load videos error:', err);
+        showToast('Failed to load videos', true);
+    }
+}
+loadAllVideos();
+
+// ========== Random Clips (existing) ==========
+let randomTaskId = null, randomTimer = null;
+document.getElementById('randomBtn').onclick = async () => {
+    const video = document.getElementById('randomVideoSelect').value;
+    if (!video) { alert('Select a video'); return; }
+    const seg = parseInt(document.getElementById('segmentSec').value);
+    const clip = parseInt(document.getElementById('randomClipSec').value);
+    if (isNaN(seg) || seg < 1) { alert('Segment duration invalid'); return; }
+    if (isNaN(clip) || clip < 1) { alert('Clip duration invalid'); return; }
+    if (clip > seg) { alert('Clip cannot be longer than segment'); return; }
+    const body = `video_file=${encodeURIComponent(video)}&segment_duration=${seg}&clip_duration=${clip}`;
+    const resp = await fetch('/clipper/random', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body });
+    const data = await resp.json();
+    if (data.error) { alert(data.error); return; }
+    randomTaskId = data.task_id;
+    const st = document.getElementById('randomStatus'), res = document.getElementById('randomResult');
+    st.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Processing...';
+    res.innerHTML = '<div class="empty-state">Please wait...</div>';
+    if (randomTimer) clearInterval(randomTimer);
+    randomTimer = setInterval(async () => {
+        const prog = await fetch(`/progress/${randomTaskId}`);
+        const t = await prog.json();
+        if (t.status === 'done') {
+            clearInterval(randomTimer);
+            st.innerHTML = `✅ Done! <a href="/download/${t.output_file}" target="_blank">Download</a>`;
+            res.innerHTML = `<div class="empty-state">✅ Ready: <a href="/download/${t.output_file}">${t.output_file}</a></div>`;
+        } else if (t.status === 'error') {
+            clearInterval(randomTimer);
+            st.innerHTML = `❌ Error: ${t.error_msg}`;
+            res.innerHTML = '<div class="empty-state">Failed.</div>';
+        } else {
+            st.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${t.status} (${t.progress||0}%)`;
+        }
+    }, 2000);
+};
+
+// ========== AI Summarizer (existing) ==========
+let summaryTaskId = null, summaryTimer = null;
+document.getElementById('summaryBtn').onclick = async () => {
+    const video = document.getElementById('summaryVideoSelect').value;
+    if (!video) { alert('Select a video'); return; }
+    const target = parseInt(document.getElementById('targetSec').value);
+    const clip = parseInt(document.getElementById('summaryClipSec').value);
+    if (isNaN(target) || target < 1) { alert('Target duration invalid'); return; }
+    if (isNaN(clip) || clip < 1) { alert('Clip length invalid'); return; }
+    const body = `video_file=${encodeURIComponent(video)}&target_duration=${target}&clip_duration=${clip}`;
+    const resp = await fetch('/clipper/summarize', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body });
+    const data = await resp.json();
+    if (data.error) { alert(data.error); return; }
+    summaryTaskId = data.task_id;
+    const st = document.getElementById('summaryStatus'), res = document.getElementById('summaryResult');
+    st.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Processing...';
+    res.innerHTML = '<div class="empty-state">Please wait...</div>';
+    if (summaryTimer) clearInterval(summaryTimer);
+    summaryTimer = setInterval(async () => {
+        const prog = await fetch(`/progress/${summaryTaskId}`);
+        const t = await prog.json();
+        if (t.status === 'done') {
+            clearInterval(summaryTimer);
+            st.innerHTML = `✅ Done! <a href="/download/${t.output_file}" target="_blank">Download</a>`;
+            res.innerHTML = `<div class="empty-state">✅ Ready: <a href="/download/${t.output_file}">${t.output_file}</a></div>`;
+        } else if (t.status === 'error') {
+            clearInterval(summaryTimer);
+            st.innerHTML = `❌ Error: ${t.error_msg}`;
+            res.innerHTML = '<div class="empty-state">Failed.</div>';
+        } else {
+            st.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${t.status} (${t.progress||0}%)`;
+        }
+    }, 2000);
+};
+
+// ========== Face Swap (new) ==========
+let swapTaskId = null, swapTimer = null;
+const startSwapBtn = document.getElementById('startSwapBtn');
+const faceSwapVideoSelect = document.getElementById('faceSwapVideoSelect');
+const photoInput = document.getElementById('photoInput');
+const selectPhotoBtn = document.getElementById('selectPhotoBtn');
+const photoNameSpan = document.getElementById('photoName');
+const swapStatus = document.getElementById('swapStatus');
+const swapResult = document.getElementById('swapResult');
+let selectedPhoto = null;
+
+selectPhotoBtn.onclick = () => photoInput.click();
+photoInput.onchange = () => {
+    if (photoInput.files.length > 0) {
+        selectedPhoto = photoInput.files[0];
+        photoNameSpan.textContent = selectedPhoto.name;
+    } else {
+        selectedPhoto = null;
+        photoNameSpan.textContent = 'No photo chosen';
+    }
+};
+
+startSwapBtn.onclick = async () => {
+    const video = faceSwapVideoSelect.value;
+    if (!video) { showToast('Select a video', true); return; }
+    if (!selectedPhoto) { showToast('Select a photo', true); return; }
+    const formData = new FormData();
+    formData.append('video_path', video);
+    formData.append('photo', selectedPhoto);
+    try {
+        const resp = await fetch('/face_swap/start', { method: 'POST', body: formData });
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+        swapTaskId = data.task_id;
+        swapStatus.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Face swap started (may take several minutes)...';
+        swapResult.innerHTML = '<div class="empty-state">Processing...</div>';
+        if (swapTimer) clearInterval(swapTimer);
+        swapTimer = setInterval(async () => {
+            const prog = await fetch(`/progress/${swapTaskId}`);
+            const t = await prog.json();
+            if (t.status === 'done') {
+                clearInterval(swapTimer);
+                swapStatus.innerHTML = `✅ Done! <a href="/download/${t.output_file}" target="_blank">Download swapped video</a>`;
+                swapResult.innerHTML = `<div class="empty-state">✅ Result ready: <a href="/download/${t.output_file}">${t.output_file}</a></div>`;
+            } else if (t.status === 'error') {
+                clearInterval(swapTimer);
+                swapStatus.innerHTML = `❌ Error: ${t.error_msg}`;
+                swapResult.innerHTML = '<div class="empty-state">Face swap failed.</div>';
+            } else {
+                swapStatus.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${t.status} (${t.progress || 0}%)`;
+            }
+        }, 2000);
+    } catch (err) { showToast(err.message, true); }
+};
+</script>
