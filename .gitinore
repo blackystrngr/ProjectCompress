@@ -1,0 +1,120 @@
+# ============================================================
+# SECRETS — never commit these
+# ============================================================
+# Telegram
+telegram_session.session
+telegram_session.session-journal
+telegram_session.session-wal
+telegram_session.session-shm
+telegram_creds.json
+
+# Google Drive / OAuth
+token.json
+token.json.bak
+token_*.json
+token_*.json.bak
+credentials.json
+client_secret*.json
+service_account*.json
+
+# Cookies
+cookies.txt
+cookies.txt.bak
+*.cookies
+
+# Environment
+.env
+.password
+.env.*
+!.env.example
+
+# Runtime settings
+settings.json
+settings.json.bak
+
+# ============================================================
+# RUNTIME DATA — not for the repo
+# ============================================================
+tasks/
+downloads/
+proxy_cache/
+temp/
+tmp/
+uploads/
+logs/
+*.log
+
+# ============================================================
+# PYTHON
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+.python-version
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.cache
+
+# Type checkers
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.ruff_cache/
+
+# ============================================================
+# EDITORS & OS
+# ============================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+*.sublime-*
+
+# ============================================================
+# JUPYTER
+# ============================================================
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ============================================================
+# MISC
+# ============================================================
+*.bak
+*.tmp
+*.orig
+*.rej
+.cache/
