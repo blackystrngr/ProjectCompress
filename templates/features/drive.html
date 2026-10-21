@@ -22,6 +22,15 @@
             </button>
             <input type="file" id="driveUploadInput" multiple style="display:none;">
             <button id="refreshDriveBtn"><i class="fas fa-sync-alt"></i> Refresh</button>
+            <label title="Colab skips sources whose output already exists in any account"
+                   style="display:flex; align-items:center; gap:0.4rem; font-size:0.8rem; cursor:pointer;
+                          padding:0.3rem 0.7rem; background:rgba(30,40,60,0.7); border-radius:1rem;
+                          border:1px solid #2a3248; user-select:none;">
+                <input type="checkbox" id="coordinatorToggle" checked
+                       style="accent-color:#5f8fe0; cursor:pointer;">
+                <i class="fas fa-shield-halved" id="coordinatorIcon" style="color:#5f8fe0;"></i>
+                <span>Cross-drive dedup</span>
+            </label>
         </div>
     </div>
 
@@ -44,7 +53,6 @@
         </div>
     </div>
 
-    <!-- Upload / batch progress banner -->
     <div id="driveUploadStatus" style="display:none; margin-bottom:1rem;
          padding:0.7rem 1rem; background:rgba(20,25,40,0.75); border-radius:1rem;
          border:1px solid #2a3248; font-size:0.85rem;">
@@ -97,6 +105,16 @@ async function loadDriveAccounts() {
             sel.appendChild(opt);
         });
 
+        // Coordinator toggle state from server
+        const toggle = document.getElementById('coordinatorToggle');
+        const icon = document.getElementById('coordinatorIcon');
+        if (toggle) {
+            toggle.checked = data.coordinator_enabled !== false;
+            if (icon) {
+                icon.style.color = toggle.checked ? '#5f8fe0' : '#8a9bc0';
+            }
+        }
+
         const shared = window.selectedDriveAccount;
         if (shared && accounts.find(a => a.name === shared)) {
             sel.value = shared;
@@ -128,47 +146,65 @@ window.addEventListener('driveAccountChanged', (e) => {
 });
 
 // ============================================================
+// Coordinator toggle
+// ============================================================
+document.getElementById('coordinatorToggle').addEventListener('change', async (e) => {
+    const enabled = e.target.checked;
+    const icon = document.getElementById('coordinatorIcon');
+    if (icon) icon.style.color = enabled ? '#5f8fe0' : '#8a9bc0';
+
+    try {
+        const resp = await fetch('/drive/coordinator', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: `enabled=${enabled}`,
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+            showToast(data.enabled
+                ? 'Cross-drive dedup enabled'
+                : 'Cross-drive dedup disabled — Colab will re-process duplicates');
+        } else {
+            throw new Error(data.error || 'Failed');
+        }
+    } catch (err) {
+        // Revert checkbox on failure
+        e.target.checked = !enabled;
+        if (icon) icon.style.color = e.target.checked ? '#5f8fe0' : '#8a9bc0';
+        showToast(err.message, true);
+    }
+});
+
+// ============================================================
 // Load folder
 // ============================================================
 async function loadDriveFolder(folderId) {
     const listEl = document.getElementById('driveFileList');
     listEl.innerHTML = '<div class="empty-state">'
         + '<i class="fas fa-spinner fa-pulse"></i> Loading...</div>';
-
     try {
         const params = new URLSearchParams();
         if (folderId) params.append('folder_id', folderId);
         if (driveCurrentAccount) params.append('account', driveCurrentAccount);
-        const url = '/drive/list?' + params.toString();
-
-        const resp = await fetch(url, {cache: 'no-store'});
+        const resp = await fetch('/drive/list?' + params.toString(),
+                                 {cache: 'no-store'});
         const data = await resp.json();
         if (data.error) throw new Error(data.error);
-
         driveCurrentFolderId = data.current_folder_id;
         driveParentId = data.parent_id;
         driveIsRoot = data.is_root;
-        if (data.colab_folder_id) {
-            driveColabFolderId = data.colab_folder_id;
-        }
-
+        if (data.colab_folder_id) driveColabFolderId = data.colab_folder_id;
         const emailEl = document.getElementById('driveAccountEmail');
-        if (emailEl) {
-            emailEl.textContent = data.account_email ? `(${data.account_email})` : '';
-        }
-
+        if (emailEl) emailEl.textContent = data.account_email ? `(${data.account_email})` : '';
         driveFiles = [...(data.folders || []), ...(data.files || [])];
-
         renderDriveBreadcrumbs(data.breadcrumbs);
         renderDriveFileList();
         updateDriveUpButton();
-
         selectedDriveIds.clear();
         updateDriveSelectionUI();
     } catch (err) {
         listEl.innerHTML = `<div class="empty-state" style="color:#ff8a8a;">
-            Error: ${escapeHtml(err.message)}
-        </div>`;
+            Error: ${escapeHtml(err.message)}</div>`;
     }
 }
 
@@ -217,12 +253,10 @@ function renderDriveFileList() {
         listEl.innerHTML = '<div class="empty-state">Empty folder.</div>';
         return;
     }
-
     let html = '';
     driveFiles.forEach(item => {
         const isSel = selectedDriveIds.has(item.id);
         const isFolder = item.is_folder;
-
         if (isFolder) {
             html += `<div class="file-card drive-folder-card" data-id="${item.id}" data-folder="true">
                 <div class="file-name" style="cursor:pointer;"
@@ -242,8 +276,7 @@ function renderDriveFileList() {
                 <input type="checkbox" class="file-checkbox drive-checkbox"
                        data-id="${item.id}" ${isSel ? 'checked' : ''}>
                 <div class="file-name">
-                    <i class="fas fa-file"></i>
-                    ${escapeHtml(item.name)}
+                    <i class="fas fa-file"></i> ${escapeHtml(item.name)}
                 </div>
                 <div class="file-size">${escapeHtml(item.size_str || '—')}</div>
                 <div class="file-actions">
@@ -259,7 +292,6 @@ function renderDriveFileList() {
             </div>`;
         }
     });
-
     listEl.innerHTML = html;
     attachDriveEvents();
     updateDriveSelectionUI();
@@ -269,7 +301,6 @@ function attachDriveEvents() {
     document.querySelectorAll('.drive-open-folder').forEach(btn => {
         btn.onclick = () => loadDriveFolder(btn.dataset.id);
     });
-
     document.querySelectorAll('.drive-checkbox').forEach(cb => {
         cb.onchange = () => {
             const id = cb.dataset.id;
@@ -278,7 +309,6 @@ function attachDriveEvents() {
             updateDriveSelectionUI();
         };
     });
-
     document.querySelectorAll('.drive-download-single').forEach(btn => {
         btn.onclick = async () => {
             const id = btn.dataset.id;
@@ -288,15 +318,13 @@ function attachDriveEvents() {
             try {
                 await startDriveDownload(id, name);
                 showToast(`Download started: ${name}`);
-            } catch (err) {
-                showToast(err.message, true);
-            } finally {
+            } catch (err) { showToast(err.message, true); }
+            finally {
                 btn.disabled = false;
                 btn.innerHTML = '<i class="fas fa-download"></i> Download';
             }
         };
     });
-
     document.querySelectorAll('.drive-delete').forEach(btn => {
         btn.onclick = async () => {
             if (!confirm('Move to trash?')) return;
@@ -331,15 +359,10 @@ function updateDriveSelectionUI() {
     });
 }
 
-// ============================================================
-// Account switch
-// ============================================================
 document.getElementById('driveAccountSelect').addEventListener('change', (e) => {
     const name = e.target.value;
     driveCurrentAccount = name;
-    if (typeof window.setDriveAccount === 'function') {
-        window.setDriveAccount(name);
-    }
+    if (typeof window.setDriveAccount === 'function') window.setDriveAccount(name);
     driveCurrentFolderId = 'root';
     driveParentId = null;
     driveIsRoot = true;
@@ -348,69 +371,51 @@ document.getElementById('driveAccountSelect').addEventListener('change', (e) => 
     loadDriveFolder('root');
 });
 
-// ============================================================
-// Single-file download helper (used by batch)
-// ============================================================
 async function startDriveDownload(fileId, fileName) {
     const body = new URLSearchParams();
     body.append('file_id', fileId);
     body.append('file_name', fileName);
     if (driveCurrentAccount) body.append('account', driveCurrentAccount);
-
     const resp = await fetch('/drive/download_to_server', {
         method: 'POST',
         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-        body: body
+        body: body,
     });
     const data = await resp.json();
-    if (!resp.ok || data.error) {
-        throw new Error(data.error || `HTTP ${resp.status}`);
-    }
+    if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
     return data.task_id;
 }
 
-// ============================================================
-// Buttons
-// ============================================================
 document.getElementById('driveUpBtn').onclick = () => {
     if (driveParentId) loadDriveFolder(driveParentId);
     else if (!driveIsRoot) loadDriveFolder('root');
 };
-
 document.getElementById('driveColabBtn').onclick = () => {
     if (driveColabFolderId) loadDriveFolder(driveColabFolderId);
     else loadDriveFolder('root');
 };
-
 document.getElementById('refreshDriveBtn').onclick = () => {
     loadDriveFolder(driveCurrentFolderId || 'root');
 };
-
 document.getElementById('deselectAllDriveBtn').onclick = () => {
     selectedDriveIds.clear();
     updateDriveSelectionUI();
     renderDriveFileList();
 };
 
-// -------- Download Selected (batch) --------
 document.getElementById('downloadSelectedDriveBtn').onclick = async () => {
     if (selectedDriveIds.size === 0) return;
-
-    // Collect only files (skip folders)
     const targets = [];
     for (const id of selectedDriveIds) {
         const file = driveFiles.find(f => f.id === id && !f.is_folder);
         if (file) targets.push(file);
     }
-
     if (targets.length === 0) {
         showToast('No files selected (folders ignored)', true);
         return;
     }
-
     const btn = document.getElementById('downloadSelectedDriveBtn');
     btn.disabled = true;
-
     let started = 0, failed = 0;
     for (let i = 0; i < targets.length; i++) {
         const f = targets[i];
@@ -418,68 +423,50 @@ document.getElementById('downloadSelectedDriveBtn').onclick = async () => {
         try {
             await startDriveDownload(f.id, f.name);
             started++;
-        } catch (e) {
-            failed++;
-            console.error('Download failed for', f.name, e);
-        }
+        } catch (e) { failed++; }
     }
-
     btn.disabled = false;
     btn.innerHTML = '<i class="fas fa-download"></i> Download Selected';
-
     if (failed) showToast(`Started ${started} download(s), ${failed} failed`, true);
-    else showToast(`Started ${started} download(s)`, false);
-
+    else showToast(`Started ${started} download(s)`);
     if (typeof fetchTasks === 'function') fetchTasks();
 };
 
-// -------- Delete Selected (batch) --------
 document.getElementById('deleteSelectedDriveBtn').onclick = async () => {
     if (selectedDriveIds.size === 0) return;
     if (!confirm(`Move ${selectedDriveIds.size} item(s) to trash?`)) return;
-
     const btn = document.getElementById('deleteSelectedDriveBtn');
     btn.disabled = true;
     btn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Deleting…';
-
     let ok = 0, failed = 0;
     for (const id of selectedDriveIds) {
         const url = `/drive/delete/${id}` +
             (driveCurrentAccount ? `?account=${encodeURIComponent(driveCurrentAccount)}` : '');
         try {
             const resp = await fetch(url, {method: 'DELETE'});
-            if (resp.ok) ok++;
-            else failed++;
+            if (resp.ok) ok++; else failed++;
         } catch (e) { failed++; }
     }
-
     btn.disabled = false;
     btn.innerHTML = '<i class="fas fa-trash-alt"></i> Delete Selected';
-
     if (failed) showToast(`Deleted ${ok}, ${failed} failed`, true);
-    else showToast(`Moved ${ok} item(s) to trash`, false);
-
+    else showToast(`Moved ${ok} item(s) to trash`);
     selectedDriveIds.clear();
     loadDriveFolder(driveCurrentFolderId);
 };
 
 // ============================================================
-// Multi-file upload — always targets Colab_Processing
+// Multi-file upload
 // ============================================================
 const uploadInput = document.getElementById('driveUploadInput');
 document.getElementById('driveUploadBtn').onclick = () => uploadInput.click();
 
 uploadInput.onchange = async () => {
     if (!uploadInput.files.length) return;
-
     const files = Array.from(uploadInput.files);
     const total = files.length;
-
-    // Snapshot the account so mid-batch account switching doesn't
-    // send later files to a different Drive.
     const targetAccount = driveCurrentAccount;
 
-    // Set up the progress banner
     const statusEl = document.getElementById('driveUploadStatus');
     const textEl = document.getElementById('driveUploadText');
     const pctEl = document.getElementById('driveUploadPct');
@@ -490,19 +477,15 @@ uploadInput.onchange = async () => {
     statusEl.style.display = 'block';
     spinnerEl.style.display = 'inline-block';
 
-    let succeeded = 0;
-    let failed = 0;
+    let succeeded = 0, failed = 0;
     const failures = [];
 
     for (let i = 0; i < files.length; i++) {
         const file = files[i];
-        const fileIndex = i + 1;
-
-        textEl.textContent = `Uploading ${fileIndex}/${total}: ${file.name}`;
+        textEl.textContent = `Uploading ${i+1}/${total}: ${file.name}`;
         pctEl.textContent = '0%';
         barEl.style.width = '0%';
         detailEl.textContent = '';
-
         try {
             await uploadOneDriveFile(file, targetAccount, (pct) => {
                 pctEl.textContent = `${pct}%`;
@@ -512,17 +495,13 @@ uploadInput.onchange = async () => {
         } catch (err) {
             failed++;
             failures.push(`${file.name}: ${err.message}`);
-            console.error('Upload failed for', file.name, err);
         }
-
-        // Aggregate progress after each file
         const overallPct = Math.round(((i + 1) / total) * 100);
         barEl.style.width = `${overallPct}%`;
         pctEl.textContent = `${overallPct}%`;
     }
 
     spinnerEl.style.display = 'none';
-
     if (failed === 0) {
         textEl.textContent = `✅ Uploaded ${succeeded} file(s) to Colab_Processing`;
         detailEl.textContent = '';
@@ -536,39 +515,24 @@ uploadInput.onchange = async () => {
         setTimeout(() => { statusEl.style.display = 'none'; }, 6000);
     }
 
-    // Refresh the current view (in case we're inside Colab_Processing)
     loadDriveFolder(driveCurrentFolderId);
-
-    // Clear the input so the same files can be selected again
     uploadInput.value = '';
 };
 
-/**
- * Upload one file to Colab_Processing via /drive/upload.
- * onProgress(pct) called repeatedly with 0..100.
- */
 async function uploadOneDriveFile(file, account, onProgress) {
     return new Promise((resolve, reject) => {
         const formData = new FormData();
         formData.append('file', file);
         if (account) formData.append('account', account);
-
         fetch('/drive/upload', {method: 'POST', body: formData})
             .then(async (resp) => {
                 const data = await resp.json();
-                if (!resp.ok || data.error) {
-                    throw new Error(data.error || `HTTP ${resp.status}`);
-                }
-
+                if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
                 const taskId = data.task_id;
-                let lastStatus = null;
-
-                // Poll progress until done or error
                 const interval = setInterval(async () => {
                     try {
                         const r = await fetch(`/progress/${taskId}`);
                         const t = await r.json();
-
                         if (t.status === 'done') {
                             clearInterval(interval);
                             if (onProgress) onProgress(100);
@@ -579,12 +543,8 @@ async function uploadOneDriveFile(file, account, onProgress) {
                         } else {
                             const pct = t.upload_progress || 0;
                             if (onProgress) onProgress(pct);
-                            lastStatus = t.status;
                         }
-                    } catch (e) {
-                        // Network hiccup — keep polling
-                        console.warn('progress poll error', e);
-                    }
+                    } catch (e) { /* silent */ }
                 }, 500);
             })
             .catch(reject);
