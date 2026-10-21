@@ -2,9 +2,9 @@
 import os
 import glob
 import json
+import time
 import uuid
 import threading
-import time
 import logging
 from flask import request, jsonify
 from werkzeug.utils import secure_filename
@@ -24,26 +24,14 @@ COLAB_OUTPUT_SUBFOLDER = "Processed"
 
 # ============================================================
 # Thread-local Drive service cache
-# ------------------------------------------------------------
-# googleapiclient's underlying httplib2.Http is NOT thread-safe.
-# Two threads sharing one service corrupt the internal socket pool,
-# which manifests as `free(): corrupted unsorted chunks` crashes or
-# segfaults inside OpenSSL.
-#
-# Fix: every thread gets its own service per account. No shared
-# mutable HTTP state → no corruption, no locks needed, and requests
-# run fully in parallel.
 # ============================================================
 _thread_local = threading.local()
 
-# Bumped when a token file changes so stale per-thread services get
-# rebuilt on next use. See /upload_token in app.py.
 _service_generation = 0
 _generation_lock = threading.Lock()
 
 
 def _bump_service_generation():
-    """Call this after uploading a new token to force all threads to rebuild."""
     global _service_generation
     with _generation_lock:
         _service_generation += 1
@@ -54,15 +42,41 @@ def _current_generation():
         return _service_generation
 
 
-# Only credential refresh needs a lock: two threads refreshing the same
-# token file simultaneously would race on the file write.
 _cred_lock = threading.Lock()
 
-# Shared metadata caches — just scalars, guarded by _cache_lock on write.
 _email_cache = {}
 _quota_cache = {}
 _colab_folder_cache = {}
 _cache_lock = threading.Lock()
+
+
+# ============================================================
+# Coordinator: processed list + claims
+# ============================================================
+_processed_cache = {'names': set(), 'ts': 0, 'lock': threading.Lock()}
+_processed_cache_ttl = 30
+
+_claims = {}
+_claims_lock = threading.Lock()
+_claim_ttl = 4 * 3600
+_min_output_size = 1024
+
+
+def _purge_stale_claims():
+    now = time.time()
+    with _claims_lock:
+        stale = [k for k, v in _claims.items() if now - v['ts'] > _claim_ttl]
+        for k in stale:
+            del _claims[k]
+
+
+def _snapshot_claims():
+    now = time.time()
+    with _claims_lock:
+        return {
+            k: {'account': v['account'], 'age_sec': int(now - v['ts'])}
+            for k, v in _claims.items()
+        }
 
 
 # ============================================================
@@ -100,7 +114,6 @@ def _token_file_valid(path):
 
 
 def _load_credentials(token_path):
-    """Thread-safe token load + refresh (serialized by _cred_lock)."""
     with _cred_lock:
         creds = Credentials.from_authorized_user_file(
             token_path, ['https://www.googleapis.com/auth/drive'])
@@ -119,20 +132,14 @@ def _load_credentials(token_path):
 
 
 def get_drive_service(account='default'):
-    """
-    Return a Drive service for THIS THREAD. Each thread builds its own
-    service, so concurrent uploads/downloads never contend.
-    """
+    """Return a per-thread Drive service for the account."""
     if not hasattr(_thread_local, 'services'):
         _thread_local.services = {}
         _thread_local.generation = -1
 
-    current_gen = _current_generation()
-
-    # Token was updated → rebuild cached services for this thread
-    if _thread_local.generation != current_gen:
+    if _thread_local.generation != _current_generation():
         _thread_local.services.clear()
-        _thread_local.generation = current_gen
+        _thread_local.generation = _current_generation()
 
     if account in _thread_local.services:
         return _thread_local.services[account]
@@ -150,7 +157,6 @@ def get_drive_service(account='default'):
     service = build('drive', 'v3', credentials=creds, cache_discovery=False)
     _thread_local.services[account] = service
 
-    # Populate shared metadata cache (only needs to happen once ever)
     try:
         about = service.about().get(fields='user,storageQuota').execute()
         email = about.get('user', {}).get('emailAddress', 'unknown')
@@ -164,8 +170,7 @@ def get_drive_service(account='default'):
     except Exception as e:
         logger.warning(f"About fetch failed for {account}: {e}")
 
-    logger.info(f"Drive service built for thread {threading.get_ident()} "
-                f"account '{account}'")
+    logger.info(f"Drive service built (thread={threading.get_ident()}, account='{account}')")
     return service
 
 
@@ -286,11 +291,7 @@ def _list_folder(service, folder_id):
         except HttpError:
             pass
 
-    return {
-        'folders': folders,
-        'files': files,
-        'parent_id': parent_id,
-    }
+    return {'folders': folders, 'files': files, 'parent_id': parent_id}
 
 
 def _get_unique_filename(filename):
@@ -351,8 +352,59 @@ def get_colab_folder_id(account='default'):
         return None
 
 
+def get_colab_output_folder_id(account='default'):
+    try:
+        svc = get_drive_service(account)
+        root_id = _find_or_create_folder(svc, COLAB_FOLDER_NAME)
+        if not root_id:
+            return None
+        return _find_or_create_folder(svc, COLAB_OUTPUT_SUBFOLDER, root_id)
+    except Exception as e:
+        logger.error(f"Output folder resolve failed for {account}: {e}")
+        return None
+
+
+def get_all_processed_outputs(force_refresh=False):
+    with _processed_cache['lock']:
+        now = time.time()
+        if (not force_refresh
+                and _processed_cache['names']
+                and now - _processed_cache['ts'] < _processed_cache_ttl):
+            return _processed_cache['names']
+
+    names = set()
+    for account in discover_accounts().keys():
+        try:
+            svc = get_drive_service(account)
+            output_id = get_colab_output_folder_id(account)
+            if not output_id:
+                continue
+            page_token = None
+            while True:
+                res = svc.files().list(
+                    q=f"'{output_id}' in parents and trashed = false",
+                    fields="nextPageToken, files(name,size)",
+                    pageSize=200, pageToken=page_token,
+                ).execute()
+                for f in res.get('files', []):
+                    if int(f.get('size', 0) or 0) >= _min_output_size:
+                        n = f.get('name', '')
+                        if n:
+                            names.add(n)
+                page_token = res.get('nextPageToken')
+                if not page_token:
+                    break
+        except Exception as e:
+            logger.warning(f"processed scan failed for {account}: {e}")
+
+    with _processed_cache['lock']:
+        _processed_cache['names'] = names
+        _processed_cache['ts'] = time.time()
+    return names
+
+
 # ============================================================
-# Colab upload job (runs in its own thread, own service)
+# Colab upload job
 # ============================================================
 def process_colab(task_id, input_path, original_filename, account):
     logger.info(f"Colab task {task_id}: input={input_path} account={account}")
@@ -460,7 +512,6 @@ def register_routes(app):
             if limit > 0:
                 entry['free_bytes'] = max(0, limit - usage)
             out.append(entry)
-
         return jsonify({
             'accounts': out,
             'default': out[0]['name'] if out else None,
@@ -481,8 +532,7 @@ def register_routes(app):
             if folder_id != MY_DRIVE_ROOT:
                 try:
                     meta = service.files().get(
-                        fileId=folder_id,
-                        fields='id,name,mimeType'
+                        fileId=folder_id, fields='id,name,mimeType'
                     ).execute()
                 except HttpError as e:
                     if e.resp.status == 404:
@@ -563,7 +613,6 @@ def register_routes(app):
                             if t:
                                 t['download_progress'] = pct
                                 save_task(task_id, t)
-
                 final_path = os.path.join(UPLOAD_FOLDER, final_name)
                 os.rename(temp_path, final_path)
                 task = load_task(task_id)
@@ -619,8 +668,7 @@ def register_routes(app):
         target_folder = get_colab_folder_id(account)
         if not target_folder:
             return jsonify({'error':
-                f'Cannot resolve/create Colab_Processing for '
-                f'{account}'}), 500
+                f'Cannot resolve/create Colab_Processing for {account}'}), 500
 
         temp_path = os.path.join(UPLOAD_FOLDER,
                                   f"_upload_{uuid.uuid4().hex}_{safe_name}")
@@ -662,7 +710,6 @@ def register_routes(app):
                         if t:
                             t['upload_progress'] = pct
                             save_task(task_id, t)
-
                 task = load_task(task_id)
                 task['status'] = 'done'
                 task['upload_progress'] = 100
@@ -734,3 +781,73 @@ def register_routes(app):
         except Exception as e:
             logger.exception("Colab process error")
             return jsonify({'error': str(e)}), 500
+
+    # ---- Coordinator endpoints ----
+    @app.route('/processed_list', methods=['GET'])
+    def processed_list():
+        token = request.headers.get('X-Upload-Token', '')
+        expected = os.environ.get('COOKIE_UPLOAD_TOKEN', 'whyyouleftme')
+        if not token or token != expected:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        _purge_stale_claims()
+        force = request.args.get('force', '0') == '1'
+        names = get_all_processed_outputs(force_refresh=force)
+        return jsonify({
+            'processed': sorted(names),
+            'in_progress': _snapshot_claims(),
+            'generated_at': time.time(),
+        })
+
+    @app.route('/mark_processing/<path:video_name>', methods=['POST'])
+    def mark_processing(video_name):
+        token = request.headers.get('X-Upload-Token', '')
+        expected = os.environ.get('COOKIE_UPLOAD_TOKEN', 'whyyouleftme')
+        if not token or token != expected:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        account = request.form.get('account', 'unknown')
+        expected_output = request.form.get('expected_output', '')
+
+        _purge_stale_claims()
+        now = time.time()
+
+        if expected_output:
+            processed = get_all_processed_outputs()
+            if expected_output in processed:
+                return jsonify({'status': 'already_done', 'output': expected_output})
+
+        with _claims_lock:
+            existing = _claims.get(video_name)
+            if existing:
+                return jsonify({
+                    'status': 'in_progress',
+                    'by': existing['account'],
+                    'age_sec': int(now - existing['ts']),
+                })
+            _claims[video_name] = {'account': account, 'ts': now}
+            return jsonify({'status': 'ok', 'claimed_by': account})
+
+    @app.route('/mark_done/<path:video_name>', methods=['POST'])
+    def mark_done(video_name):
+        token = request.headers.get('X-Upload-Token', '')
+        expected = os.environ.get('COOKIE_UPLOAD_TOKEN', 'whyyouleftme')
+        if not token or token != expected:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        with _claims_lock:
+            _claims.pop(video_name, None)
+        with _processed_cache['lock']:
+            _processed_cache['ts'] = 0
+        return jsonify({'status': 'ok'})
+
+    @app.route('/mark_failed/<path:video_name>', methods=['POST'])
+    def mark_failed(video_name):
+        token = request.headers.get('X-Upload-Token', '')
+        expected = os.environ.get('COOKIE_UPLOAD_TOKEN', 'whyyouleftme')
+        if not token or token != expected:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        with _claims_lock:
+            _claims.pop(video_name, None)
+        return jsonify({'status': 'ok'})
