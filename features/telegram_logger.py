@@ -2,10 +2,8 @@
 """
 Send logs + task lifecycle events to a Telegram channel.
 
-Config is read from settings.json (via features.settings) on startup
-and can be changed live via features.settings → reconfigure().
-
-Env vars act as fallbacks when settings.json has no value.
+Config is read from settings.json on startup and can be changed live
+via features.settings → reconfigure().
 """
 
 import os
@@ -21,7 +19,7 @@ import atexit
 from datetime import datetime
 from collections import OrderedDict
 
-from flask import jsonify, request          # ← THE FIX: was missing
+from flask import jsonify
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +38,7 @@ RETRY_DELAYS      = [5, 15, 60]
 
 # ---------- Mutable runtime config ----------
 TG_LOG_ENABLED   = False
-TG_LOG_CHANNEL   = ''
+TG_LOG_CHANNEL   = ''          # str (@username) OR int (channel ID)
 TG_LOG_BOT_TOKEN = ''
 TG_LOG_LEVEL     = 'WARNING'
 
@@ -52,10 +50,55 @@ _MAX_TRACKED_TASKS = 500
 
 
 # ============================================================
+# Channel normalization
+# ============================================================
+def _normalize_channel(ch) -> str | int:
+    """
+    Return either:
+      int   — for numeric channel IDs (supergroups/channels)
+      str   — '@username' for public channels
+      ''    — invalid/empty
+    """
+    if ch is None:
+        return ''
+
+    # Already an int (from settings.json stored as int)
+    if isinstance(ch, int):
+        return ch
+
+    ch = str(ch).strip().rstrip('/')
+    if not ch:
+        return ''
+
+    for prefix in ('https://t.me/', 'http://t.me/', 't.me/'):
+        if ch.lower().startswith(prefix):
+            ch = ch[len(prefix):]
+            break
+
+    if not ch:
+        return ''
+
+    # Private/numeric channel ID → MUST be int for bots
+    if ch.startswith('-'):
+        try:
+            return int(ch)
+        except ValueError:
+            logger.warning(f"Channel '{ch}' looks numeric but isn't a valid int")
+            return ch
+
+    # Invite link — cannot use directly
+    if ch.startswith('+'):
+        return ch
+
+    if not ch.startswith('@'):
+        ch = '@' + ch
+    return ch
+
+
+# ============================================================
 # Config loading
 # ============================================================
 def _load_config() -> dict:
-    """Read from settings.json first, fall back to env vars."""
     try:
         from .settings import get_effective_config
         cfg = get_effective_config()
@@ -68,55 +111,18 @@ def _load_config() -> dict:
     except Exception as e:
         logger.warning(f"telegram_logger: could not read settings: {e}")
         return {
-            'enabled':  os.environ.get('TG_LOG_ENABLED', 'false').lower() in
-                        ('1', 'true', 'yes', 'on'),
+            'enabled':  os.environ.get('TG_LOG_ENABLED', 'false').lower()
+                        in ('1', 'true', 'yes', 'on'),
             'channel':  _normalize_channel(os.environ.get('TG_LOG_CHANNEL', '')),
             'token':    os.environ.get('TG_LOG_BOT_TOKEN', '').strip(),
             'level':    os.environ.get('TG_LOG_LEVEL', 'WARNING').upper(),
         }
 
 
-def _normalize_channel(ch: str) -> str:
-    """
-    Accept all common formats and normalize to something Telethon accepts:
-      https://t.me/mychannel   →  @mychannel
-      http://t.me/mychannel    →  @mychannel
-      t.me/mychannel           →  @mychannel
-      mychannel                →  @mychannel
-      @mychannel               →  @mychannel    (unchanged)
-      -1001234567890           →  -1001234567890 (unchanged)
-      https://t.me/+abc123     →  +abc123       (invite links — see note below)
-    """
-    ch = (ch or '').strip().rstrip('/')
-    if not ch:
-        return ''
-
-    for prefix in ('https://t.me/', 'http://t.me/', 't.me/'):
-        if ch.lower().startswith(prefix):
-            ch = ch[len(prefix):]
-            break
-
-    if not ch:
-        return ''
-
-    # Private numeric channel ID
-    if ch.startswith('-'):
-        return ch
-
-    # Invite link (needs join first — can't send_message directly)
-    if ch.startswith('+'):
-        return ch
-
-    if not ch.startswith('@'):
-        ch = '@' + ch
-    return ch
-
-
 def is_enabled() -> bool:
     if not TG_LOG_ENABLED or not TG_LOG_CHANNEL:
         return False
-    if TG_LOG_CHANNEL.startswith('+'):
-        # invite links can't be used for send_message without joining first
+    if isinstance(TG_LOG_CHANNEL, str) and TG_LOG_CHANNEL.startswith('+'):
         return False
     return os.path.exists(TELEGRAM_CREDS_FILE)
 
@@ -134,7 +140,6 @@ def _strip_html(s: str) -> str:
 
 
 def notify(text: str, level: str = 'info'):
-    """Send an arbitrary message. No-op if disabled."""
     if _worker is None or not is_enabled():
         return
     emoji = {'info': 'ℹ️', 'success': '✅',
@@ -277,7 +282,20 @@ class _Worker:
             except Exception as e:
                 logger.warning(f"Telegram log send failed: "
                                f"{type(e).__name__}: {e}")
+                # FIX: close the client before dropping the reference
+                try:
+                    if self.client is not None:
+                        self.loop.run_until_complete(self._disconnect_quietly())
+                except Exception:
+                    pass
                 self.client = None
+
+    async def _disconnect_quietly(self):
+        try:
+            if self.client is not None and self.client.is_connected():
+                await self.client.disconnect()
+        except Exception:
+            pass
 
     async def _send(self, text: str):
         client = await self._ensure_client()
@@ -294,8 +312,18 @@ class _Worker:
                 raise
 
     async def _ensure_client(self):
+        # Reuse a healthy connection
         if self.client is not None and self.client.is_connected():
             return self.client
+
+        # FIX: Properly disconnect any stale client before opening a new one
+        if self.client is not None:
+            try:
+                if self.client.is_connected():
+                    await self.client.disconnect()
+            except Exception:
+                pass
+            self.client = None
 
         from telethon import TelegramClient
 
@@ -310,17 +338,20 @@ class _Worker:
         api_hash = creds['api_hash']
 
         if TG_LOG_BOT_TOKEN:
-            logger.info("Telegram logger connecting (bot mode)…")
-            client = TelegramClient(LOGGER_BOT_SESSION, api_id, api_hash)
+            # FIX: Bot auth is stateless — use in-memory session to
+            # completely eliminate "database is locked" errors.
+            logger.info("Telegram logger connecting (bot mode, in-memory session)…")
+            client = TelegramClient(':memory:', api_id, api_hash)
             await client.start(bot_token=TG_LOG_BOT_TOKEN)
         else:
+            # User mode needs persistence (login session)
             logger.info("Telegram logger connecting (user mode)…")
             client = TelegramClient(LOGGER_SESSION, api_id, api_hash)
             await client.start()
 
         me = await client.get_me()
         who = getattr(me, 'username', None) or getattr(me, 'first_name', '?')
-        logger.info(f"Telegram logger client connected as @{who} → {TG_LOG_CHANNEL}")
+        logger.info(f"Telegram logger connected as @{who} → {TG_LOG_CHANNEL}")
 
         self.client = client
         return client
@@ -351,7 +382,7 @@ class _Handler(logging.Handler):
 
 
 # ============================================================
-# Registration + live reconfiguration
+# Registration
 # ============================================================
 def _shutdown():
     if _worker is None:
@@ -364,7 +395,6 @@ def _shutdown():
 
 
 def register_logging(app=None):
-    """Initial registration (idempotent)."""
     global _worker, _handler
     if _worker is not None or _handler is not None:
         return
@@ -372,7 +402,6 @@ def register_logging(app=None):
 
 
 def reconfigure():
-    """Called by features.settings after a settings POST."""
     _apply_config(initial=False)
 
 
@@ -381,7 +410,7 @@ def _apply_config(initial: bool):
     global _worker, _handler
 
     cfg = _load_config()
-    token_changed = (cfg['token'] != TG_LOG_BOT_TOKEN)
+    token_changed   = (cfg['token']   != TG_LOG_BOT_TOKEN)
     channel_changed = (cfg['channel'] != TG_LOG_CHANNEL)
 
     TG_LOG_ENABLED   = cfg['enabled']
@@ -389,7 +418,7 @@ def _apply_config(initial: bool):
     TG_LOG_BOT_TOKEN = cfg['token']
     TG_LOG_LEVEL     = cfg['level'] or 'WARNING'
 
-    # Force client reconnect if token or channel changed
+    # Force client rebuild if token or channel changed
     if _worker is not None and (token_changed or channel_changed):
         _worker.client = None
 
@@ -434,63 +463,58 @@ def register_routes(app):
         if not is_enabled():
             reasons = []
             if not TG_LOG_ENABLED:
-                reasons.append('logging is disabled (enable it in Settings)')
+                reasons.append('logging disabled (enable in Settings)')
             if not TG_LOG_CHANNEL:
-                reasons.append('channel is not set')
-            elif TG_LOG_CHANNEL.startswith('+'):
+                reasons.append('channel not set')
+            elif isinstance(TG_LOG_CHANNEL, str) and TG_LOG_CHANNEL.startswith('+'):
                 reasons.append('invite links (t.me/+…) cannot be used — '
-                               'use @channelname or -100… channel ID')
+                               'use @channel or the numeric -100… ID')
             if not os.path.exists(TELEGRAM_CREDS_FILE):
-                reasons.append('telegram_creds.json is missing')
+                reasons.append('telegram_creds.json missing')
             return jsonify({
                 'enabled': False,
-                'reason': 'Telegram logging is not ready: ' + '; '.join(reasons),
+                'reason': 'Telegram logging not ready: ' + '; '.join(reasons),
                 'debug': {
                     'enabled':  TG_LOG_ENABLED,
                     'channel':  TG_LOG_CHANNEL or None,
+                    'channel_type': type(TG_LOG_CHANNEL).__name__,
                     'has_token': bool(TG_LOG_BOT_TOKEN),
                     'has_creds': os.path.exists(TELEGRAM_CREDS_FILE),
                 },
             }), 400
 
-        # Enqueue the test message
         notify("🧪 <b>Test message</b> — Telegram logging works!", level='success')
 
-        # Give the worker up to 15s to actually deliver it so we can
-        # return a meaningful result to the settings panel.
-        queue_size_at_start = _worker.q.qsize() if _worker else 0
-        deadline = time.time() + 15
+        start = time.time()
         delivered = False
-        while time.time() < deadline:
-            if _worker is not None and _worker.last_send > (deadline - 15):
+        while time.time() - start < 15:
+            if _worker is not None and _worker.last_send > start:
                 delivered = True
                 break
             time.sleep(0.3)
 
         if delivered:
             return jsonify({
-                'enabled': True,
-                'status': 'sent',
-                'channel': TG_LOG_CHANNEL,
+                'enabled': True, 'status': 'sent',
+                'channel': str(TG_LOG_CHANNEL),
                 'mode': 'bot' if TG_LOG_BOT_TOKEN else 'user',
             })
-        else:
-            return jsonify({
-                'enabled': True,
-                'status': 'queued',
-                'note': 'Message queued but delivery not confirmed within 15s. '
-                        'Check that the bot is an admin of the channel, or '
-                        'check server logs for details.',
-                'channel': TG_LOG_CHANNEL,
-                'mode': 'bot' if TG_LOG_BOT_TOKEN else 'user',
-                'queue_size': _worker.q.qsize() if _worker else 0,
-            }), 202
+        return jsonify({
+            'enabled': True,
+            'status': 'queued',
+            'note': 'Queued but delivery not confirmed within 15s. '
+                    'Check server logs — likely bot is not admin of the channel.',
+            'channel': str(TG_LOG_CHANNEL),
+            'mode': 'bot' if TG_LOG_BOT_TOKEN else 'user',
+            'queue_size': _worker.q.qsize() if _worker else 0,
+        }), 202
 
     @app.route('/telegram/log/status', methods=['GET'])
     def telegram_log_status():
         return jsonify({
             'enabled':  is_enabled(),
-            'channel':  TG_LOG_CHANNEL or None,
+            'channel':  str(TG_LOG_CHANNEL) if TG_LOG_CHANNEL else None,
+            'channel_type': type(TG_LOG_CHANNEL).__name__,
             'mode':     'bot' if TG_LOG_BOT_TOKEN else ('user' if is_enabled() else 'off'),
             'level':    TG_LOG_LEVEL,
             'queue':    _worker.q.qsize() if _worker else 0,
