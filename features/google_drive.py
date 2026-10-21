@@ -6,6 +6,7 @@ import time
 import uuid
 import threading
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from flask import request, jsonify
 from werkzeug.utils import secure_filename
 from google.auth.transport.requests import Request
@@ -23,10 +24,48 @@ COLAB_FOLDER_NAME = "Colab_Processing"
 COLAB_OUTPUT_SUBFOLDER = "Processed"
 
 # ============================================================
+# Settings (shared settings.json, key: coordinator_enabled)
+# ============================================================
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SETTINGS_FILE = os.path.join(PROJECT_ROOT, 'settings.json')
+_settings_lock = threading.Lock()
+
+
+def _load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception as e:
+            logger.warning(f"Failed to load settings: {e}")
+    return {}
+
+
+def _save_settings(data):
+    with _settings_lock:
+        try:
+            with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save settings: {e}")
+
+
+def is_coordinator_enabled():
+    return bool(_load_settings().get('coordinator_enabled', True))
+
+
+def set_coordinator_enabled(enabled):
+    data = _load_settings()
+    data['coordinator_enabled'] = bool(enabled)
+    _save_settings(data)
+
+
+# ============================================================
 # Thread-local Drive service cache
 # ============================================================
 _thread_local = threading.local()
-
 _service_generation = 0
 _generation_lock = threading.Lock()
 
@@ -43,18 +82,18 @@ def _current_generation():
 
 
 _cred_lock = threading.Lock()
-
 _email_cache = {}
 _quota_cache = {}
 _colab_folder_cache = {}
+_output_folder_cache = {}
 _cache_lock = threading.Lock()
 
 
 # ============================================================
-# Coordinator: processed list + claims
+# Coordinator state
 # ============================================================
 _processed_cache = {'names': set(), 'ts': 0, 'lock': threading.Lock()}
-_processed_cache_ttl = 30
+_processed_cache_ttl = 120
 
 _claims = {}
 _claims_lock = threading.Lock()
@@ -77,6 +116,11 @@ def _snapshot_claims():
             k: {'account': v['account'], 'age_sec': int(now - v['ts'])}
             for k, v in _claims.items()
         }
+
+
+def _invalidate_processed_cache():
+    with _processed_cache['lock']:
+        _processed_cache['ts'] = 0
 
 
 # ============================================================
@@ -132,7 +176,6 @@ def _load_credentials(token_path):
 
 
 def get_drive_service(account='default'):
-    """Return a per-thread Drive service for the account."""
     if not hasattr(_thread_local, 'services'):
         _thread_local.services = {}
         _thread_local.generation = -1
@@ -148,8 +191,7 @@ def get_drive_service(account='default'):
     if account not in accounts:
         raise Exception(
             f"Drive account '{account}' not found or invalid. "
-            f"Available: {sorted(accounts.keys())}. "
-            f"Add a valid token_<name>.json to the project root."
+            f"Available: {sorted(accounts.keys())}."
         )
 
     token_path = accounts[account]
@@ -190,14 +232,11 @@ def _request_account():
     requested = (request.args.get('account')
                  or request.form.get('account')
                  or '').strip()
-
     accounts = discover_accounts()
     if not accounts:
         raise Exception("No valid Drive accounts found.")
-
     if requested and requested in accounts:
         return requested
-
     last_err = None
     for name in sorted(accounts.keys()):
         try:
@@ -206,7 +245,6 @@ def _request_account():
         except Exception as e:
             last_err = e
             continue
-
     raise Exception(f"No Drive account could be loaded. Last error: {last_err}")
 
 
@@ -228,11 +266,9 @@ def _escape_drive(s):
 def _get_breadcrumbs(service, folder_id):
     if folder_id == MY_DRIVE_ROOT:
         return [{'id': MY_DRIVE_ROOT, 'name': 'My Drive'}]
-
     crumbs = []
     current = folder_id
     visited = set()
-
     while current and current not in visited and len(crumbs) < 50:
         visited.add(current)
         try:
@@ -243,7 +279,6 @@ def _get_breadcrumbs(service, folder_id):
         crumbs.insert(0, {'id': meta['id'], 'name': meta.get('name', 'Unknown')})
         parents = meta.get('parents', [])
         current = parents[0] if parents else None
-
     crumbs.insert(0, {'id': MY_DRIVE_ROOT, 'name': 'My Drive'})
     return crumbs
 
@@ -260,25 +295,19 @@ def _list_folder(service, folder_id):
     folders = []
     files = []
     FOLDER_MIME = 'application/vnd.google-apps.folder'
-
     for item in all_items:
         if item.get('mimeType') == FOLDER_MIME:
             folders.append({
-                'id': item['id'],
-                'name': item['name'],
-                'modifiedTime': item.get('modifiedTime'),
-                'is_folder': True,
+                'id': item['id'], 'name': item['name'],
+                'modifiedTime': item.get('modifiedTime'), 'is_folder': True,
             })
         else:
             size_raw = item.get('size', 0)
             files.append({
-                'id': item['id'],
-                'name': item['name'],
-                'size': size_raw,
+                'id': item['id'], 'name': item['name'], 'size': size_raw,
                 'size_str': _format_size(size_raw),
                 'mimeType': item.get('mimeType'),
-                'modifiedTime': item.get('modifiedTime'),
-                'is_folder': False,
+                'modifiedTime': item.get('modifiedTime'), 'is_folder': False,
             })
 
     parent_id = None
@@ -311,17 +340,12 @@ def _find_or_create_folder(service, name, parent_id=None):
              f"trashed = false")
         if parent_id:
             q += f" and '{parent_id}' in parents"
-
         res = service.files().list(
-            q=q, fields="files(id,name)",
-            pageSize=10,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
+            q=q, fields="files(id,name)", pageSize=10,
+            supportsAllDrives=True, includeItemsFromAllDrives=True,
         ).execute()
-
         if res.get('files'):
             return res['files'][0]['id']
-
         body = {'name': name, 'mimeType': 'application/vnd.google-apps.folder'}
         if parent_id:
             body['parents'] = [parent_id]
@@ -339,7 +363,6 @@ def get_colab_folder_id(account='default'):
     with _cache_lock:
         if account in _colab_folder_cache:
             return _colab_folder_cache[account]
-
     try:
         svc = get_drive_service(account)
         fid = _find_or_create_folder(svc, COLAB_FOLDER_NAME)
@@ -353,12 +376,19 @@ def get_colab_folder_id(account='default'):
 
 
 def get_colab_output_folder_id(account='default'):
+    with _cache_lock:
+        if account in _output_folder_cache:
+            return _output_folder_cache[account]
     try:
         svc = get_drive_service(account)
-        root_id = _find_or_create_folder(svc, COLAB_FOLDER_NAME)
+        root_id = get_colab_folder_id(account)
         if not root_id:
             return None
-        return _find_or_create_folder(svc, COLAB_OUTPUT_SUBFOLDER, root_id)
+        out_id = _find_or_create_folder(svc, COLAB_OUTPUT_SUBFOLDER, root_id)
+        if out_id:
+            with _cache_lock:
+                _output_folder_cache[account] = out_id
+        return out_id
     except Exception as e:
         logger.error(f"Output folder resolve failed for {account}: {e}")
         return None
@@ -372,13 +402,15 @@ def get_all_processed_outputs(force_refresh=False):
                 and now - _processed_cache['ts'] < _processed_cache_ttl):
             return _processed_cache['names']
 
-    names = set()
-    for account in discover_accounts().keys():
+    accounts = list(discover_accounts().keys())
+
+    def scan_one(account):
+        local_names = set()
         try:
             svc = get_drive_service(account)
             output_id = get_colab_output_folder_id(account)
             if not output_id:
-                continue
+                return local_names
             page_token = None
             while True:
                 res = svc.files().list(
@@ -390,12 +422,19 @@ def get_all_processed_outputs(force_refresh=False):
                     if int(f.get('size', 0) or 0) >= _min_output_size:
                         n = f.get('name', '')
                         if n:
-                            names.add(n)
+                            local_names.add(n)
                 page_token = res.get('nextPageToken')
                 if not page_token:
                     break
         except Exception as e:
             logger.warning(f"processed scan failed for {account}: {e}")
+        return local_names
+
+    names = set()
+    if accounts:
+        with ThreadPoolExecutor(max_workers=min(8, len(accounts))) as ex:
+            for chunk in ex.map(scan_one, accounts):
+                names |= chunk
 
     with _processed_cache['lock']:
         _processed_cache['names'] = names
@@ -495,6 +534,19 @@ def process_colab(task_id, input_path, original_filename, account):
 # ============================================================
 def register_routes(app):
 
+    @app.route('/drive/coordinator', methods=['GET'])
+    def coordinator_get():
+        return jsonify({'enabled': is_coordinator_enabled()})
+
+    @app.route('/drive/coordinator', methods=['POST'])
+    def coordinator_post():
+        enabled = request.form.get('enabled', 'true').lower() in (
+            'true', '1', 'yes', 'on')
+        set_coordinator_enabled(enabled)
+        _invalidate_processed_cache()
+        logger.info(f"Coordinator {'enabled' if enabled else 'disabled'}")
+        return jsonify({'enabled': enabled})
+
     @app.route('/drive/accounts')
     def drive_accounts():
         accounts = discover_accounts()
@@ -515,6 +567,7 @@ def register_routes(app):
         return jsonify({
             'accounts': out,
             'default': out[0]['name'] if out else None,
+            'coordinator_enabled': is_coordinator_enabled(),
         })
 
     @app.route('/drive/list')
@@ -523,12 +576,9 @@ def register_routes(app):
             account = _request_account()
         except Exception as e:
             return jsonify({'error': str(e)}), 500
-
         folder_id = request.args.get('folder_id') or MY_DRIVE_ROOT
-
         try:
             service = get_drive_service(account)
-
             if folder_id != MY_DRIVE_ROOT:
                 try:
                     meta = service.files().get(
@@ -543,16 +593,13 @@ def register_routes(app):
                 folder_name = meta.get('name', 'Folder')
             else:
                 folder_name = 'My Drive'
-
             listing = _list_folder(service, folder_id)
             breadcrumbs = _get_breadcrumbs(service, folder_id)
-
             colab_id = None
             try:
                 colab_id = get_colab_folder_id(account)
             except Exception:
                 pass
-
             return jsonify({
                 'account': account,
                 'account_email': get_account_email(account),
@@ -565,7 +612,6 @@ def register_routes(app):
                 'is_root': folder_id == MY_DRIVE_ROOT,
                 'colab_folder_id': colab_id,
             })
-
         except Exception as e:
             logger.error(f"Drive list error [{account}]: {e}")
             return jsonify({'error': str(e)}), 500
@@ -576,19 +622,16 @@ def register_routes(app):
             account = _request_account()
         except Exception as e:
             return jsonify({'error': str(e)}), 500
-
         file_id = request.form.get('file_id')
         file_name = request.form.get('file_name')
         if not file_id or not file_name:
             return jsonify({'error': 'Missing file_id or file_name'}), 400
 
         task_id = str(uuid.uuid4())
-        task_data = {
+        save_task(task_id, {
             'task_id': task_id, 'status': 'queued', 'download_progress': 0,
-            'created_at': time.time(), 'cancelled': False,
-            'account': account,
-        }
-        save_task(task_id, task_data)
+            'created_at': time.time(), 'cancelled': False, 'account': account,
+        })
 
         def run():
             task = load_task(task_id)
@@ -654,22 +697,18 @@ def register_routes(app):
             account = _request_account()
         except Exception as e:
             return jsonify({'error': str(e)}), 500
-
         if 'file' not in request.files:
             return jsonify({'error': 'No file'}), 400
         file = request.files['file']
         if file.filename == '':
             return jsonify({'error': 'Empty filename'}), 400
-
         safe_name = secure_filename(file.filename)
         if not safe_name:
             return jsonify({'error': 'Invalid filename'}), 400
-
         target_folder = get_colab_folder_id(account)
         if not target_folder:
             return jsonify({'error':
                 f'Cannot resolve/create Colab_Processing for {account}'}), 500
-
         temp_path = os.path.join(UPLOAD_FOLDER,
                                   f"_upload_{uuid.uuid4().hex}_{safe_name}")
         try:
@@ -678,13 +717,12 @@ def register_routes(app):
             return jsonify({'error': f'Save failed: {e}'}), 500
 
         task_id = str(uuid.uuid4())
-        task_data = {
+        save_task(task_id, {
             'task_id': task_id, 'status': 'queued', 'upload_progress': 0,
             'created_at': time.time(), 'cancelled': False,
             'account': account, 'target_folder': target_folder,
             'target_folder_name': COLAB_FOLDER_NAME,
-        }
-        save_task(task_id, task_data)
+        })
 
         def run():
             task = load_task(task_id)
@@ -692,15 +730,11 @@ def register_routes(app):
             save_task(task_id, task)
             try:
                 service = get_drive_service(account)
-                file_metadata = {
-                    'name': safe_name,
-                    'parents': [target_folder],
-                }
                 media = MediaFileUpload(temp_path, resumable=True,
                                         chunksize=10 * 1024 * 1024)
                 request = service.files().create(
-                    body=file_metadata, media_body=media,
-                    fields='id,name,size')
+                    body={'name': safe_name, 'parents': [target_folder]},
+                    media_body=media, fields='id,name,size')
                 response = None
                 while response is None:
                     status, response = request.next_chunk()
@@ -732,8 +766,7 @@ def register_routes(app):
 
         threading.Thread(target=run, daemon=True).start()
         return jsonify({
-            'task_id': task_id,
-            'account': account,
+            'task_id': task_id, 'account': account,
             'target_folder': target_folder,
             'target_folder_name': COLAB_FOLDER_NAME,
         })
@@ -745,7 +778,6 @@ def register_routes(app):
         except Exception as e:
             logger.warning(f"colab_process: cannot resolve account: {e}")
             return jsonify({'error': str(e)}), 500
-
         try:
             file_path = request.form.get('file_path')
             filename = request.form.get('filename')
@@ -759,19 +791,17 @@ def register_routes(app):
                 original_filename = filename
             else:
                 return jsonify({'error': 'Missing file_path or filename'}), 400
-
             if not os.path.exists(full_path):
                 return jsonify({'error': 'File not found'}), 404
             if os.path.isdir(full_path):
                 return jsonify({'error': 'Cannot process a directory'}), 400
 
             task_id = str(uuid.uuid4())
-            task_data = {
+            save_task(task_id, {
                 'task_id': task_id, 'status': 'queued', 'upload_progress': 0,
                 'download_progress': 0, 'created_at': time.time(),
                 'cancelled': False, 'account': account,
-            }
-            save_task(task_id, task_data)
+            })
             threading.Thread(
                 target=process_colab,
                 args=(task_id, full_path, original_filename, account),
@@ -790,10 +820,19 @@ def register_routes(app):
         if not token or token != expected:
             return jsonify({'error': 'Unauthorized'}), 401
 
+        if not is_coordinator_enabled():
+            return jsonify({
+                'enabled': False,
+                'processed': [],
+                'in_progress': {},
+                'generated_at': time.time(),
+            })
+
         _purge_stale_claims()
         force = request.args.get('force', '0') == '1'
         names = get_all_processed_outputs(force_refresh=force)
         return jsonify({
+            'enabled': True,
             'processed': sorted(names),
             'in_progress': _snapshot_claims(),
             'generated_at': time.time(),
@@ -806,6 +845,9 @@ def register_routes(app):
         if not token or token != expected:
             return jsonify({'error': 'Unauthorized'}), 401
 
+        if not is_coordinator_enabled():
+            return jsonify({'enabled': False, 'status': 'ok', 'claimed_by': 'disabled'})
+
         account = request.form.get('account', 'unknown')
         expected_output = request.form.get('expected_output', '')
 
@@ -815,18 +857,20 @@ def register_routes(app):
         if expected_output:
             processed = get_all_processed_outputs()
             if expected_output in processed:
-                return jsonify({'status': 'already_done', 'output': expected_output})
+                return jsonify({'enabled': True, 'status': 'already_done',
+                                'output': expected_output})
 
         with _claims_lock:
             existing = _claims.get(video_name)
             if existing:
                 return jsonify({
+                    'enabled': True,
                     'status': 'in_progress',
                     'by': existing['account'],
                     'age_sec': int(now - existing['ts']),
                 })
             _claims[video_name] = {'account': account, 'ts': now}
-            return jsonify({'status': 'ok', 'claimed_by': account})
+            return jsonify({'enabled': True, 'status': 'ok', 'claimed_by': account})
 
     @app.route('/mark_done/<path:video_name>', methods=['POST'])
     def mark_done(video_name):
@@ -834,11 +878,9 @@ def register_routes(app):
         expected = os.environ.get('COOKIE_UPLOAD_TOKEN', 'whyyouleftme')
         if not token or token != expected:
             return jsonify({'error': 'Unauthorized'}), 401
-
         with _claims_lock:
             _claims.pop(video_name, None)
-        with _processed_cache['lock']:
-            _processed_cache['ts'] = 0
+        _invalidate_processed_cache()
         return jsonify({'status': 'ok'})
 
     @app.route('/mark_failed/<path:video_name>', methods=['POST'])
@@ -847,7 +889,6 @@ def register_routes(app):
         expected = os.environ.get('COOKIE_UPLOAD_TOKEN', 'whyyouleftme')
         if not token or token != expected:
             return jsonify({'error': 'Unauthorized'}), 401
-
         with _claims_lock:
             _claims.pop(video_name, None)
         return jsonify({'status': 'ok'})
