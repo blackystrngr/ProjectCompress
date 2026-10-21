@@ -12,13 +12,20 @@ from . import torrent_search
 from . import face_swap
 from . import ocr
 from . import web_crawler
-from . import thumbnails  
+from . import thumbnails
+from . import settings              # ← NEW
+from . import telegram_logger
 
 logger = logging.getLogger(__name__)
+
 
 def register_all_features(app):
     """Register all feature blueprints/routes."""
     logger.info("Registering features...")
+
+    # Logger installed first so every later startup log reaches Telegram
+    telegram_logger.register_logging(app)
+
     auth.register_auth(app)
     url_download.register_routes(app)
     telegram.register_routes(app)
@@ -33,4 +40,7 @@ def register_all_features(app):
     ocr.register_routes(app)
     web_crawler.register_routes(app)
     thumbnails.register_routes(app)
+    settings.register_routes(app)       # ← NEW
+    telegram_logger.register_routes(app)
+
     logger.info("All features registered")
