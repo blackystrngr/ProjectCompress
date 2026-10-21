@@ -195,8 +195,6 @@ def create_app():
         if not content or len(content) < 50:
             return jsonify({'error': 'Empty or too-short cookie data'}), 400
 
-        # ---- (REMOVED the "youtube.com required" check) ----
-
         try:
             if os.path.exists(COOKIES_SAVE_PATH):
                 shutil.copy(COOKIES_SAVE_PATH, COOKIES_SAVE_PATH + '.bak')
@@ -210,7 +208,6 @@ def create_app():
             cookie_lines = [l for l in content.splitlines()
                             if l and not l.startswith('#') and '\t' in l]
 
-            # Count unique domains
             domains = set()
             for line in cookie_lines:
                 parts = line.split('\t')
@@ -252,7 +249,6 @@ def create_app():
         except Exception:
             return jsonify({'error': 'Not valid JSON'}), 400
 
-        # Accept OAuth user tokens OR service account keys
         required_oauth = {'client_id', 'client_secret', 'refresh_token'}
         required_sa = {'type', 'private_key', 'client_email'}
         keys = set(data.keys())
@@ -276,18 +272,18 @@ def create_app():
             logger.exception("Failed to write token file")
             return jsonify({'error': str(e)}), 500
 
-        # Invalidate cached Drive service so next request uses the new token
+        # Invalidate per-thread Drive services so the next request rebuilds
+        # with the new token, and clear cached email/quota.
         email = None
         try:
             from features.google_drive import (
-                _service_cache, _email_cache, _quota_cache, _cache_lock,
-                get_drive_service
+                _bump_service_generation, get_drive_service,
+                _email_cache, _quota_cache, _cache_lock,
             )
+            _bump_service_generation()
             with _cache_lock:
-                _service_cache.pop(account, None)
                 _email_cache.pop(account, None)
                 _quota_cache.pop(account, None)
-            # Verify + grab email
             svc = get_drive_service(account)
             about = svc.about().get(fields='user').execute()
             email = about['user']['emailAddress']
@@ -318,13 +314,11 @@ def create_app():
 
 
 if __name__ == '__main__':
-    # Cleanup old terminal task files (older than 1 day)
     try:
         cleanup_old_tasks(max_age_seconds=86400)
     except Exception as e:
         logger.warning(f"cleanup_old_tasks failed: {e}")
 
-    # ---- Kill any orphan playwright/chromium from previous runs ----
     try:
         from features.url_download import _cleanup_playwright_processes
         killed = _cleanup_playwright_processes(verbose=True)
