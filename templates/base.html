@@ -7,11 +7,6 @@
     <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
 
-    <!-- ============================================================
-         DUAL THEMES: classic (original) + modern (animated).
-         The early script below disables whichever is not active
-         BEFORE first paint, so there is no flash of wrong UI.
-         ============================================================ -->
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" id="theme-classic">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style-modern.css') }}" id="theme-modern">
     <script>
@@ -20,12 +15,268 @@
             try { theme = localStorage.getItem('ui-theme') || 'classic'; } catch (e) {}
             if (theme !== 'modern' && theme !== 'classic') theme = 'classic';
             document.documentElement.dataset.theme = theme;
-            var classic = document.getElementById('theme-classic');
-            var modern  = document.getElementById('theme-modern');
-            if (classic) classic.disabled = (theme === 'modern');
-            if (modern)  modern.disabled  = (theme !== 'modern');
+            var c = document.getElementById('theme-classic');
+            var m = document.getElementById('theme-modern');
+            if (c) c.disabled = (theme === 'modern');
+            if (m) m.disabled  = (theme !== 'modern');
         })();
     </script>
+
+    <!-- ============================================================
+         SETTINGS PANEL — inline styles so it works in both themes
+         ============================================================ -->
+    <style>
+        .settings-fab {
+            position: fixed;
+            top: 50%;
+            right: 1rem;
+            transform: translateY(-50%);
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #5f8fe0, #4367b8);
+            border: 1px solid rgba(255,255,255,0.22);
+            color: #fff;
+            font-size: 1.15rem;
+            cursor: pointer;
+            z-index: 500;
+            box-shadow: 0 10px 28px -8px rgba(95,143,224,0.75);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        .settings-fab:hover {
+            transform: translateY(-50%) scale(1.1) rotate(45deg);
+            box-shadow: 0 14px 32px -8px rgba(95,143,224,1);
+        }
+        .settings-fab.open { transform: translateY(-50%) rotate(45deg); }
+
+        .settings-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.55);
+            backdrop-filter: blur(3px);
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.25s ease;
+            z-index: 998;
+        }
+        .settings-overlay.open { opacity: 1; pointer-events: auto; }
+
+        .settings-panel {
+            position: fixed;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            width: min(420px, 92vw);
+            background: rgba(18, 22, 35, 0.97);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border-left: 1px solid rgba(95,143,224,0.4);
+            z-index: 999;
+            transform: translateX(105%);
+            transition: transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+            display: flex;
+            flex-direction: column;
+            box-shadow: -20px 0 40px -20px rgba(0,0,0,0.8);
+            color: #eef2ff;
+            font-family: 'Inter', sans-serif;
+        }
+        .settings-panel.open { transform: translateX(0); }
+
+        .settings-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1.2rem 1.5rem;
+            border-bottom: 1px solid rgba(95,143,224,0.25);
+        }
+        .settings-header h2 {
+            margin: 0;
+            font-size: 1.1rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            padding: 0;
+            border: none;
+        }
+        .settings-header h2 i { color: #5f8fe0; }
+
+        .settings-close {
+            background: transparent;
+            border: 1px solid rgba(255,255,255,0.15);
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            color: #fff;
+            padding: 0;
+            font-size: 0.85rem;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.15s ease;
+        }
+        .settings-close:hover {
+            background: rgba(239,68,68,0.3);
+            border-color: rgba(239,68,68,0.6);
+        }
+
+        .settings-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1.2rem 1.5rem;
+        }
+
+        .settings-section {
+            margin-bottom: 1.4rem;
+            padding: 1rem;
+            background: rgba(25,30,45,0.55);
+            border-radius: 1rem;
+            border: 1px solid rgba(95,143,224,0.22);
+        }
+        .settings-section h3 {
+            font-size: 0.78rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: #8a9bc0;
+            margin-bottom: 0.9rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-weight: 600;
+        }
+        .settings-section h3 i { color: #5f8fe0; }
+
+        .settings-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 1rem;
+            padding: 0.55rem 0;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+        .settings-row:last-of-type { border-bottom: none; }
+        .settings-row > span {
+            font-size: 0.85rem;
+            color: #eef2ff;
+            flex-shrink: 0;
+        }
+        .settings-row input[type="text"],
+        .settings-row input[type="password"],
+        .settings-row select {
+            flex: 1;
+            max-width: 230px;
+            background: rgba(20,26,42,0.95);
+            border: 1px solid rgba(95,143,224,0.3);
+            color: #eef2ff;
+            padding: 0.45rem 0.75rem;
+            border-radius: 0.5rem;
+            font-size: 0.8rem;
+            font-family: inherit;
+            outline: none;
+            transition: border-color 0.15s ease, box-shadow 0.15s ease;
+        }
+        .settings-row input:focus,
+        .settings-row select:focus {
+            border-color: #5f8fe0;
+            box-shadow: 0 0 0 3px rgba(95,143,224,0.18);
+        }
+        .settings-row input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            accent-color: #5f8fe0;
+            cursor: pointer;
+        }
+
+        .settings-hint {
+            font-size: 0.7rem;
+            color: #8a9bc0;
+            margin-top: 0.5rem;
+            padding: 0.4rem 0.65rem;
+            background: rgba(30,40,60,0.5);
+            border-radius: 0.4rem;
+            font-family: 'JetBrains Mono', monospace;
+            word-break: break-all;
+        }
+        .settings-hint:empty { display: none; }
+        .settings-hint.warn { color: #fcd34d; }
+
+        .settings-btn {
+            width: 100%;
+            margin-top: 0.65rem;
+            background: rgba(44,62,102,0.9);
+            border: 1px solid rgba(95,143,224,0.35);
+            color: #fff;
+            padding: 0.55rem 1rem;
+            border-radius: 0.6rem;
+            font-size: 0.82rem;
+            font-family: inherit;
+            font-weight: 500;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            transition: all 0.15s ease;
+        }
+        .settings-btn:hover {
+            background: rgba(60,85,140,0.95);
+            border-color: #5f8fe0;
+            transform: translateY(-1px);
+        }
+        .settings-btn.primary {
+            background: linear-gradient(135deg, #5f8fe0, #4367b8);
+            border-color: rgba(140,170,230,0.6);
+        }
+        .settings-btn.primary:hover {
+            background: linear-gradient(135deg, #7099e6, #4d72c8);
+        }
+        .settings-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .settings-footer {
+            padding: 1rem 1.5rem;
+            border-top: 1px solid rgba(95,143,224,0.25);
+            display: flex;
+            gap: 0.5rem;
+        }
+        .settings-footer .settings-btn { margin-top: 0; }
+
+        .settings-toast {
+            position: fixed;
+            bottom: 24px;
+            left: 50%;
+            transform: translateX(-50%) translateY(80px);
+            background: linear-gradient(135deg, rgba(44,62,94,0.98), rgba(30,42,70,0.98));
+            color: #fff;
+            padding: 12px 22px;
+            border-radius: 999px;
+            font-size: 0.85rem;
+            z-index: 9999;
+            box-shadow: 0 20px 40px -14px rgba(0,0,0,0.8),
+                        0 0 0 1px rgba(95,143,224,0.45);
+            opacity: 0;
+            pointer-events: none;
+            transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+        }
+        .settings-toast.show {
+            opacity: 1;
+            transform: translateX(-50%) translateY(0);
+        }
+
+        @media (max-width: 700px) {
+            .settings-panel { width: 100vw; }
+            .settings-fab { top: auto; bottom: 5rem; right: 1rem; transform: none; }
+            .settings-fab:hover { transform: scale(1.1) rotate(45deg); }
+            .settings-fab.open { transform: rotate(45deg); }
+        }
+    </style>
 </head>
 <body>
 <div class="container">
@@ -67,7 +318,6 @@
             <span class="sys-label" style="min-width:auto;">Pause&nbsp;Thumbs</span>
         </label>
 
-        <!-- ========== UI Theme Switcher ========== -->
         <button id="themeToggleBtn"
                 class="sys-stat sys-toggle"
                 type="button"
@@ -99,6 +349,108 @@
     </div>
 </div>
 
+<!-- ============================================================
+     SETTINGS FAB + PANEL
+     ============================================================ -->
+<button id="settingsFab" class="settings-fab" type="button" title="Settings">
+    <i class="fas fa-cog"></i>
+</button>
+
+<div id="settingsOverlay" class="settings-overlay"></div>
+
+<aside id="settingsPanel" class="settings-panel" aria-hidden="true">
+    <header class="settings-header">
+        <h2><i class="fas fa-sliders-h"></i> Settings</h2>
+        <button id="settingsClose" class="settings-close" type="button" title="Close">
+            <i class="fas fa-times"></i>
+        </button>
+    </header>
+
+    <div class="settings-body">
+
+        <!-- ===== Appearance ===== -->
+        <section class="settings-section">
+            <h3><i class="fas fa-palette"></i> Appearance</h3>
+            <label class="settings-row">
+                <span>UI Theme</span>
+                <select id="setUiTheme">
+                    <option value="classic">Classic</option>
+                    <option value="modern">Modern (animated)</option>
+                </select>
+            </label>
+        </section>
+
+        <!-- ===== Telegram Logging ===== -->
+        <section class="settings-section">
+            <h3><i class="fab fa-telegram"></i> Telegram Logging</h3>
+
+            <label class="settings-row">
+                <span>Enabled</span>
+                <input type="checkbox" id="setTgEnabled">
+            </label>
+
+            <label class="settings-row">
+                <span>Channel</span>
+                <input type="text" id="setTgChannel"
+                       placeholder="@channel or -100…" autocomplete="off">
+            </label>
+
+            <label class="settings-row">
+                <span>Bot token</span>
+                <input type="password" id="setTgToken"
+                       placeholder="123456:ABC…" autocomplete="off">
+            </label>
+
+            <label class="settings-row">
+                <span>Log level</span>
+                <select id="setTgLevel">
+                    <option>DEBUG</option>
+                    <option>INFO</option>
+                    <option>WARNING</option>
+                    <option>ERROR</option>
+                    <option>CRITICAL</option>
+                </select>
+            </label>
+
+            <div class="settings-hint" id="setTgHint"></div>
+
+            <button id="setTgTest" class="settings-btn" type="button">
+                <i class="fas fa-paper-plane"></i> Send test message
+            </button>
+        </section>
+
+        <!-- ===== Colab Coordinator ===== -->
+        <section class="settings-section">
+            <h3><i class="fas fa-shield-halved"></i> Colab Coordinator</h3>
+            <label class="settings-row">
+                <span>Cross-drive dedup</span>
+                <input type="checkbox" id="setCoordinator">
+            </label>
+        </section>
+
+        <!-- ===== Thumbnails ===== -->
+        <section class="settings-section">
+            <h3><i class="fas fa-images"></i> Thumbnails</h3>
+            <label class="settings-row">
+                <span>Generate thumbnails</span>
+                <input type="checkbox" id="setThumbnailsEnabled">
+            </label>
+        </section>
+
+    </div>
+
+    <footer class="settings-footer">
+        <button id="settingsSave" class="settings-btn primary" type="button">
+            <i class="fas fa-save"></i> Save
+        </button>
+        <button id="settingsReset" class="settings-btn" type="button">
+            <i class="fas fa-undo"></i> Reload
+        </button>
+    </footer>
+</aside>
+
+<div id="settingsToast" class="settings-toast"></div>
+
 <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 
 <!-- ========== System Stats + Thumbnail Toggle ========== -->
@@ -120,13 +472,13 @@ window.thumbnailsEnabled = true;
         if (pct < 80) return 'linear-gradient(90deg, #facc15, #fde68a)';
         return 'linear-gradient(90deg, #ef4444, #fca5a5)';
     }
-    function formatBytes(bytes) {
-        if (bytes === 0) return '0 B';
-        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-        const i = Math.floor(Math.log(bytes) / Math.log(1024));
-        return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
+    function fmtBytes(b) {
+        if (b === 0) return '0 B';
+        const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+        const i = Math.floor(Math.log(b) / Math.log(1024));
+        return (b / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + u[i];
     }
-    function formatSpeed(bps) {
+    function fmtSpeed(bps) {
         if (bps < 1024) return bps + ' B/s';
         if (bps < 1024 * 1024) return (bps / 1024).toFixed(1) + ' KB/s';
         if (bps < 1024 * 1024 * 1024) return (bps / (1024 * 1024)).toFixed(1) + ' MB/s';
@@ -144,13 +496,13 @@ window.thumbnailsEnabled = true;
             ramFill.style.background = colorFor(data.ram);
             ramValue.textContent = data.ram + '%';
             if (data.ram_used && data.ram_total) {
-                ramValue.title = `${formatBytes(data.ram_used)} / ${formatBytes(data.ram_total)}`;
+                ramValue.title = `${fmtBytes(data.ram_used)} / ${fmtBytes(data.ram_total)}`;
             }
             diskFill.style.width = data.disk + '%';
             diskFill.style.background = colorFor(data.disk);
             diskValue.textContent = data.disk + '%';
-            downValue.textContent = formatSpeed(data.net_down || 0);
-            upValue.textContent = formatSpeed(data.net_up || 0);
+            downValue.textContent = fmtSpeed(data.net_down || 0);
+            upValue.textContent = fmtSpeed(data.net_up || 0);
             downValue.style.color = (data.net_down > 1024 * 1024) ? '#86efac'
                                    : (data.net_down > 0) ? '#d1fae5' : '#8a9bc0';
             upValue.style.color = (data.net_up > 1024 * 1024) ? '#fde68a'
@@ -164,7 +516,7 @@ window.thumbnailsEnabled = true;
 })();
 
 // ============================================================
-// Thumbnail pause toggle
+// Thumbnail pause toggle (sys-stats)
 // ============================================================
 (function() {
     const cb = document.getElementById('pauseThumbnails');
@@ -211,51 +563,59 @@ window.thumbnailsEnabled = true;
 })();
 </script>
 
-<!-- ========== Theme Switcher + Modern UI polish ========== -->
+<!-- ============================================================
+     THEME SYSTEM (shared by sys-stats toggle + settings panel)
+     ============================================================ -->
 <script>
-/* ========================================================
-   Theme Switcher — flips between style.css and style-modern.css
-   ======================================================== */
+window.applyTheme = function (theme, syncServer) {
+    if (theme !== 'modern' && theme !== 'classic') theme = 'classic';
+    if (document.documentElement.dataset.theme === theme) return;
+
+    document.documentElement.dataset.theme = theme;
+    const c = document.getElementById('theme-classic');
+    const m = document.getElementById('theme-modern');
+    if (c) c.disabled = (theme === 'modern');
+    if (m) m.disabled  = (theme !== 'modern');
+    try { localStorage.setItem('ui-theme', theme); } catch (e) {}
+
+    if (syncServer) {
+        fetch('/settings', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ ui_theme: theme })
+        }).catch(() => {});
+    }
+    window.dispatchEvent(new CustomEvent('themeChanged', { detail: theme }));
+};
+
 (function () {
-    var btn   = document.getElementById('themeToggleBtn');
-    var icon  = document.getElementById('themeIcon');
-    var label = document.getElementById('themeLabel');
+    const btn   = document.getElementById('themeToggleBtn');
+    const icon  = document.getElementById('themeIcon');
+    const label = document.getElementById('themeLabel');
     if (!btn) return;
 
     function updateUI(theme) {
         if (theme === 'modern') {
-            icon.className    = 'fas fa-palette';
+            icon.className = 'fas fa-palette';
             label.textContent = 'Classic';
-            btn.title         = 'Switch to Classic UI';
+            btn.title = 'Switch to Classic UI';
         } else {
-            icon.className    = 'fas fa-wand-magic-sparkles';
+            icon.className = 'fas fa-wand-magic-sparkles';
             label.textContent = 'Modern';
-            btn.title         = 'Switch to Animated Modern UI';
+            btn.title = 'Switch to Animated Modern UI';
         }
     }
-
     updateUI(document.documentElement.dataset.theme || 'classic');
 
     btn.addEventListener('click', function () {
-        var next = (document.documentElement.dataset.theme === 'modern')
-                   ? 'classic' : 'modern';
-
-        /* Quick fade while swapping stylesheets */
+        const next = (document.documentElement.dataset.theme === 'modern')
+                     ? 'classic' : 'modern';
         document.body.style.transition = 'opacity 0.15s ease';
-        document.body.style.opacity    = '0.7';
-
+        document.body.style.opacity = '0.7';
         setTimeout(function () {
-            document.documentElement.dataset.theme = next;
-            var classic = document.getElementById('theme-classic');
-            var modern  = document.getElementById('theme-modern');
-            if (classic) classic.disabled = (next === 'modern');
-            if (modern)  modern.disabled  = (next !== 'modern');
-            try { localStorage.setItem('ui-theme', next); } catch (e) {}
-            updateUI(next);
-
+            window.applyTheme(next, true);
             document.body.style.opacity = '1';
-            setTimeout(function () { document.body.style.transition = ''; }, 200);
-
+            setTimeout(() => { document.body.style.transition = ''; }, 200);
             if (typeof showToast === 'function') {
                 showToast(next === 'modern'
                     ? '✨ Modern UI enabled'
@@ -263,46 +623,252 @@ window.thumbnailsEnabled = true;
             }
         }, 150);
     });
-})();
 
-/* ========================================================
-   Modern-UI-only polish:
-     • cursor spotlight on cards
-     • click ripple on buttons/tabs
-   Both auto-disable when the classic theme is active.
-   ======================================================== */
+    window.addEventListener('themeChanged', (e) => updateUI(e.detail));
+})();
+</script>
+
+<!-- ============================================================
+     SETTINGS PANEL LOGIC
+     ============================================================ -->
+<script>
+(function () {
+    const fab        = document.getElementById('settingsFab');
+    const overlay    = document.getElementById('settingsOverlay');
+    const panel      = document.getElementById('settingsPanel');
+    const closeBtn   = document.getElementById('settingsClose');
+    const saveBtn    = document.getElementById('settingsSave');
+    const resetBtn   = document.getElementById('settingsReset');
+    const toastEl    = document.getElementById('settingsToast');
+
+    const inTheme    = document.getElementById('setUiTheme');
+    const inTgEnabled= document.getElementById('setTgEnabled');
+    const inTgChannel= document.getElementById('setTgChannel');
+    const inTgToken  = document.getElementById('setTgToken');
+    const inTgLevel  = document.getElementById('setTgLevel');
+    const inCoord    = document.getElementById('setCoordinator');
+    const inThumbs   = document.getElementById('setThumbnailsEnabled');
+    const tgHint     = document.getElementById('setTgHint');
+    const tgTestBtn  = document.getElementById('setTgTest');
+
+    let current = null;   // last-known server state
+
+    /* ---------- Toast ---------- */
+    function toast(msg, isErr) {
+        toastEl.textContent = msg;
+        toastEl.style.background = isErr
+            ? 'linear-gradient(135deg, #b83a3a, #8b2c2c)'
+            : 'linear-gradient(135deg, rgba(44,62,94,0.98), rgba(30,42,70,0.98))';
+        toastEl.classList.add('show');
+        clearTimeout(toastEl._t);
+        toastEl._t = setTimeout(() => toastEl.classList.remove('show'), 2600);
+    }
+
+    /* ---------- Open / close ---------- */
+    function openPanel() {
+        panel.classList.add('open');
+        overlay.classList.add('open');
+        fab.classList.add('open');
+        panel.setAttribute('aria-hidden', 'false');
+        load();
+    }
+    function closePanel() {
+        panel.classList.remove('open');
+        overlay.classList.remove('open');
+        fab.classList.remove('open');
+        panel.setAttribute('aria-hidden', 'true');
+    }
+    fab.addEventListener('click', openPanel);
+    closeBtn.addEventListener('click', closePanel);
+    overlay.addEventListener('click', closePanel);
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && panel.classList.contains('open')) closePanel();
+    });
+
+    /* ---------- Load current settings ---------- */
+    async function load() {
+        try {
+            const r = await fetch('/settings', { cache: 'no-store' });
+            current = await r.json();
+
+            inTheme.value     = current.ui_theme || 'classic';
+            inTgEnabled.checked = !!current.tg_log_enabled;
+            inTgChannel.value = current.tg_log_channel || '';
+            inTgToken.value   = '';                   // never prefill
+            inTgToken.placeholder = current.tg_log_bot_token_set
+                ? `set (${current.tg_log_bot_token_masked}) — leave empty to keep`
+                : '123456:ABC…';
+            inTgLevel.value   = current.tg_log_level || 'WARNING';
+            inCoord.checked   = !!current.coordinator_enabled;
+            inThumbs.checked  = !!current.thumbnails_enabled;
+
+            // Hints about env vars
+            const hints = [];
+            if (current.env && current.env.TG_LOG_CHANNEL)
+                hints.push('env TG_LOG_CHANNEL is set');
+            if (current.env && current.env.TG_LOG_BOT_TOKEN)
+                hints.push('env TG_LOG_BOT_TOKEN is set');
+            if (current.env && current.env.TG_LOG_LEVEL)
+                hints.push('env TG_LOG_LEVEL is set');
+            tgHint.textContent = hints.join(' · ');
+            tgHint.classList.toggle('warn', hints.length > 0);
+        } catch (e) {
+            toast('Failed to load settings', true);
+            console.error(e);
+        }
+    }
+
+    /* ---------- Save (only changed fields) ---------- */
+    saveBtn.addEventListener('click', async () => {
+        if (!current) { toast('Not loaded yet', true); return; }
+
+        const payload = {};
+
+        if (inTheme.value !== current.ui_theme)
+            payload.ui_theme = inTheme.value;
+
+        if (inTgEnabled.checked !== !!current.tg_log_enabled)
+            payload.tg_log_enabled = inTgEnabled.checked;
+
+        if (inTgChannel.value.trim() !== (current.tg_log_channel || ''))
+            payload.tg_log_channel = inTgChannel.value.trim();
+
+        if (inTgToken.value.trim())
+            payload.tg_log_bot_token = inTgToken.value.trim();
+
+        if (inTgLevel.value !== current.tg_log_level)
+            payload.tg_log_level = inTgLevel.value;
+
+        if (inCoord.checked !== !!current.coordinator_enabled)
+            payload.coordinator_enabled = inCoord.checked;
+
+        if (inThumbs.checked !== !!current.thumbnails_enabled)
+            payload.thumbnails_enabled = inThumbs.checked;
+
+        if (!Object.keys(payload).length) {
+            toast('No changes');
+            return;
+        }
+
+        saveBtn.disabled = true;
+        saveBtn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Saving…';
+
+        try {
+            const r = await fetch('/settings', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            });
+            const data = await r.json();
+
+            if (!r.ok) {
+                const msg = data.error || 'Save failed';
+                toast(msg, true);
+                if (data.errors) console.warn('Field errors:', data.errors);
+                return;
+            }
+
+            // Apply theme locally (server has already stored it)
+            if (payload.ui_theme) {
+                const cur = document.documentElement.dataset.theme;
+                if (cur !== payload.ui_theme) {
+                    window.applyTheme(payload.ui_theme, false);
+                }
+            }
+
+            // Reflect thumbnails change in sys-stats toggle
+            if ('thumbnails_enabled' in payload) {
+                const pauseCb = document.getElementById('pauseThumbnails');
+                if (pauseCb) pauseCb.checked = !payload.thumbnails_enabled;
+                window.thumbnailsEnabled = payload.thumbnails_enabled;
+                window.dispatchEvent(new Event('thumbnailsToggled'));
+            }
+
+            toast(`Saved (${data.updated.length} field${data.updated.length === 1 ? '' : 's'})`);
+            inTgToken.value = '';
+            await load();
+        } catch (e) {
+            toast('Network error: ' + e.message, true);
+        } finally {
+            saveBtn.disabled = false;
+            saveBtn.innerHTML = '<i class="fas fa-save"></i> Save';
+        }
+    });
+
+    /* ---------- Reload ---------- */
+    resetBtn.addEventListener('click', load);
+
+    /* ---------- Test Telegram ---------- */
+    tgTestBtn.addEventListener('click', async () => {
+        tgTestBtn.disabled = true;
+        tgTestBtn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Sending…';
+        try {
+            const r = await fetch('/telegram/log/test');
+            const data = await r.json();
+            if (r.ok) {
+                toast('Test message sent ✓');
+            } else {
+                toast(data.reason || data.error || 'Test failed', true);
+            }
+        } catch (e) {
+            toast('Network error: ' + e.message, true);
+        } finally {
+            tgTestBtn.disabled = false;
+            tgTestBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Send test message';
+        }
+    });
+
+    /* ---------- Server-side theme sync on load ---------- */
+    // If the server has a saved theme different from localStorage,
+    // apply the server version (localStorage was just a fast cache).
+    fetch('/settings', { cache: 'no-store' })
+        .then(r => r.ok ? r.json() : null)
+        .then(data => {
+            if (!data || !data.ui_theme) return;
+            const cur = document.documentElement.dataset.theme;
+            if (data.ui_theme !== cur) {
+                window.applyTheme(data.ui_theme, false);
+            }
+        })
+        .catch(() => {});
+})();
+</script>
+
+<!-- ============================================================
+     Modern-UI-only polish: cursor spotlight + ripple
+     (auto-disabled when classic theme is active)
+     ============================================================ -->
+<script>
 (function () {
     if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
 
-    /* --- Cursor spotlight --- */
-    var pending = null;
+    let pending = null;
     document.addEventListener('mousemove', function (e) {
         if (document.documentElement.dataset.theme !== 'modern') return;
         if (pending) return;
         pending = requestAnimationFrame(function () {
             pending = null;
-            var el = e.target.closest('.card, .file-card, .task-card');
+            const el = e.target.closest('.card, .file-card, .task-card');
             if (!el) return;
-            var r = el.getBoundingClientRect();
+            const r = el.getBoundingClientRect();
             el.style.setProperty('--mx', (e.clientX - r.left) + 'px');
             el.style.setProperty('--my', (e.clientY - r.top)  + 'px');
         });
     }, { passive: true });
 
-    /* --- Click ripple --- */
     document.addEventListener('pointerdown', function (e) {
         if (document.documentElement.dataset.theme !== 'modern') return;
-        var el = e.target.closest('button, .tab-btn, .file-actions button, .file-actions a');
+        const el = e.target.closest('button, .tab-btn, .file-actions button, .file-actions a');
         if (!el) return;
-        var r    = el.getBoundingClientRect();
-        var size = Math.max(r.width, r.height);
-        var rip  = document.createElement('span');
-        rip.className    = 'ripple';
-        rip.style.width  = rip.style.height = size + 'px';
-        rip.style.left   = (e.clientX - r.left - size / 2) + 'px';
-        rip.style.top    = (e.clientY - r.top  - size / 2) + 'px';
+        const r = el.getBoundingClientRect();
+        const size = Math.max(r.width, r.height);
+        const rip = document.createElement('span');
+        rip.className = 'ripple';
+        rip.style.width = rip.style.height = size + 'px';
+        rip.style.left = (e.clientX - r.left - size / 2) + 'px';
+        rip.style.top  = (e.clientY - r.top  - size / 2) + 'px';
         el.appendChild(rip);
-        setTimeout(function () { rip.remove(); }, 650);
+        setTimeout(() => rip.remove(), 650);
     }, { passive: true });
 })();
 </script>
