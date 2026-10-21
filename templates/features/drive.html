@@ -22,15 +22,6 @@
             </button>
             <input type="file" id="driveUploadInput" multiple style="display:none;">
             <button id="refreshDriveBtn"><i class="fas fa-sync-alt"></i> Refresh</button>
-            <label title="Colab skips sources whose output already exists in any account"
-                   style="display:flex; align-items:center; gap:0.4rem; font-size:0.8rem; cursor:pointer;
-                          padding:0.3rem 0.7rem; background:rgba(30,40,60,0.7); border-radius:1rem;
-                          border:1px solid #2a3248; user-select:none;">
-                <input type="checkbox" id="coordinatorToggle" checked
-                       style="accent-color:#5f8fe0; cursor:pointer;">
-                <i class="fas fa-shield-halved" id="coordinatorIcon" style="color:#5f8fe0;"></i>
-                <span>Cross-drive dedup</span>
-            </label>
         </div>
     </div>
 
@@ -105,15 +96,8 @@ async function loadDriveAccounts() {
             sel.appendChild(opt);
         });
 
-        // Coordinator toggle state from server
-        const toggle = document.getElementById('coordinatorToggle');
-        const icon = document.getElementById('coordinatorIcon');
-        if (toggle) {
-            toggle.checked = data.coordinator_enabled !== false;
-            if (icon) {
-                icon.style.color = toggle.checked ? '#5f8fe0' : '#8a9bc0';
-            }
-        }
+        // Note: coordinator_enabled is still in the API response for debugging,
+        // but the toggle now lives in the Settings panel (single source of truth).
 
         const shared = window.selectedDriveAccount;
         if (shared && accounts.find(a => a.name === shared)) {
@@ -143,36 +127,6 @@ window.addEventListener('driveAccountChanged', (e) => {
     driveColabFolderId = null;
     selectedDriveIds.clear();
     loadDriveFolder('root');
-});
-
-// ============================================================
-// Coordinator toggle
-// ============================================================
-document.getElementById('coordinatorToggle').addEventListener('change', async (e) => {
-    const enabled = e.target.checked;
-    const icon = document.getElementById('coordinatorIcon');
-    if (icon) icon.style.color = enabled ? '#5f8fe0' : '#8a9bc0';
-
-    try {
-        const resp = await fetch('/drive/coordinator', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-            body: `enabled=${enabled}`,
-        });
-        const data = await resp.json();
-        if (resp.ok) {
-            showToast(data.enabled
-                ? 'Cross-drive dedup enabled'
-                : 'Cross-drive dedup disabled — Colab will re-process duplicates');
-        } else {
-            throw new Error(data.error || 'Failed');
-        }
-    } catch (err) {
-        // Revert checkbox on failure
-        e.target.checked = !enabled;
-        if (icon) icon.style.color = e.target.checked ? '#5f8fe0' : '#8a9bc0';
-        showToast(err.message, true);
-    }
 });
 
 // ============================================================
