@@ -23,25 +23,50 @@ COLAB_FOLDER_NAME = "Colab_Processing"
 COLAB_OUTPUT_SUBFOLDER = "Processed"
 
 # ============================================================
-# GLOBAL DRIVE I/O LOCK (reentrant)
+# Thread-local Drive service cache
 # ------------------------------------------------------------
-# googleapiclient + httplib2 are not thread-safe. Any concurrent
-# call to service.*.execute() can corrupt the heap or crash inside
-# OpenSSL. All Drive calls — list, get, upload, download — are
-# serialized through this reentrant lock. Reentrant so a call site
-# that already holds it can call helper functions that also lock.
+# googleapiclient's underlying httplib2.Http is NOT thread-safe.
+# Two threads sharing one service corrupt the internal socket pool,
+# which manifests as `free(): corrupted unsorted chunks` crashes or
+# segfaults inside OpenSSL.
+#
+# Fix: every thread gets its own service per account. No shared
+# mutable HTTP state → no corruption, no locks needed, and requests
+# run fully in parallel.
 # ============================================================
-_drive_io_lock = threading.RLock()
+_thread_local = threading.local()
+
+# Bumped when a token file changes so stale per-thread services get
+# rebuilt on next use. See /upload_token in app.py.
+_service_generation = 0
+_generation_lock = threading.Lock()
 
 
-def _locked(fn):
-    """Run fn() while holding the global Drive lock."""
-    with _drive_io_lock:
-        return fn()
+def _bump_service_generation():
+    """Call this after uploading a new token to force all threads to rebuild."""
+    global _service_generation
+    with _generation_lock:
+        _service_generation += 1
+
+
+def _current_generation():
+    with _generation_lock:
+        return _service_generation
+
+
+# Only credential refresh needs a lock: two threads refreshing the same
+# token file simultaneously would race on the file write.
+_cred_lock = threading.Lock()
+
+# Shared metadata caches — just scalars, guarded by _cache_lock on write.
+_email_cache = {}
+_quota_cache = {}
+_colab_folder_cache = {}
+_cache_lock = threading.Lock()
 
 
 # ============================================================
-# Token discovery + validity
+# Token discovery
 # ============================================================
 def discover_accounts():
     out = {}
@@ -74,17 +99,9 @@ def _token_file_valid(path):
         return False
 
 
-_service_cache = {}
-_email_cache = {}
-_quota_cache = {}
-_colab_folder_cache = {}
-_cache_lock = threading.Lock()
-
-
 def _load_credentials(token_path):
-    # Network call when refresh is needed — must run under the
-    # Drive lock to avoid concurrent refresh on the same creds.
-    with _drive_io_lock:
+    """Thread-safe token load + refresh (serialized by _cred_lock)."""
+    with _cred_lock:
         creds = Credentials.from_authorized_user_file(
             token_path, ['https://www.googleapis.com/auth/drive'])
         if not creds.valid:
@@ -102,45 +119,53 @@ def _load_credentials(token_path):
 
 
 def get_drive_service(account='default'):
-    with _cache_lock:
-        if account in _service_cache:
-            return _service_cache[account]
+    """
+    Return a Drive service for THIS THREAD. Each thread builds its own
+    service, so concurrent uploads/downloads never contend.
+    """
+    if not hasattr(_thread_local, 'services'):
+        _thread_local.services = {}
+        _thread_local.generation = -1
+
+    current_gen = _current_generation()
+
+    # Token was updated → rebuild cached services for this thread
+    if _thread_local.generation != current_gen:
+        _thread_local.services.clear()
+        _thread_local.generation = current_gen
+
+    if account in _thread_local.services:
+        return _thread_local.services[account]
 
     accounts = discover_accounts()
     if account not in accounts:
         raise Exception(
             f"Drive account '{account}' not found or invalid. "
-            f"Available: {sorted(accounts.keys())}."
+            f"Available: {sorted(accounts.keys())}. "
+            f"Add a valid token_<name>.json to the project root."
         )
 
     token_path = accounts[account]
+    creds = _load_credentials(token_path)
+    service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+    _thread_local.services[account] = service
 
-    with _drive_io_lock:
-        # Re-check inside the lock in case another thread just built it
+    # Populate shared metadata cache (only needs to happen once ever)
+    try:
+        about = service.about().get(fields='user,storageQuota').execute()
+        email = about.get('user', {}).get('emailAddress', 'unknown')
+        q = about.get('storageQuota', {})
         with _cache_lock:
-            if account in _service_cache:
-                return _service_cache[account]
-
-        creds = _load_credentials(token_path)
-        service = build('drive', 'v3', credentials=creds, cache_discovery=False)
-
-        try:
-            about = service.about().get(fields='user,storageQuota').execute()
-            email = about.get('user', {}).get('emailAddress', 'unknown')
-            q = about.get('storageQuota', {})
+            _email_cache[account] = email
             _quota_cache[account] = (
                 int(q.get('limit', 0) or 0),
                 int(q.get('usage', 0) or 0),
             )
-        except Exception as e:
-            logger.warning(f"Quota fetch failed for {account}: {e}")
-            email = 'unknown'
+    except Exception as e:
+        logger.warning(f"About fetch failed for {account}: {e}")
 
-        with _cache_lock:
-            _service_cache[account] = service
-            _email_cache[account] = email
-
-    logger.info(f"Drive service loaded for account '{account}' ({email})")
+    logger.info(f"Drive service built for thread {threading.get_ident()} "
+                f"account '{account}'")
     return service
 
 
@@ -191,6 +216,10 @@ def _format_size(size_bytes):
     return f"{size / (1024**3):.2f} GB"
 
 
+def _escape_drive(s):
+    return s.replace("\\", "\\\\").replace("'", "\\'")
+
+
 def _get_breadcrumbs(service, folder_id):
     if folder_id == MY_DRIVE_ROOT:
         return [{'id': MY_DRIVE_ROOT, 'name': 'My Drive'}]
@@ -202,8 +231,8 @@ def _get_breadcrumbs(service, folder_id):
     while current and current not in visited and len(crumbs) < 50:
         visited.add(current)
         try:
-            meta = _locked(lambda: service.files().get(
-                fileId=current, fields='id,name,parents').execute())
+            meta = service.files().get(
+                fileId=current, fields='id,name,parents').execute()
         except HttpError:
             break
         crumbs.insert(0, {'id': meta['id'], 'name': meta.get('name', 'Unknown')})
@@ -218,9 +247,9 @@ def _list_folder(service, folder_id):
     query = f"'{folder_id}' in parents and trashed = false"
     fields = ("files(id, name, size, modifiedTime, mimeType, "
               "parents, iconLink, webViewLink)")
-    results = _locked(lambda: service.files().list(
+    results = service.files().list(
         q=query, fields=fields, orderBy="folder, name", pageSize=1000
-    ).execute())
+    ).execute()
 
     all_items = results.get('files', [])
     folders = []
@@ -250,8 +279,8 @@ def _list_folder(service, folder_id):
     parent_id = None
     if folder_id != MY_DRIVE_ROOT:
         try:
-            meta = _locked(lambda: service.files().get(
-                fileId=folder_id, fields='parents').execute())
+            meta = service.files().get(fileId=folder_id,
+                                        fields='parents').execute()
             parents = meta.get('parents', [])
             parent_id = parents[0] if parents else MY_DRIVE_ROOT
         except HttpError:
@@ -276,19 +305,18 @@ def _get_unique_filename(filename):
 
 def _find_or_create_folder(service, name, parent_id=None):
     try:
-        escaped = name.replace("'", "\\'")
-        q = (f"name = '{escaped}' and "
+        q = (f"name = '{_escape_drive(name)}' and "
              f"mimeType = 'application/vnd.google-apps.folder' and "
              f"trashed = false")
         if parent_id:
             q += f" and '{parent_id}' in parents"
 
-        res = _locked(lambda: service.files().list(
+        res = service.files().list(
             q=q, fields="files(id,name)",
             pageSize=10,
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
-        ).execute())
+        ).execute()
 
         if res.get('files'):
             return res['files'][0]['id']
@@ -296,10 +324,9 @@ def _find_or_create_folder(service, name, parent_id=None):
         body = {'name': name, 'mimeType': 'application/vnd.google-apps.folder'}
         if parent_id:
             body['parents'] = [parent_id]
-        folder = _locked(lambda: service.files().create(
-            body=body, fields='id',
-            supportsAllDrives=True,
-        ).execute())
+        folder = service.files().create(
+            body=body, fields='id', supportsAllDrives=True,
+        ).execute()
         logger.info(f"Created Drive folder '{name}' (id={folder['id']})")
         return folder['id']
     except Exception as e:
@@ -325,7 +352,7 @@ def get_colab_folder_id(account='default'):
 
 
 # ============================================================
-# Colab upload job — lock only around actual Drive calls
+# Colab upload job (runs in its own thread, own service)
 # ============================================================
 def process_colab(task_id, input_path, original_filename, account):
     logger.info(f"Colab task {task_id}: input={input_path} account={account}")
@@ -341,22 +368,20 @@ def process_colab(task_id, input_path, original_filename, account):
         if not colab_folder:
             raise Exception(f"Cannot resolve Colab_Processing for {account}")
 
-        # ---- Upload the source file (lock held for the whole upload) ----
-        with _drive_io_lock:
-            file_metadata = {'name': original_filename, 'parents': [colab_folder]}
-            media = MediaFileUpload(input_path, resumable=True,
-                                    chunksize=10 * 1024 * 1024)
-            request = service.files().create(
-                body=file_metadata, media_body=media, fields='id')
-            response = None
-            while response is None:
-                status, response = request.next_chunk()
-                if status:
-                    pct = int(status.progress() * 100)
-                    t = load_task(task_id)
-                    if t:
-                        t['upload_progress'] = pct
-                        save_task(task_id, t)
+        file_metadata = {'name': original_filename, 'parents': [colab_folder]}
+        media = MediaFileUpload(input_path, resumable=True,
+                                chunksize=10 * 1024 * 1024)
+        request = service.files().create(
+            body=file_metadata, media_body=media, fields='id')
+        response = None
+        while response is None:
+            status, response = request.next_chunk()
+            if status:
+                pct = int(status.progress() * 100)
+                t = load_task(task_id)
+                if t:
+                    t['upload_progress'] = pct
+                    save_task(task_id, t)
 
         task = load_task(task_id)
         task['status'] = 'waiting_colab'
@@ -373,33 +398,27 @@ def process_colab(task_id, input_path, original_filename, account):
 
         while time.time() - start_time < timeout:
             time.sleep(15)
-
-            # Poll for output (short lock)
             query = (f"'{colab_folder}' in parents and name = '{output_name}' "
                      f"and trashed = false")
-            results = _locked(lambda: service.files().list(
-                q=query, fields="files(id, name)").execute())
+            results = service.files().list(
+                q=query, fields="files(id, name)").execute()
             files = results.get('files', [])
-
             if files:
                 file_id = files[0]['id']
-                # Download output + delete it, both under the lock
-                with _drive_io_lock:
-                    request = service.files().get_media(fileId=file_id)
-                    with open(local_output, 'wb') as f:
-                        downloader = MediaIoBaseDownload(
-                            f, request, chunksize=10 * 1024 * 1024)
-                        done = False
-                        while not done:
-                            status, done = downloader.next_chunk()
-                            if status:
-                                pct = int(status.progress() * 100)
-                                t = load_task(task_id)
-                                if t:
-                                    t['download_progress'] = pct
-                                    save_task(task_id, t)
-                    service.files().delete(fileId=file_id).execute()
-
+                request = service.files().get_media(fileId=file_id)
+                with open(local_output, 'wb') as f:
+                    downloader = MediaIoBaseDownload(
+                        f, request, chunksize=10 * 1024 * 1024)
+                    done = False
+                    while not done:
+                        status, done = downloader.next_chunk()
+                        if status:
+                            pct = int(status.progress() * 100)
+                            t = load_task(task_id)
+                            if t:
+                                t['download_progress'] = pct
+                                save_task(task_id, t)
+                service.files().delete(fileId=file_id).execute()
                 final_name = _get_unique_filename(output_name)
                 final_path = os.path.join(UPLOAD_FOLDER, final_name)
                 os.rename(local_output, final_path)
@@ -408,7 +427,6 @@ def process_colab(task_id, input_path, original_filename, account):
                 task['output_file'] = final_name
                 save_task(task_id, task)
                 return
-
         raise TimeoutError("Timeout waiting for Colab output")
 
     except Exception as e:
@@ -436,8 +454,9 @@ def register_routes(app):
             except Exception as e:
                 logger.warning(f"Skipping broken Drive account '{name}': {e}")
                 continue
-            entry['email'] = _email_cache.get(name)
-            limit, usage = _quota_cache.get(name, (0, 0))
+            with _cache_lock:
+                entry['email'] = _email_cache.get(name)
+                limit, usage = _quota_cache.get(name, (0, 0))
             if limit > 0:
                 entry['free_bytes'] = max(0, limit - usage)
             out.append(entry)
@@ -461,10 +480,10 @@ def register_routes(app):
 
             if folder_id != MY_DRIVE_ROOT:
                 try:
-                    meta = _locked(lambda: service.files().get(
+                    meta = service.files().get(
                         fileId=folder_id,
                         fields='id,name,mimeType'
-                    ).execute())
+                    ).execute()
                 except HttpError as e:
                     if e.resp.status == 404:
                         return jsonify({'error': 'Folder not found'}), 404
@@ -528,24 +547,22 @@ def register_routes(app):
             temp_path = None
             try:
                 service = get_drive_service(account)
+                request = service.files().get_media(fileId=file_id)
                 final_name = _get_unique_filename(file_name)
                 temp_path = os.path.join(UPLOAD_FOLDER,
                                           f"{task_id}_temp_{final_name}")
-
-                with _drive_io_lock:
-                    request = service.files().get_media(fileId=file_id)
-                    with open(temp_path, 'wb') as f:
-                        downloader = MediaIoBaseDownload(
-                            f, request, chunksize=10 * 1024 * 1024)
-                        done = False
-                        while not done:
-                            status, done = downloader.next_chunk()
-                            if status:
-                                pct = int(status.progress() * 100)
-                                t = load_task(task_id)
-                                if t:
-                                    t['download_progress'] = pct
-                                    save_task(task_id, t)
+                with open(temp_path, 'wb') as f:
+                    downloader = MediaIoBaseDownload(
+                        f, request, chunksize=10 * 1024 * 1024)
+                    done = False
+                    while not done:
+                        status, done = downloader.next_chunk()
+                        if status:
+                            pct = int(status.progress() * 100)
+                            t = load_task(task_id)
+                            if t:
+                                t['download_progress'] = pct
+                                save_task(task_id, t)
 
                 final_path = os.path.join(UPLOAD_FOLDER, final_name)
                 os.rename(temp_path, final_path)
@@ -576,7 +593,7 @@ def register_routes(app):
             return jsonify({'error': str(e)}), 500
         try:
             service = get_drive_service(account)
-            _locked(lambda: service.files().delete(fileId=file_id).execute())
+            service.files().delete(fileId=file_id).execute()
             return jsonify({'success': True, 'account': account})
         except Exception as e:
             logger.error(f"Drive delete error [{account}]: {e}")
@@ -627,26 +644,24 @@ def register_routes(app):
             save_task(task_id, task)
             try:
                 service = get_drive_service(account)
-
-                with _drive_io_lock:
-                    file_metadata = {
-                        'name': safe_name,
-                        'parents': [target_folder],
-                    }
-                    media = MediaFileUpload(temp_path, resumable=True,
-                                            chunksize=10 * 1024 * 1024)
-                    request = service.files().create(
-                        body=file_metadata, media_body=media,
-                        fields='id,name,size')
-                    response = None
-                    while response is None:
-                        status, response = request.next_chunk()
-                        if status:
-                            pct = int(status.progress() * 100)
-                            t = load_task(task_id)
-                            if t:
-                                t['upload_progress'] = pct
-                                save_task(task_id, t)
+                file_metadata = {
+                    'name': safe_name,
+                    'parents': [target_folder],
+                }
+                media = MediaFileUpload(temp_path, resumable=True,
+                                        chunksize=10 * 1024 * 1024)
+                request = service.files().create(
+                    body=file_metadata, media_body=media,
+                    fields='id,name,size')
+                response = None
+                while response is None:
+                    status, response = request.next_chunk()
+                    if status:
+                        pct = int(status.progress() * 100)
+                        t = load_task(task_id)
+                        if t:
+                            t['upload_progress'] = pct
+                            save_task(task_id, t)
 
                 task = load_task(task_id)
                 task['status'] = 'done'
