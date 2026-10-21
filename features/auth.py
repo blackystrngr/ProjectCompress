@@ -17,12 +17,26 @@ PASSWORD_FILE = os.path.join(
 _cache = {'mtime': 0, 'password': None}
 
 # Endpoints that must remain reachable without Basic Auth because they
-# have their own header-token authentication (for the browser extension).
+# have their own header-token authentication (for the browser extension
+# and the Colab coordinator).
 EXEMPT_PATHS = {
     '/favicon.ico',
     '/upload_cookies',
     '/upload_token',
+    '/processed_list',
 }
+
+EXEMPT_PREFIXES = (
+    '/mark_processing/',
+    '/mark_done/',
+    '/mark_failed/',
+)
+
+
+def _is_exempt(path):
+    if path in EXEMPT_PATHS:
+        return True
+    return any(path.startswith(p) for p in EXEMPT_PREFIXES)
 
 
 def _load_password():
@@ -74,7 +88,7 @@ def register_auth(app):
 
     @app.before_request
     def _require_auth():
-        if request.path in EXEMPT_PATHS:
+        if _is_exempt(request.path):
             return None
 
         if _check_basic_auth(request.authorization):
