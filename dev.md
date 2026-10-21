@@ -1,7 +1,6 @@
 # 🛠️ ProjectCompress — Developer Guide
 
-A complete walkthrough of the architecture, structure, and workflow for anyone
-joining the project or extending it.
+A complete walkthrough of the architecture, structure, and workflow for anyone joining the project or extending it.
 
 ---
 
@@ -13,20 +12,24 @@ joining the project or extending it.
 4. [How It Was Built](#4-how-it-was-built)
 5. [The Task System (Core Concept)](#5-the-task-system-core-concept)
 6. [Real-Time Updates (SSE)](#6-real-time-updates-sse)
-7. [Feature Modules](#7-feature-modules)
-8. [Frontend Structure](#8-frontend-structure)
-9. [How to Add a New Feature](#9-how-to-add-a-new-feature)
-10. [How to Maintain the Project](#10-how-to-maintain-the-project)
-11. [Common Debugging](#11-common-debugging)
-12. [Conventions & Best Practices](#12-conventions--best-practices)
-13. [Deployment](#13-deployment)
+7. [Settings System](#7-settings-system)
+8. [Theme System (Classic vs Modern)](#8-theme-system-classic-vs-modern)
+9. [Telegram Logger](#9-telegram-logger)
+10. [Authentication](#10-authentication)
+11. [Feature Modules](#11-feature-modules)
+12. [Frontend Structure](#12-frontend-structure)
+13. [How to Add a New Feature](#13-how-to-add-a-new-feature)
+14. [How to Add a New Setting](#14-how-to-add-a-new-setting)
+15. [How to Maintain the Project](#15-how-to-maintain-the-project)
+16. [Common Debugging](#16-common-debugging)
+17. [Conventions & Best Practices](#17-conventions--best-practices)
+18. [Deployment](#18-deployment)
 
 ---
 
 ## 1. What Is This Project?
 
-**ProjectCompress** is a self-hosted Flask web app that gives you a single
-dashboard for:
+**ProjectCompress** is a self-hosted Flask web app that gives you a single dashboard for:
 
 - Downloading videos/files from any URL
 - Compressing videos with FFmpeg
@@ -34,10 +37,17 @@ dashboard for:
 - Scanning and downloading from Telegram chats
 - OCR, subtitles, proxies, torrents, face-swap, web crawling
 
-It is not a "framework" — it's a **modular toolbox**. Every feature is a Python
-file in `features/` that plugs into the main Flask app.
+It is not a "framework" — it's a **modular toolbox**. Every feature is a Python file in `features/` that plugs into the main Flask app.
 
 **Audience:** Personal VPS deployment. Not multi-user SaaS.
+
+**Recent additions (v2):**
+- Dual-theme UI (classic + animated modern) with persistent switcher
+- Right-side settings panel with live-apply (no restart)
+- Central `settings.json` store for all runtime toggles
+- Telegram log-forwarding (bot or user session, batch + rate-limited)
+- Basic Auth using `/root/.password` (env-overridable, multi-location)
+- Auto-join for Telegram channels (invite, public, private-ID)
 
 ---
 
@@ -46,45 +56,37 @@ file in `features/` that plugs into the main Flask app.
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                       BROWSER (SPA-like)                     │
-│  - Tabs for each feature                                     │
-│  - SSE connection for live task updates                      │
-│  - Per-feature polling for their own task progress           │
+│  • Dual stylesheets (classic + modern), one active           │
+│  • Tabs for each feature                                     │
+│  • Slide-out settings panel (right edge)                     │
+│  • SSE connection for live task updates                      │
+│  • Per-feature polling for their own task progress           │
 └─────────────────────────────────────────────────────────────┘
-                              │
-                              │  HTTP + SSE
+                              │ HTTP + SSE + Basic Auth
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                  FLASK APP (app.py, Waitress)                │
-│                                                              │
-│  Core routes:                                                │
-│   /                       → main UI                          │
-│   /start                  → queue download                   │
-│   /progress/<id>          → per-task progress                │
-│   /cancel/<id>            → cancel task                      │
-│   /get_tasks              → list all tasks                   │
-│   /tasks/stream           → SSE stream                       │
-│   /system_stats           → CPU/RAM/Disk/Network             │
-│   /upload_cookies         → receive cookies from extension   │
+│  /start  /progress/<id>  /cancel/<id>  /get_tasks            │
+│  /tasks/stream (SSE)   /system_stats                         │
+│  /settings GET/POST   /settings/debug                        │
+│  /telegram/log/test   /telegram/log/status                   │
+│  /upload_cookies      /upload_token                          │
 └─────────────────────────────────────────────────────────────┘
-                              │
-                              │  register_routes(app)
+                              │ register_routes(app)
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                      features/*.py                           │
-│  Every feature is an independent module that registers its   │
-│  own routes with the Flask app.                             │
+│  auth.py  settings.py  telegram_logger.py  (+ all features)  │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                      External Tools                          │
 │  yt-dlp · ffmpeg · telethon · google-api · tesseract ·       │
-│  libtorrent · requests                                       │
+│  libtorrent · requests · playwright                          │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Key idea:** Every long-running job is a **task**, stored as a JSON file in
-`tasks/`, and reported to the UI via either SSE (global) or polling (per-feature).
+**Key idea:** Every long-running job is a **task** stored as a JSON file in `tasks/`, reported to the UI via SSE or polling. Every runtime toggle lives in `settings.json`, exposed via `/settings`, applied live — no restart.
 
 ---
 
@@ -93,17 +95,22 @@ file in `features/` that plugs into the main Flask app.
 ```
 ProjectCompress/
 ├── app.py                    # Flask entry, core routes, SSE, system stats
-├── config.py                 # Paths, secrets, API keys
-├── tasks.py                  # Task state + in-memory cache + broadcaster
+├── config.py                 # Paths, secrets, folder IDs
+├── tasks.py                  # Task state + cache + broadcaster
 ├── requirements.txt
-├── install.sh                # One-shot installer
+├── install.sh
 ├── settings.json             # Runtime settings (auto-generated)
-├── cookies.txt               # YouTube/site cookies (from extension)
-├── token.json                # Google OAuth token
-├── telegram_creds.json       # Telegram API credentials
+├── cookies.txt               # YouTube/site cookies
+├── token.json                # Google OAuth (account "default")
+├── token_<name>.json         # Additional Drive accounts
+├── telegram_creds.json       # Telegram API id/hash
+├── .password                 # LEGACY (now /root/.password)
 │
-├── features/                 # ← ALL features live here
-│   ├── __init__.py           # register_all_features(app)
+├── features/
+│   ├── __init__.py
+│   ├── auth.py               # Basic Auth (via /root/.password)
+│   ├── settings.py           # settings.json API + validation
+│   ├── telegram_logger.py    # logs + events → Telegram
 │   ├── url_download.py
 │   ├── video_extractor.py
 │   ├── video_clipper.py
@@ -118,85 +125,54 @@ ProjectCompress/
 │   ├── web_crawler.py
 │   └── thumbnails.py
 │
-├── templates/                # Jinja2 HTML
-│   ├── base.html             # Main shell
+├── templates/
+│   ├── base.html             # Shell (theme switcher + settings panel)
 │   ├── index.html
-│   ├── _features_macro.html  # Tab + pane macros
-│   └── features/
-│       ├── url.html
-│       ├── telegram.html
-│       ├── drive.html
-│       ├── local.html
-│       ├── video_clipper.html
-│       ├── proxy_fetcher.html
-│       ├── subtitle_finder.html
-│       ├── ocr.html
-│       └── web_crawler.html
+│   ├── _features_macro.html
+│   └── features/ (url.html, telegram.html, drive.html,
+│                  local.html, video_clipper.html,
+│                  proxy_fetcher.html, subtitle_finder.html,
+│                  ocr.html, web_crawler.html)
 │
 ├── static/
-│   ├── css/style.css
-│   └── js/app.js             # Global SSE, tabs, helpers, polling
+│   ├── css/
+│   │   ├── style.css         # Classic theme
+│   │   └── style-modern.css  # Modern animated theme
+│   └── js/app.js             # Global SSE, tabs, helpers
 │
-├── downloads/                # All user files
-│   ├── .thumbnails/          # Cached video thumbnails
-│   └── (playlists, clips, etc.)
+├── downloads/
+│   ├── .thumbnails/
+│   ├── playlist_<id>_<q>/
+│   ├── clips_<task_id>/
+│   ├── frames_<task_id>/
+│   └── crack_debug/
 │
-├── tasks/                    # Task state JSON files (one per task)
-├── proxy_cache/              # Cached proxy results
-└── venv/                     # Optional virtualenv
+├── tasks/                    # Task JSON files
+├── proxy_cache/
+└── venv/ (optional)
+
+External:
+/root/.password               # Auth (primary location)
+/root/.cache/ms-playwright/   # Playwright browsers
 ```
 
 ---
 
 ## 4. How It Was Built
 
-The project was developed incrementally, feature by feature. Here's the pattern
-used for every new capability:
+Every new capability follows the same pattern:
 
-### Step 1: Identify the capability
-Example: "I want to OCR an image."
-
-### Step 2: Create a feature module
-`features/ocr.py` — a self-contained file with:
-- Helper functions
-- A background worker function
-- A `register_routes(app)` function
-
-### Step 3: Register it in `features/__init__.py`
-```python
-from . import ocr
-ocr.register_routes(app)
-```
-
-### Step 4: Create a UI pane
-`templates/features/ocr.html` with form + JavaScript.
-
-### Step 5: Add it to the tab macro
-In `templates/_features_macro.html`:
-```html
-<button class="tab-btn" data-tab="ocr">
-    <i class="fas fa-file-alt"></i> OCR
-</button>
-...
-<div id="ocr-tab" class="tab-pane">
-    {% include 'features/ocr.html' %}
-</div>
-```
-
-### Step 6: Test end-to-end
-Drop a file in → watch task progress → see output.
-
-**Every feature follows this exact pattern.** Once you understand one, you
-understand them all.
+1. **Create feature module** `features/my_feature.py` — self-contained with helpers, worker, `register_routes(app)`
+2. **Register in `features/__init__.py`** — `from . import my_feature; my_feature.register_routes(app)`
+3. **Create UI pane** `templates/features/my_feature.html` — form + JS
+4. **Add to `_features_macro.html`** — tab button + pane include
+5. **Test end-to-end** — drop a file in → watch progress → see output
 
 ---
 
 ## 5. The Task System (Core Concept)
 
-Every long-running job is a **task** — identified by a UUID, stored as
-`tasks/<uuid>.json`.
-
-### Task structure (typical)
+Every long-running job is a **task** — UUID-named JSON file in `tasks/`.
 
 ```json
 {
@@ -211,130 +187,279 @@ Every long-running job is a **task** — identified by a UUID, stored as
 }
 ```
 
-### Why tasks?
+**Why tasks?** Persistent (survive restarts), inspectable (read by ID), cancellable (flip flag).
 
-- **Persistent** — survive page reloads and even server restarts
-- **Inspectable** — any code can read a task's state by ID
-- **Cancellable** — flip `cancelled: true` and workers check for it
+**Lifecycle:** `queued → running → done | error | cancelled`
 
-### The task lifecycle
-
-```
-queued → running (multiple sub-statuses) → done | error | cancelled
-```
-
-### Writing to a task
-
+**Writing:**
 ```python
 from tasks import load_task, save_task
-
 task = load_task(task_id)
 task['progress'] = 50
 save_task(task_id, task)
 ```
 
-`save_task()`:
-1. Updates the in-memory cache (instant reads)
-2. Writes to disk (persistence)
-3. Broadcasts to all SSE clients
+`save_task()` updates cache → writes disk → broadcasts SSE → forwards to Telegram logger.
 
-### Reading a task
-
-```python
-task = load_task(task_id)
-if task.get('cancelled'):
-    return  # user cancelled
-```
-
-### Task cleanup
-
-Terminal tasks (`done`, `error`, `cancelled`) are kept for 10 minutes
-then auto-removed on next server startup via `cleanup_old_tasks()`.
+**Cleanup:** Terminal tasks removed after 10 min (`cleanup_old_tasks()`).
 
 ---
 
 ## 6. Real-Time Updates (SSE)
 
-The app uses **Server-Sent Events** — a one-way streaming connection from
-server to browser.
+One-way stream from server to browser.
 
-### How it works
-
-1. Browser opens `EventSource('/tasks/stream')`.
-2. Server pushes the **full task list** whenever any task changes.
-3. Browser re-renders the task list.
-4. Connection auto-reconnects if it drops.
-
-### Server side (`app.py`)
-
+**Server (`app.py`):**
 ```python
 @app.route('/tasks/stream')
 def tasks_stream():
     q = queue.Queue(maxsize=1)
     add_subscriber(q)
-
     def event_stream():
         try:
-            initial = json.dumps(get_active_tasks())
-            yield f"data: {initial}\n\n"
+            yield f"data: {json.dumps(get_active_tasks())}\n\n"
             while True:
                 try:
-                    data = q.get(timeout=HEARTBEAT_SECONDS)
-                    yield f"data: {data}\n\n"
+                    yield f"data: {q.get(timeout=HEARTBEAT_SECONDS)}\n\n"
                 except queue.Empty:
                     yield ": heartbeat\n\n"
         finally:
             remove_subscriber(q)
-
     return Response(stream_with_context(event_stream()),
                     mimetype="text/event-stream")
 ```
 
-### Broadcast (`tasks.py`)
+**Why not WebSockets?** SSE is simpler, works over plain HTTP, auto-reconnects, one-way is enough here.
 
-Every `save_task()` triggers `_broadcast_from_cache()`, which pushes the
-snapshot to all subscribers.
-
-### Why not WebSockets?
-
-SSE is simpler, works over plain HTTP, auto-reconnects, and is perfectly
-suited for one-way server→client updates. WebSockets are overkill here.
+**Log noise:** `waitress` logs `Client disconnected` when tabs close. Not an error. Silence:
+```python
+logging.getLogger('waitress').setLevel(logging.WARNING)
+```
 
 ---
 
-## 7. Feature Modules
+## 7. Settings System
 
-Each feature in `features/` follows the same structure:
+Central config store powering the settings panel.
 
-### Skeleton
+**Design:** One file (`settings.json`), one API (`/settings`), live apply, validation, secrets stay server-side.
 
+**Key functions (`features/settings.py`):**
+```python
+load_settings()                     # raw dict
+save_settings(data) -> (ok, err)    # atomic write
+get_effective_config()              # settings.json → env → default
+```
+
+**Schema:**
+```python
+ALLOWED_KEYS = {
+    'ui_theme':             {'type': 'str',  'choices': ('classic', 'modern')},
+    'thumbnails_enabled':   {'type': 'bool'},
+    'coordinator_enabled':  {'type': 'bool'},
+    'tg_log_enabled':       {'type': 'bool'},
+    'tg_log_channel':       {'type': 'str',  'max': 200},
+    'tg_log_bot_token':     {'type': 'str',  'max': 200},
+    'tg_log_level':         {'type': 'str',
+                             'choices': ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')},
+}
+```
+
+**Value precedence:** `settings.json` → env var → default.
+
+**Endpoints:**
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/settings` | Config (token masked) + env hints |
+| POST | `/settings` | Write subset, apply to subsystems |
+| GET | `/settings/debug` | Diagnostic (path, permissions, write test) |
+
+POST handler applies changes:
+```python
+if 'thumbnails_enabled' in updated:
+    from .thumbnails import set_thumbnails_enabled
+    set_thumbnails_enabled(current['thumbnails_enabled'])
+if 'coordinator_enabled' in updated:
+    from .google_drive import set_coordinator_enabled
+    set_coordinator_enabled(current['coordinator_enabled'])
+if any(k.startswith('tg_log_') for k in updated):
+    from .telegram_logger import reconfigure
+    reconfigure()
+```
+
+`ui_theme` is applied **client-side** — server persists only.
+
+**Diagnostic endpoint:** `/settings/debug` returns path, permissions, `write_test: "ok"|error`. First thing to check when saves fail.
+
+---
+
+## 8. Theme System (Classic vs Modern)
+
+Two complete stylesheets, one active. **Classic is never modified.**
+
+```
+static/css/
+├── style.css           # Original dark theme
+└── style-modern.css    # Animated, glassmorphic
+```
+
+**Load (`base.html`):**
+```html
+<link rel="stylesheet" href="...style.css"        id="theme-classic">
+<link rel="stylesheet" href="...style-modern.css" id="theme-modern">
+<script>
+    (function () {
+        var theme = 'classic';
+        try { theme = localStorage.getItem('ui-theme') || 'classic'; } catch (e) {}
+        if (theme !== 'modern' && theme !== 'classic') theme = 'classic';
+        document.documentElement.dataset.theme = theme;
+        document.getElementById('theme-classic').disabled = (theme === 'modern');
+        document.getElementById('theme-modern').disabled  = (theme !== 'modern');
+    })();
+</script>
+```
+
+Both sheets download once. `disabled` toggling = instant switch, no FOUC.
+
+**Switching:** `window.applyTheme(theme, syncServer)` — called from sys-stats pill and settings panel.
+
+**Persistence:** localStorage (fast, no flash) + settings.json (source of truth).
+
+**Modern-only effects** (spotlight, ripple) gate on `document.documentElement.dataset.theme === 'modern'`.
+
+**GPU note:** `backdrop-filter` and `filter: blur()` are expensive. For low-power devices add a perf-mode toggle:
+```css
+html[data-perf="1"] *, html[data-perf="1"] *::before, html[data-perf="1"] *::after {
+    animation: none !important;
+    transition: none !important;
+    backdrop-filter: none !important;
+    filter: none !important;
+}
+```
+
+**`prefers-reduced-motion`** respected in both themes.
+
+---
+
+## 9. Telegram Logger
+
+Forwards `WARNING+` logs + task events to a Telegram channel.
+
+**Modes:**
+| Mode | When | Session |
+|---|---|---|
+| **Bot** (recommended) | `tg_log_bot_token` set | `:memory:` — no locks |
+| **User** | token empty, session exists | cloned from main |
+
+**Config (`settings.json`):** `tg_log_enabled`, `tg_log_channel`, `tg_log_bot_token`, `tg_log_level`. All fall back to `TG_LOG_*` env vars.
+
+**Channel normalization** — `_normalize_channel()` accepts:
+| Input | Normalized |
+|---|---|
+| `-1004480032378` (str) | `int(-1004480032378)` ✅ |
+| `@mychannel` | `'@mychannel'` |
+| `https://t.me/mychannel` | `'@mychannel'` |
+| `https://t.me/+InviteCode` | `'+InviteCode'` (rejected — bot can't join) |
+
+**Critical:** Telethon bots require **integer** IDs for private channels.
+
+**Worker architecture:**
+```
+log record → _Handler.emit() → Worker.enqueue()
+                                 ↓
+                          [asyncio thread]
+                                 ↓
+                     collect_batch (3s, max 15)
+                                 ↓
+                     rate-limit (min 3s between sends)
+                                 ↓
+                     _send() → Telethon → Telegram
+                                 ↓
+                     retry [0, 5, 15, 60]s on fail
+```
+
+**Safety:**
+| Concern | Handling |
+|---|---|
+| Blocking requests | `put_nowait()` — microseconds |
+| Flood limits | Batch + min interval ≈ 20/min |
+| Chatty `save_task` | Only fires on first-seen + terminal |
+| Telegram down | Retry then drop |
+| Crashes | Every layer in try/except |
+| Circular import | Lazy import inside `save_task()` |
+| Database locks | Bot mode uses `:memory:` |
+| Long messages | Truncate at 3800 chars |
+| HTML parse fail | Fallback to plain text |
+| Queue overflow | Drop past 500 |
+| Shutdown | `atexit` flushes |
+
+**Endpoints:**
+| GET | `/telegram/log/test` | Send test, wait 15s |
+| GET | `/telegram/log/status` | State JSON |
+
+**Bot setup:**
+1. `@BotFather` → create bot → copy token
+2. Add bot as **administrator** of channel with "Post messages"
+3. Settings panel → paste channel + token → Save
+4. Click "Send test message"
+
+If bot isn't admin → `/telegram/log/test` returns 202, server log shows `ChatWriteForbiddenError`.
+
+---
+
+## 10. Authentication
+
+HTTP Basic Auth on every route, with exempt-list for header-token endpoints.
+
+**Password file resolution order:**
+1. `$AUTH_PASSWORD_FILE` (env override)
+2. `/root/.password` (primary)
+3. `~/.password`
+4. `<project_root>/.password` (legacy)
+
+First existing wins. **Fail-closed** if none exist (all 401).
+
+**Setup:**
+```bash
+sudo sh -c 'echo "YourPassword" > /root/.password'
+sudo chmod 600 /root/.password
+sudo chown root:root /root/.password
+```
+
+**Live reload:** mtime checked each request — edits take effect immediately, no restart.
+
+**Exempt paths:**
+```python
+EXEMPT_PATHS = {'/favicon.ico', '/upload_cookies',
+                '/upload_token', '/processed_list'}
+EXEMPT_PREFIXES = ('/mark_processing/', '/mark_done/', '/mark_failed/')
+```
+
+**Timing-safe comparison:** `hmac.compare_digest`.
+
+**Nginx option:** If using Nginx basic auth, disable Flask auth to avoid double prompts (remove `auth.register_auth(app)` from `__init__.py`).
+
+---
+
+## 11. Feature Modules
+
+**Skeleton:**
 ```python
 # features/my_feature.py
-import os
-import uuid
-import threading
-import logging
+import os, uuid, threading, logging
 from flask import request, jsonify
 from tasks import save_task, load_task
 from config import UPLOAD_FOLDER
 
 logger = logging.getLogger(__name__)
 
-
-# ---- Worker (runs in a background thread) ----
 def process_task(task_id, input_data):
     task = load_task(task_id)
     task['status'] = 'running'
     save_task(task_id, task)
-
     try:
-        # ... do the actual work ...
-        # periodically:
-        #   task['progress'] = X
-        #   save_task(task_id, task)
-        # and check cancellation:
-        #   if load_task(task_id).get('cancelled'): return
-
+        # ... work ... periodically save_task with task['progress']
+        # check cancellation: if load_task(task_id).get('cancelled'): return
         task['status'] = 'done'
         task['output_file'] = 'result.mp4'
         save_task(task_id, task)
@@ -345,389 +470,279 @@ def process_task(task_id, input_data):
         task['error_msg'] = str(e)
         save_task(task_id, task)
 
-
-# ---- Routes ----
 def register_routes(app):
-
     @app.route('/my_feature/start', methods=['POST'])
     def my_feature_start():
-        # 1. Validate input
         value = request.form.get('value')
         if not value:
             return jsonify({'error': 'value required'}), 400
-
-        # 2. Create a task
         task_id = str(uuid.uuid4())
         save_task(task_id, {
-            'task_id': task_id,
-            'status': 'queued',
-            'progress': 0,
-            'created_at': time.time(),
-            'cancelled': False,
+            'task_id': task_id, 'status': 'queued', 'progress': 0,
+            'created_at': time.time(), 'cancelled': False,
         })
-
-        # 3. Launch background worker
-        threading.Thread(
-            target=process_task,
-            args=(task_id, value),
-            daemon=True,
-        ).start()
-
-        # 4. Return task_id so UI can poll /progress/<task_id>
+        threading.Thread(target=process_task, args=(task_id, value),
+                         daemon=True).start()
         return jsonify({'task_id': task_id})
 ```
 
-That's the entire contract.
+**Feature reference:**
+| Feature | Purpose | Dep |
+|---|---|---|
+| `url_download.py` | URL/magnet/torrent/playlist download | yt-dlp, requests |
+| `video_clipper.py` | Clips, frames, summary, trim | ffmpeg |
+| `ocr.py` | Text extraction | pytesseract |
+| `telegram.py` | Chat scan/download/upload | telethon |
+| `google_drive.py` | Drive browse/download/upload | google-api |
+| `local_files.py` | File browser | Flask |
+| `web_crawler.py` | Domain discovery | requests, bs4 |
+| `thumbnails.py` | Video thumbnails | ffmpeg |
+| `auth.py` | Basic Auth | Flask |
+| `settings.py` | Config store | Flask |
+| `telegram_logger.py` | Log forwarding | telethon |
 
-### Example features and what they do
-
-| Feature | What it does | Key dependency |
-|---------|--------------|----------------|
-| `url_download.py` | Downloads videos, files, torrents, playlists | `yt-dlp`, `requests` |
-| `video_clipper.py` | Random clips, frames, summarizer | `ffmpeg` |
-| `ocr.py` | Extracts text from images/PDFs | `pytesseract` |
-| `telegram.py` | Scans/downloads/upload from chats | `telethon` |
-| `google_drive.py` | Lists/downloads/deletes Drive files | `google-api-python-client` |
-| `local_files.py` | File browser for `downloads/` | Flask only |
-| `web_crawler.py` | Recursive domain discovery | `requests`, `bs4` |
-| `thumbnails.py` | Extracts thumbnails from videos | `ffmpeg` |
-
----
-
-## 8. Frontend Structure
-
-### Base shell: `templates/base.html`
-
-Contains:
-- Top system stats bar (CPU/RAM/Disk/Network)
-- Thumbnail pause toggle
-- Header + tab bar
-- Active tasks panel
-- Global `<script src="app.js">`
-
-### Tabs and panes: `templates/_features_macro.html`
-
-Two macros:
-- `render_tabs()` — the tab buttons
-- `render_panes()` — the content containers
-
-Every feature appears in both.
-
-### Global JS: `static/js/app.js`
-
-Responsibilities:
-- Opens the SSE connection to `/tasks/stream`
-- Renders the task list
-- Wires up tab switching
-- Provides helpers (`showToast`, `escapeHtml`, `formatBytes`)
-- Handles persistent task polling per feature
-
-### Per-feature JS: inside each `templates/features/*.html`
-
-Each feature has its own `<script>` block that:
-- Handles its form submission
-- Polls `/progress/<task_id>` for its own task
-- Renders its own result UI
-
-**Two-layer task system:**
-- **Global panel** (bottom of page) — shows every active task via SSE
-- **Feature-local panel** — shows only its own task via polling
-
----
-
-## 9. How to Add a New Feature
-
-Let's add a hypothetical **"MP3 Converter"**.
-
-### Step 1: Create `features/mp3_converter.py`
-
+**`__init__.py` order matters:**
 ```python
-import os
-import uuid
-import time
-import threading
-import logging
-import subprocess
-from flask import request, jsonify
-from tasks import save_task, load_task
-from config import UPLOAD_FOLDER
-
-logger = logging.getLogger(__name__)
-
-
-def convert_to_mp3(task_id, input_path):
-    task = load_task(task_id)
-    task['status'] = 'converting'
-    save_task(task_id, task)
-
-    out_name = os.path.splitext(os.path.basename(input_path))[0] + '.mp3'
-    out_path = os.path.join(UPLOAD_FOLDER, out_name)
-
-    try:
-        cmd = ['ffmpeg', '-y', '-i', input_path,
-               '-vn', '-c:a', 'libmp3lame', '-b:a', '192k', out_path]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        if result.returncode != 0:
-            raise Exception(result.stderr[:200])
-
-        task = load_task(task_id)
-        task['status'] = 'done'
-        task['progress'] = 100
-        task['output_file'] = out_name
-        save_task(task_id, task)
-    except Exception as e:
-        logger.exception("MP3 conversion failed")
-        task = load_task(task_id)
-        task['status'] = 'error'
-        task['error_msg'] = str(e)
-        save_task(task_id, task)
-
-
-def register_routes(app):
-
-    @app.route('/mp3/convert', methods=['POST'])
-    def mp3_convert():
-        filename = request.form.get('filename', '')
-        if not filename:
-            return jsonify({'error': 'filename required'}), 400
-
-        input_path = os.path.join(UPLOAD_FOLDER, filename)
-        if not os.path.exists(input_path):
-            return jsonify({'error': 'File not found'}), 404
-
-        task_id = str(uuid.uuid4())
-        save_task(task_id, {
-            'task_id': task_id,
-            'status': 'queued',
-            'progress': 0,
-            'created_at': time.time(),
-            'cancelled': False,
-        })
-        threading.Thread(
-            target=convert_to_mp3,
-            args=(task_id, input_path),
-            daemon=True,
-        ).start()
-        return jsonify({'task_id': task_id})
-```
-
-### Step 2: Register in `features/__init__.py`
-
-```python
-from . import mp3_converter
-# ...
 def register_all_features(app):
-    # ...
-    mp3_converter.register_routes(app)
+    telegram_logger.register_logging(app)  # FIRST — captures startup logs
+    auth.register_auth(app)                # Early — before_request hook
+    # ...all feature routes...
+    settings.register_routes(app)          # Last — POSTs need subsystems ready
+    telegram_logger.register_routes(app)
 ```
 
-### Step 3: Create `templates/features/mp3_converter.html`
+**Special:** `features/telegram.py` has `resolve_entity(client, chat_link)` — always use it instead of raw `get_entity()`. Handles all link formats, auto-joins, returns readable errors.
 
+---
+
+## 12. Frontend Structure
+
+**`base.html` contains:**
+- System-stats bar (CPU/RAM/Disk/Net + Pause Thumbs + Theme toggle)
+- Header + tab bar
+- Settings FAB (right edge) + slide-out panel
+- Active tasks panel
+- Early theme script (prevents FOUC)
+- Settings panel logic
+- Modern-UI effects (gated on theme)
+- `<script src="app.js">`
+
+**`_features_macro.html`:** `render_tabs()` + `render_panes()` macros.
+
+**`app.js` responsibilities:** SSE connection, task rendering, tab switching, helpers (`showToast`, `escapeHtml`, `formatBytes`), per-feature polling.
+
+**Per-feature JS:** inside each pane — form submission, own task polling, own result UI.
+
+**Settings panel structure:**
 ```html
-<div class="card">
-    <h2><i class="fas fa-music"></i> MP3 Converter</h2>
-    <div class="input-group">
-        <input type="text" id="mp3File" placeholder="video.mp4">
-        <button id="mp3ConvertBtn" class="primary">
-            <i class="fas fa-play"></i> Convert
-        </button>
+<button id="settingsFab">⚙</button>
+<div id="settingsOverlay"></div>
+<aside id="settingsPanel">
+    <header>...</header>
+    <div class="settings-body">
+        <section>Appearance (ui_theme)</section>
+        <section>Telegram (enabled/channel/token/level + test)</section>
+        <section>Colab Coordinator</section>
+        <section>Thumbnails</section>
     </div>
-    <div id="mp3Status" class="help-text"></div>
-</div>
-
-<script>
-document.getElementById('mp3ConvertBtn').onclick = async () => {
-    const filename = document.getElementById('mp3File').value.trim();
-    if (!filename) return showToast('Filename required', true);
-
-    const form = new URLSearchParams();
-    form.append('filename', filename);
-
-    const resp = await fetch('/mp3/convert', { method: 'POST', body: form });
-    const data = await resp.json();
-    if (data.error) return showToast(data.error, true);
-
-    const statusEl = document.getElementById('mp3Status');
-    const interval = setInterval(async () => {
-        const r = await fetch(`/progress/${data.task_id}`);
-        const task = await r.json();
-        if (task.status === 'done') {
-            clearInterval(interval);
-            statusEl.innerHTML = `✅ <a href="/download_file?path=${task.output_file}">Download</a>`;
-        } else if (task.status === 'error') {
-            clearInterval(interval);
-            statusEl.innerHTML = `❌ ${task.error_msg}`;
-        } else {
-            statusEl.innerHTML = `⏳ ${task.status}`;
-        }
-    }, 2000);
-};
-</script>
+    <footer>Save / Reload</footer>
+</aside>
 ```
 
-### Step 4: Add to `_features_macro.html`
-
-```html
-{% macro render_tabs() %}
-<!-- ... existing tabs ... -->
-<button class="tab-btn" data-tab="mp3">
-    <i class="fas fa-music"></i> MP3
-</button>
-{% endmacro %}
-
-{% macro render_panes() %}
-<!-- ... existing panes ... -->
-<div id="mp3-tab" class="tab-pane">
-    {% include 'features/mp3_converter.html' %}
-</div>
-{% endmacro %}
-```
-
-### Step 5: Restart Flask → done
-
-Your feature is live, uses the standard task system, and integrates with
-the global task panel automatically.
+Panel CSS is inline in `base.html` (theme-independent). JS: loads `/settings` on open, diffs on save (only changed keys), displays field errors via `#setSaveStatus`, applies `ui_theme` locally after save, syncs thumbnails with sys-stats.
 
 ---
 
-## 10. How to Maintain the Project
+## 13. How to Add a New Feature
 
-### Daily / weekly
+Example: "MP3 Converter".
 
-- **Monitor task files**: `ls tasks/*.json | wc -l` — should stay small.
-  The startup cleanup handles old ones, but you can manually delete stale files.
-- **Check `downloads/` size**: Big libraries fill the disk fast.
-- **Check `cookies.txt` freshness**: YouTube cookies expire ~every few weeks.
-- **Restart Flask periodically** to clear memory and stale threads.
-
-### Monthly
-
-- **Update yt-dlp**: `pip install --break-system-packages -U yt-dlp`
-  (YouTube breaks yt-dlp frequently).
-- **Update ffmpeg** if you installed via static build — re-run `install.sh`.
-- **Empty Drive trash** if you use the Drive features heavily.
-- **Review logs**: `journalctl -u projectcompress -n 200` for errors.
-
-### When YouTube downloads fail
-
-1. Export fresh cookies via the browser extension.
-2. Upload them via the extension.
-3. Verify `cookies.txt` has current entries.
-4. Test: `yt-dlp --cookies cookies.txt <url>` in the terminal.
-
-### When a task hangs
-
-1. Check `/tasks/<task_id>.json` — status tells you where it's stuck.
-2. Check running processes: `ps aux | grep -E "ffmpeg|yt-dlp"`.
-3. Cancel via the UI → it flips `cancelled: true` and calls `kill_process()`.
-4. If the worker ignores it, restart Flask.
+1. **Create `features/mp3_converter.py`** with worker + `register_routes(app)` (see §11 skeleton).
+2. **Register in `features/__init__.py`:**
+   ```python
+   from . import mp3_converter
+   # inside register_all_features:
+   mp3_converter.register_routes(app)
+   ```
+3. **Create `templates/features/mp3_converter.html`** — form + JS polling `/progress/<task_id>`.
+4. **Add to `_features_macro.html`:**
+   ```html
+   <button class="tab-btn" data-tab="mp3">
+       <i class="fas fa-music"></i> MP3
+   </button>
+   <div id="mp3-tab" class="tab-pane">
+       {% include 'features/mp3_converter.html' %}
+   </div>
+   ```
+5. **Restart Flask** → feature live, uses standard task system, auto-integrates with global panel + Telegram logger.
 
 ---
 
-## 11. Common Debugging
+## 14. How to Add a New Setting
 
-### "Task stuck in `queued` forever"
+Six steps for a new toggle (example: `whisper_model`).
 
-The thread never started. Check that `threading.Thread(...).start()` is called.
-
-### "Task shows progress but file never appears"
-
-The worker finished but `output_file` wasn't set. Check the worker's end path.
-
-### "SSE connection errors in browser console"
-
-- Check `/tasks/stream` returns `Content-Type: text/event-stream`
-- Ensure `HEARTBEAT_SECONDS` in `app.py` isn't too high for your proxies
-- Check firewall isn't buffering responses
-
-### "ffmpeg not found" when task runs
-
-Subprocesses may not inherit the same `PATH` as your shell. Always:
-
+**1. Schema in `features/settings.py`:**
 ```python
-os.environ['PATH'] = '/usr/local/bin:' + os.environ.get('PATH', '')
+ALLOWED_KEYS = {
+    'whisper_model': {'type': 'str',
+                      'choices': ('tiny', 'base', 'small', 'medium', 'large')},
+}
 ```
 
-at the start of any worker that spawns ffmpeg/yt-dlp.
+**2. `get_effective_config()`:**
+```python
+'whisper_model': s.get('whisper_model', 'base'),
+```
 
-### "Cancel doesn't work"
+**3. UI in `base.html` (`settings-body`):**
+```html
+<section class="settings-section">
+    <h3><i class="fas fa-microphone"></i> Whisper</h3>
+    <label class="settings-row">
+        <span>Model</span>
+        <select id="setWhisperModel">
+            <option value="tiny">tiny</option>
+            <option value="base">base</option>
+            <option value="small">small</option>
+            <option value="medium">medium</option>
+            <option value="large">large</option>
+        </select>
+    </label>
+</section>
+```
 
-- The worker must call `load_task(task_id).get('cancelled')` **periodically**.
-- For subprocess-based workers, register the process (`register_process()`)
-  so `kill_process(task_id)` can kill it.
+**4. Panel JS:**
+- In `load()`: `inWhisperModel.value = current.whisper_model || 'base';`
+- In save handler: `if (inWhisperModel.value !== current.whisper_model) payload.whisper_model = inWhisperModel.value;`
 
-### Verbose logging
+**5. Optional subsystem side effect** (in `settings_post`):
+```python
+if 'whisper_model' in updated:
+    from .whisper import set_model
+    set_model(current['whisper_model'])
+    applied.append('whisper')
+```
 
-Set `logging.basicConfig(level=logging.DEBUG)` in `app.py`.
+**6. Done** — new key appears on next `/settings` GET, applies on next POST, no restart.
 
 ---
 
-## 12. Conventions & Best Practices
+## 15. How to Maintain the Project
 
-### Python
+**Daily/weekly:**
+- `ls tasks/*.json | wc -l` — should stay small (auto-cleanup daily)
+- Check `downloads/` size
+- Check `cookies.txt` freshness (YouTube cookies expire ~weeks)
+- `curl /telegram/log/status` — confirm queue=0, dropped=0
+- Restart Flask periodically to clear memory
 
-- **One feature = one file.** Never mix concerns.
-- **All feature workers are threaded**, always `daemon=True`.
-- **Always check cancellation** in loops.
-- **Use `load_task()` / `save_task()`** for all task state. Never write JSON directly.
-- **Catch every exception** inside the worker and set `status: 'error'`.
-- **Log with `logger.exception()`** for failures, `logger.info()` for progress.
-- **Use `os.path.join`** everywhere, no hardcoded `/` or `\`.
-- **Never trust user input** — always validate paths and URLs.
+**Monthly:**
+- `pip install --break-system-packages -U yt-dlp` (YouTube breaks it often)
+- Re-run `install.sh` if ffmpeg updated
+- Empty Drive trash
+- Rotate `/root/.password`
+- Rotate bot tokens (`@BotFather` → paste via settings panel)
+- `journalctl -u projectcompress -n 200` — review errors
 
-### Path safety
+**When YouTube fails:** export fresh cookies → upload → test `yt-dlp --cookies cookies.txt <url>`.
 
+**When tasks hang:** read `tasks/<id>.json`, check `ps aux | grep -E "ffmpeg|yt-dlp"`, cancel via UI.
+
+**When settings won't save:** `/settings/debug` first. `write_test ≠ "ok"` = permission issue. `file_exists: false` + `dir_writable: true` = route not registered (check `__init__.py`).
+
+**When Telegram silent:** `curl /telegram/log/status` → `/telegram/log/test`. If 202: bot not admin. If disabled: `tg_log_enabled` off in settings.
+
+**When scans fail:** `Cannot get entity` — `resolve_entity` should auto-join. If it can't, error explains why (approval-only, expired invite, banned).
+
+---
+
+## 16. Common Debugging
+
+| Symptom | Cause / Fix |
+|---|---|
+| Task stuck in `queued` | Thread never started — check `.start()` |
+| Progress but no file | `output_file` not set at worker end |
+| SSE errors in console | Check `/tasks/stream` Content-Type; Nginx needs `proxy_buffering off` |
+| `ffmpeg not found` | Prepend `/usr/local/bin` to `PATH` in worker |
+| Cancel doesn't work | Worker must check `load_task(id).get('cancelled')` periodically |
+| Settings panel "Failed to load" | `curl -i /settings` — 404 = route missing, 500 = check log, 401 = Basic Auth blocking |
+| `database is locked` (Telethon) | Bot mode uses `:memory:` — switch or ensure single client per session |
+| `Cannot get entity by phone number as a bot` | Passed string ID to bot — normalize to `int` |
+| `/telegram/log/test` returns 202 | Message queued, not confirmed — check `ChatWriteForbiddenError` (bot not admin) |
+
+**Verbose logging:** `logging.basicConfig(level=logging.DEBUG)`.
+
+**Silence noise:**
+```python
+logging.getLogger('telethon.network.mtprotosender').setLevel(logging.WARNING)
+logging.getLogger('telethon.network.connection').setLevel(logging.WARNING)
+logging.getLogger('waitress').setLevel(logging.WARNING)
+```
+
+---
+
+## 17. Conventions & Best Practices
+
+**Python:**
+- One feature = one file
+- All workers threaded, `daemon=True`
+- Always check cancellation in loops
+- Use `load_task()` / `save_task()` — never write task JSON directly
+- Catch every exception in worker, set `status: 'error'`
+- `logger.exception()` for failures, `logger.info()` for progress
+- `os.path.join()` everywhere
+- Never trust user input (validate paths, URLs)
+- Never import `features.telegram_logger` at module top in `tasks.py` (circular)
+
+**Settings:**
+- All runtime toggles in `settings.json` via `features/settings.py`
+- Never expose secrets in GET responses (mask tokens)
+- Validate on server, not just client
+- Apply live — call subsystem `set_*` / `reconfigure` from `settings_post`
+
+**Path safety:**
 ```python
 if '..' in user_path or user_path.startswith('/'):
     return jsonify({'error': 'Invalid path'}), 400
 ```
 
-Applies to every file-path-based route.
+**Frontend:**
+- One feature = one HTML pane
+- Always `escapeHtml()` user-controlled strings
+- Use `showToast()` not `alert()`
+- Poll every 2–5s, not more
+- Use `storeTaskId()` / `startPollingForTask()` for page-reload survival
+- Theme-gate JS effects on `document.documentElement.dataset.theme`
 
-### Frontend
+**Git:** never commit `cookies.txt`, `token*.json`, `telegram_creds.json`, `settings.json`, `telegram_*_session*`, `downloads/`, `tasks/`, `proxy_cache/`, `venv/`.
 
-- **One feature = one HTML pane.**
-- **Always `escapeHtml()`** user-controlled strings in innerHTML.
-- **Use `showToast()`** for user feedback (not `alert()`).
-- **Poll every 2–5 seconds.** More frequent is wasteful.
-- **Use `storeTaskId()`** and `startPollingForTask()` to survive page reloads.
-
-### Git
-
-- **Never commit secrets**: `cookies.txt`, `token.json`, `telegram_creds.json`.
-- **Never commit `downloads/`, `tasks/`, `proxy_cache/`, `venv/`.**
-- Keep `.gitignore` updated.
-
-### Security
-
-- The app has **no authentication**. Behind a public URL, add Nginx Basic Auth.
-- Use HTTPS always.
-- Treat `COOKIE_UPLOAD_TOKEN` as a real secret.
+**Security:**
+- Basic Auth by default — also use HTTPS (Basic over HTTP is trivial to intercept)
+- Treat `COOKIE_UPLOAD_TOKEN`, `tg_log_bot_token`, `/root/.password` as real secrets
+- `hmac.compare_digest` for all secret comparisons
 
 ---
 
-## 13. Deployment
+## 18. Deployment
 
-### One-liner (VPS)
-
+**One-liner:**
 ```bash
-git clone https://github.com/blackystrngr/ProjectCompress.git
+git clone https://github.com/blackystrng/ProjectCompress.git
 cd ProjectCompress
 chmod +x install.sh
 sudo ./install.sh
 ```
 
-### Run in foreground
-
+**Set up auth:**
 ```bash
-python3 app.py
+sudo sh -c 'echo "YourPassword" > /root/.password'
+sudo chmod 600 /root/.password
 ```
 
-### Run as systemd service (recommended)
+**Foreground:** `python3 app.py`
 
-Create `/etc/systemd/system/projectcompress.service`:
-
+**Systemd** (`/etc/systemd/system/projectcompress.service`):
 ```ini
 [Unit]
 Description=ProjectCompress
@@ -748,44 +763,67 @@ WantedBy=multi-user.target
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now projectcompress
-sudo systemctl status projectcompress
 ```
 
-### Behind Nginx (with auth)
+**If running as non-root**, move password file:
+```bash
+sudo mv /root/.password /etc/projectcompress.password
+sudo chown <app-user>:<app-user> /etc/projectcompress.password
+```
+Then add `Environment="AUTH_PASSWORD_FILE=/etc/projectcompress.password"`.
 
+**Env vars:**
+```env
+SECRET_KEY=long-random-string
+PROXY_URL=http://user:pass@host:8080
+DRIVE_FOLDER_ID=1abc...xyz
+COOKIE_UPLOAD_TOKEN=openssl-rand-hex-32
+TG_LOG_ENABLED=false
+TG_LOG_CHANNEL=
+TG_LOG_BOT_TOKEN=
+TG_LOG_LEVEL=WARNING
+```
+
+**Nginx (with HTTPS):**
 ```nginx
 server {
     listen 80;
     server_name your-domain.com;
+    return 301 https://$server_name$request_uri;
+}
+server {
+    listen 443 ssl http2;
+    server_name your-domain.com;
+    ssl_certificate     /etc/letsencrypt/live/your-domain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/your-domain.com/privkey.pem;
 
     location / {
-        auth_basic "Restricted";
-        auth_basic_user_file /etc/nginx/.htpasswd;
-
         proxy_pass http://127.0.0.1:5000;
         proxy_http_version 1.1;
         proxy_set_header Connection '';
-        proxy_buffering off;         # required for SSE
-        proxy_read_timeout 3600s;    # long-lived SSE connections
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_buffering off;         # REQUIRED for SSE
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
     }
 }
 ```
 
-**Critical:** `proxy_buffering off` — otherwise SSE breaks.
+**Critical:** `proxy_buffering off` — otherwise SSE silently breaks.
 
 ---
 
 ## 🎓 Mental Model — One Page Summary
 
-1. **Flask app** — registers all feature routes at startup.
-2. **Every long job = a task** — a JSON file with status/progress/output.
-3. **Tasks are updated via `save_task()`** — cache → disk → SSE broadcast.
-4. **UI** — tabs on top, SSE-driven task panel at the bottom.
-5. **Cancel** — set `cancelled: true`, worker checks it, `kill_process()` for
-   subprocesses.
-6. **Adding features** — new file in `features/`, register in `__init__.py`,
-   add pane to `_features_macro.html`, done.
-7. **Debug** — read the task JSON, check the log, check running processes.
-
-That's the entire project in a nutshell. Once you've read one feature
-(`features/ocr.py` is a good small one), you've read them all.
+1. **Flask app** registers all feature routes at startup.
+2. **Every long job = a task** (JSON file with status/progress/output).
+3. **`save_task()`** = cache → disk → SSE broadcast → Telegram logger.
+4. **UI** = tabs, task panel, settings gear on right, theme switcher in stats bar.
+5. **Settings** = `settings.json` source of truth; `/settings` API; subsystem `set_*` applies live; secrets server-side only.
+6. **Themes** = two CSS files, one disabled at a time; localStorage + settings.json; modern effects gate on `dataset.theme`.
+7. **Auth** = `/root/.password` (or env), mtime-checked, fail-closed.
+8. **Logger** = bot mode `:memory:` (no locks); user mode clones session; batch + rate-limit + retry; non-blocking.
+9. **Adding features** = new file + register + pane + macro entry.
+10. **Adding settings** = schema + UI + JS wiring + optional subsystem hook.
+11. **Debug** = read task JSON, check logs, hit `/settings/debug` and `/telegram/log/status`.
