@@ -52,8 +52,11 @@ def create_app():
 
     @app.errorhandler(NotFound)
     def handle_not_found(e):
-        if request.path.startswith(('/api', '/get_tasks', '/progress', '/system_stats',
-                                     '/upload_cookies', '/upload_token')):
+        if request.path.startswith((
+                '/api', '/get_tasks', '/progress', '/system_stats',
+                '/upload_cookies', '/upload_token',
+                '/processed_list', '/mark_processing',
+                '/mark_done', '/mark_failed')):
             return jsonify({'error': 'Endpoint not found'}), 404
         return render_template('index.html'), 404
 
@@ -272,8 +275,6 @@ def create_app():
             logger.exception("Failed to write token file")
             return jsonify({'error': str(e)}), 500
 
-        # Invalidate per-thread Drive services so the next request rebuilds
-        # with the new token, and clear cached email/quota.
         email = None
         try:
             from features.google_drive import (
