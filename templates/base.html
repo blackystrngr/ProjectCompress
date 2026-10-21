@@ -22,9 +22,6 @@
         })();
     </script>
 
-    <!-- ============================================================
-         SETTINGS PANEL — inline styles so it works in both themes
-         ============================================================ -->
     <style>
         .settings-fab {
             position: fixed;
@@ -53,12 +50,10 @@
         .settings-fab.open { transform: translateY(-50%) rotate(45deg); }
 
         .settings-overlay {
-            position: fixed;
-            inset: 0;
+            position: fixed; inset: 0;
             background: rgba(0,0,0,0.55);
             backdrop-filter: blur(3px);
-            opacity: 0;
-            pointer-events: none;
+            opacity: 0; pointer-events: none;
             transition: opacity 0.25s ease;
             z-index: 998;
         }
@@ -66,9 +61,7 @@
 
         .settings-panel {
             position: fixed;
-            top: 0;
-            right: 0;
-            bottom: 0;
+            top: 0; right: 0; bottom: 0;
             width: min(420px, 92vw);
             background: rgba(18, 22, 35, 0.97);
             backdrop-filter: blur(20px);
@@ -77,8 +70,7 @@
             z-index: 999;
             transform: translateX(105%);
             transition: transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
-            display: flex;
-            flex-direction: column;
+            display: flex; flex-direction: column;
             box-shadow: -20px 0 40px -20px rgba(0,0,0,0.8);
             color: #eef2ff;
             font-family: 'Inter', sans-serif;
@@ -86,37 +78,25 @@
         .settings-panel.open { transform: translateX(0); }
 
         .settings-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
+            display: flex; justify-content: space-between; align-items: center;
             padding: 1.2rem 1.5rem;
             border-bottom: 1px solid rgba(95,143,224,0.25);
         }
         .settings-header h2 {
-            margin: 0;
-            font-size: 1.1rem;
-            font-weight: 600;
-            display: flex;
-            align-items: center;
-            gap: 0.6rem;
-            padding: 0;
-            border: none;
+            margin: 0; font-size: 1.1rem; font-weight: 600;
+            display: flex; align-items: center; gap: 0.6rem;
+            padding: 0; border: none;
         }
         .settings-header h2 i { color: #5f8fe0; }
 
         .settings-close {
             background: transparent;
             border: 1px solid rgba(255,255,255,0.15);
-            width: 32px;
-            height: 32px;
+            width: 32px; height: 32px;
             border-radius: 50%;
-            color: #fff;
-            padding: 0;
-            font-size: 0.85rem;
+            color: #fff; padding: 0; font-size: 0.85rem;
             cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
+            display: flex; align-items: center; justify-content: center;
             transition: all 0.15s ease;
         }
         .settings-close:hover {
@@ -124,59 +104,40 @@
             border-color: rgba(239,68,68,0.6);
         }
 
-        .settings-body {
-            flex: 1;
-            overflow-y: auto;
-            padding: 1.2rem 1.5rem;
-        }
+        .settings-body { flex: 1; overflow-y: auto; padding: 1.2rem 1.5rem; }
 
         .settings-section {
-            margin-bottom: 1.4rem;
-            padding: 1rem;
+            margin-bottom: 1.4rem; padding: 1rem;
             background: rgba(25,30,45,0.55);
             border-radius: 1rem;
             border: 1px solid rgba(95,143,224,0.22);
         }
         .settings-section h3 {
-            font-size: 0.78rem;
-            text-transform: uppercase;
-            letter-spacing: 0.06em;
-            color: #8a9bc0;
+            font-size: 0.78rem; text-transform: uppercase;
+            letter-spacing: 0.06em; color: #8a9bc0;
             margin-bottom: 0.9rem;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
+            display: flex; align-items: center; gap: 0.5rem;
             font-weight: 600;
         }
         .settings-section h3 i { color: #5f8fe0; }
 
         .settings-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: 1rem;
-            padding: 0.55rem 0;
+            display: flex; justify-content: space-between; align-items: center;
+            gap: 1rem; padding: 0.55rem 0;
             border-bottom: 1px solid rgba(255,255,255,0.05);
         }
         .settings-row:last-of-type { border-bottom: none; }
-        .settings-row > span {
-            font-size: 0.85rem;
-            color: #eef2ff;
-            flex-shrink: 0;
-        }
+        .settings-row > span { font-size: 0.85rem; color: #eef2ff; flex-shrink: 0; }
         .settings-row input[type="text"],
         .settings-row input[type="password"],
         .settings-row select {
-            flex: 1;
-            max-width: 230px;
+            flex: 1; max-width: 230px;
             background: rgba(20,26,42,0.95);
             border: 1px solid rgba(95,143,224,0.3);
             color: #eef2ff;
             padding: 0.45rem 0.75rem;
             border-radius: 0.5rem;
-            font-size: 0.8rem;
-            font-family: inherit;
-            outline: none;
+            font-size: 0.8rem; font-family: inherit; outline: none;
             transition: border-color 0.15s ease, box-shadow 0.15s ease;
         }
         .settings-row input:focus,
@@ -185,16 +146,12 @@
             box-shadow: 0 0 0 3px rgba(95,143,224,0.18);
         }
         .settings-row input[type="checkbox"] {
-            width: 18px;
-            height: 18px;
-            accent-color: #5f8fe0;
-            cursor: pointer;
+            width: 18px; height: 18px;
+            accent-color: #5f8fe0; cursor: pointer;
         }
 
         .settings-hint {
-            font-size: 0.7rem;
-            color: #8a9bc0;
-            margin-top: 0.5rem;
+            font-size: 0.7rem; color: #8a9bc0; margin-top: 0.5rem;
             padding: 0.4rem 0.65rem;
             background: rgba(30,40,60,0.5);
             border-radius: 0.4rem;
@@ -205,20 +162,15 @@
         .settings-hint.warn { color: #fcd34d; }
 
         .settings-btn {
-            width: 100%;
-            margin-top: 0.65rem;
+            width: 100%; margin-top: 0.65rem;
             background: rgba(44,62,102,0.9);
             border: 1px solid rgba(95,143,224,0.35);
             color: #fff;
             padding: 0.55rem 1rem;
             border-radius: 0.6rem;
-            font-size: 0.82rem;
-            font-family: inherit;
-            font-weight: 500;
+            font-size: 0.82rem; font-family: inherit; font-weight: 500;
             cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
+            display: flex; align-items: center; justify-content: center;
             gap: 0.5rem;
             transition: all 0.15s ease;
         }
@@ -235,23 +187,19 @@
             background: linear-gradient(135deg, #7099e6, #4d72c8);
         }
         .settings-btn:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-            transform: none;
+            opacity: 0.5; cursor: not-allowed; transform: none;
         }
 
         .settings-footer {
             padding: 1rem 1.5rem;
             border-top: 1px solid rgba(95,143,224,0.25);
-            display: flex;
-            gap: 0.5rem;
+            display: flex; gap: 0.5rem;
         }
         .settings-footer .settings-btn { margin-top: 0; }
 
         .settings-toast {
             position: fixed;
-            bottom: 24px;
-            left: 50%;
+            bottom: 24px; left: 50%;
             transform: translateX(-50%) translateY(80px);
             background: linear-gradient(135deg, rgba(44,62,94,0.98), rgba(30,42,70,0.98));
             color: #fff;
@@ -261,13 +209,25 @@
             z-index: 9999;
             box-shadow: 0 20px 40px -14px rgba(0,0,0,0.8),
                         0 0 0 1px rgba(95,143,224,0.45);
-            opacity: 0;
-            pointer-events: none;
+            opacity: 0; pointer-events: none;
             transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
         }
         .settings-toast.show {
             opacity: 1;
             transform: translateX(-50%) translateY(0);
+        }
+
+        #setSaveStatus {
+            font-size: 0.72rem;
+            color: #8a9bc0;
+            margin-top: 0.5rem;
+            padding: 0.4rem 0.7rem;
+            background: rgba(30,40,60,0.5);
+            border-radius: 0.4rem;
+            font-family: monospace;
+            word-break: break-all;
+            display: none;
+            white-space: pre-wrap;
         }
 
         @media (max-width: 700px) {
@@ -281,7 +241,7 @@
 <body>
 <div class="container">
 
-    <!-- ========== System Stats Meter ========== -->
+    <!-- ========== System Stats Meter (no duplicate toggles) ========== -->
     <div class="sys-stats" id="sysStats">
         <div class="sys-stat" title="CPU usage">
             <i class="fas fa-microchip"></i>
@@ -311,24 +271,6 @@
             <span class="sys-label">Up</span>
             <span class="sys-value-net" id="upValue">0 B/s</span>
         </div>
-
-        <label class="sys-stat sys-toggle" title="Pause thumbnail generation (saves CPU)">
-            <input type="checkbox" id="pauseThumbnails" style="accent-color: #ef4444;">
-            <i class="fas fa-images" id="thumbIcon"></i>
-            <span class="sys-label" style="min-width:auto;">Pause&nbsp;Thumbs</span>
-        </label>
-
-        <button id="themeToggleBtn"
-                class="sys-stat sys-toggle"
-                type="button"
-                title="Switch UI theme"
-                style="background:transparent; border:1px solid rgba(95,143,224,0.3);
-                       color:#b0c4ff; padding:4px 12px; border-radius:1rem; cursor:pointer;
-                       font-size:0.78rem; font-family:inherit;
-                       display:inline-flex; align-items:center; gap:6px;">
-            <i class="fas fa-wand-magic-sparkles" id="themeIcon"></i>
-            <span id="themeLabel" style="min-width:auto;">Modern</span>
-        </button>
     </div>
 
     <!-- ========== Header ========== -->
@@ -447,16 +389,16 @@
             <i class="fas fa-undo"></i> Reload
         </button>
     </footer>
+
+    <div id="setSaveStatus"></div>
 </aside>
 
 <div id="settingsToast" class="settings-toast"></div>
 
 <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 
-<!-- ========== System Stats + Thumbnail Toggle ========== -->
+<!-- ========== System Stats ========== -->
 <script>
-window.thumbnailsEnabled = true;
-
 (function() {
     const cpuFill  = document.getElementById('cpuFill');
     const ramFill  = document.getElementById('ramFill');
@@ -514,57 +456,27 @@ window.thumbnailsEnabled = true;
     updateStats();
     setInterval(updateStats, 2000);
 })();
+</script>
 
-// ============================================================
-// Thumbnail pause toggle (sys-stats)
-// ============================================================
-(function() {
-    const cb = document.getElementById('pauseThumbnails');
-    const icon = document.getElementById('thumbIcon');
-    if (!cb) return;
-
-    function setIcon(paused) {
-        if (!icon) return;
-        icon.style.color = paused ? '#ef4444' : '#5f8fe0';
-        icon.title = paused ? 'Thumbnails paused' : 'Thumbnails enabled';
-    }
-
+<!-- ============================================================
+     Thumbnail initial state — no UI control here anymore
+     (the settings panel is the single source of truth)
+     ============================================================ -->
+<script>
+(function () {
+    window.thumbnailsEnabled = true;
     fetch('/thumbnail/settings')
         .then(r => r.json())
         .then(data => {
-            cb.checked = !data.enabled;
-            setIcon(!data.enabled);
-            window.thumbnailsEnabled = data.enabled;
+            window.thumbnailsEnabled = !!data.enabled;
             window.dispatchEvent(new Event('thumbnailsToggled'));
         })
-        .catch(err => console.warn('Could not load thumbnail settings:', err));
-
-    cb.addEventListener('change', async function() {
-        const enabled = !cb.checked;
-        try {
-            const resp = await fetch('/thumbnail/settings', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                body: `enabled=${enabled}`
-            });
-            const data = await resp.json();
-            setIcon(!data.enabled);
-            window.thumbnailsEnabled = data.enabled;
-            window.dispatchEvent(new Event('thumbnailsToggled'));
-            if (typeof showToast === 'function') {
-                showToast(data.enabled ? 'Thumbnails enabled' : 'Thumbnails paused');
-            }
-        } catch (err) {
-            console.error('Failed to update thumbnail setting:', err);
-            cb.checked = !cb.checked;
-            setIcon(cb.checked);
-        }
-    });
+        .catch(() => {});
 })();
 </script>
 
 <!-- ============================================================
-     THEME SYSTEM (shared by sys-stats toggle + settings panel)
+     Theme API (used by the settings panel)
      ============================================================ -->
 <script>
 window.applyTheme = function (theme, syncServer) {
@@ -587,45 +499,6 @@ window.applyTheme = function (theme, syncServer) {
     }
     window.dispatchEvent(new CustomEvent('themeChanged', { detail: theme }));
 };
-
-(function () {
-    const btn   = document.getElementById('themeToggleBtn');
-    const icon  = document.getElementById('themeIcon');
-    const label = document.getElementById('themeLabel');
-    if (!btn) return;
-
-    function updateUI(theme) {
-        if (theme === 'modern') {
-            icon.className = 'fas fa-palette';
-            label.textContent = 'Classic';
-            btn.title = 'Switch to Classic UI';
-        } else {
-            icon.className = 'fas fa-wand-magic-sparkles';
-            label.textContent = 'Modern';
-            btn.title = 'Switch to Animated Modern UI';
-        }
-    }
-    updateUI(document.documentElement.dataset.theme || 'classic');
-
-    btn.addEventListener('click', function () {
-        const next = (document.documentElement.dataset.theme === 'modern')
-                     ? 'classic' : 'modern';
-        document.body.style.transition = 'opacity 0.15s ease';
-        document.body.style.opacity = '0.7';
-        setTimeout(function () {
-            window.applyTheme(next, true);
-            document.body.style.opacity = '1';
-            setTimeout(() => { document.body.style.transition = ''; }, 200);
-            if (typeof showToast === 'function') {
-                showToast(next === 'modern'
-                    ? '✨ Modern UI enabled'
-                    : '🎨 Classic UI restored');
-            }
-        }, 150);
-    });
-
-    window.addEventListener('themeChanged', (e) => updateUI(e.detail));
-})();
 </script>
 
 <!-- ============================================================
@@ -640,6 +513,7 @@ window.applyTheme = function (theme, syncServer) {
     const saveBtn    = document.getElementById('settingsSave');
     const resetBtn   = document.getElementById('settingsReset');
     const toastEl    = document.getElementById('settingsToast');
+    const statusEl   = document.getElementById('setSaveStatus');
 
     const inTheme    = document.getElementById('setUiTheme');
     const inTgEnabled= document.getElementById('setTgEnabled');
@@ -651,7 +525,7 @@ window.applyTheme = function (theme, syncServer) {
     const tgHint     = document.getElementById('setTgHint');
     const tgTestBtn  = document.getElementById('setTgTest');
 
-    let current = null;   // last-known server state
+    let current = null;
 
     /* ---------- Toast ---------- */
     function toast(msg, isErr) {
@@ -691,18 +565,17 @@ window.applyTheme = function (theme, syncServer) {
             const r = await fetch('/settings', { cache: 'no-store' });
             current = await r.json();
 
-            inTheme.value     = current.ui_theme || 'classic';
+            inTheme.value       = current.ui_theme || 'classic';
             inTgEnabled.checked = !!current.tg_log_enabled;
-            inTgChannel.value = current.tg_log_channel || '';
-            inTgToken.value   = '';                   // never prefill
+            inTgChannel.value   = current.tg_log_channel || '';
+            inTgToken.value     = '';
             inTgToken.placeholder = current.tg_log_bot_token_set
                 ? `set (${current.tg_log_bot_token_masked}) — leave empty to keep`
                 : '123456:ABC…';
-            inTgLevel.value   = current.tg_log_level || 'WARNING';
-            inCoord.checked   = !!current.coordinator_enabled;
-            inThumbs.checked  = !!current.thumbnails_enabled;
+            inTgLevel.value     = current.tg_log_level || 'WARNING';
+            inCoord.checked     = !!current.coordinator_enabled;
+            inThumbs.checked    = !!current.thumbnails_enabled;
 
-            // Hints about env vars
             const hints = [];
             if (current.env && current.env.TG_LOG_CHANNEL)
                 hints.push('env TG_LOG_CHANNEL is set');
@@ -712,6 +585,8 @@ window.applyTheme = function (theme, syncServer) {
                 hints.push('env TG_LOG_LEVEL is set');
             tgHint.textContent = hints.join(' · ');
             tgHint.classList.toggle('warn', hints.length > 0);
+
+            statusEl.style.display = 'none';
         } catch (e) {
             toast('Failed to load settings', true);
             console.error(e);
@@ -723,25 +598,18 @@ window.applyTheme = function (theme, syncServer) {
         if (!current) { toast('Not loaded yet', true); return; }
 
         const payload = {};
-
         if (inTheme.value !== current.ui_theme)
             payload.ui_theme = inTheme.value;
-
         if (inTgEnabled.checked !== !!current.tg_log_enabled)
             payload.tg_log_enabled = inTgEnabled.checked;
-
         if (inTgChannel.value.trim() !== (current.tg_log_channel || ''))
             payload.tg_log_channel = inTgChannel.value.trim();
-
         if (inTgToken.value.trim())
             payload.tg_log_bot_token = inTgToken.value.trim();
-
         if (inTgLevel.value !== current.tg_log_level)
             payload.tg_log_level = inTgLevel.value;
-
         if (inCoord.checked !== !!current.coordinator_enabled)
             payload.coordinator_enabled = inCoord.checked;
-
         if (inThumbs.checked !== !!current.thumbnails_enabled)
             payload.thumbnails_enabled = inThumbs.checked;
 
@@ -752,6 +620,7 @@ window.applyTheme = function (theme, syncServer) {
 
         saveBtn.disabled = true;
         saveBtn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Saving…';
+        statusEl.style.display = 'none';
 
         try {
             const r = await fetch('/settings', {
@@ -760,34 +629,42 @@ window.applyTheme = function (theme, syncServer) {
                 body: JSON.stringify(payload)
             });
             const data = await r.json();
+            statusEl.style.display = 'block';
 
             if (!r.ok) {
-                const msg = data.error || 'Save failed';
-                toast(msg, true);
-                if (data.errors) console.warn('Field errors:', data.errors);
+                const lines = [];
+                if (data.error) lines.push(data.error);
+                if (data.errors) {
+                    for (const [k, v] of Object.entries(data.errors))
+                        lines.push(`✗ ${k}: ${v}`);
+                }
+                statusEl.style.color = '#ff8a8a';
+                statusEl.textContent = '❌ ' + lines.join('\n');
+                toast(data.error || 'Save failed', true);
                 return;
             }
 
-            // Apply theme locally (server has already stored it)
-            if (payload.ui_theme) {
-                const cur = document.documentElement.dataset.theme;
-                if (cur !== payload.ui_theme) {
-                    window.applyTheme(payload.ui_theme, false);
-                }
+            if (payload.ui_theme &&
+                document.documentElement.dataset.theme !== payload.ui_theme) {
+                window.applyTheme(payload.ui_theme, false);
             }
 
-            // Reflect thumbnails change in sys-stats toggle
             if ('thumbnails_enabled' in payload) {
-                const pauseCb = document.getElementById('pauseThumbnails');
-                if (pauseCb) pauseCb.checked = !payload.thumbnails_enabled;
                 window.thumbnailsEnabled = payload.thumbnails_enabled;
                 window.dispatchEvent(new Event('thumbnailsToggled'));
             }
+
+            statusEl.style.color = '#a5f3c5';
+            statusEl.textContent =
+                `✅ Saved ${data.updated.length} field(s): ` + data.updated.join(', ');
 
             toast(`Saved (${data.updated.length} field${data.updated.length === 1 ? '' : 's'})`);
             inTgToken.value = '';
             await load();
         } catch (e) {
+            statusEl.style.display = 'block';
+            statusEl.style.color = '#ff8a8a';
+            statusEl.textContent = '❌ Network/parse error: ' + e.message;
             toast('Network error: ' + e.message, true);
         } finally {
             saveBtn.disabled = false;
@@ -805,11 +682,8 @@ window.applyTheme = function (theme, syncServer) {
         try {
             const r = await fetch('/telegram/log/test');
             const data = await r.json();
-            if (r.ok) {
-                toast('Test message sent ✓');
-            } else {
-                toast(data.reason || data.error || 'Test failed', true);
-            }
+            if (r.ok) toast('Test message sent ✓');
+            else toast(data.error || data.reason || 'Test failed', true);
         } catch (e) {
             toast('Network error: ' + e.message, true);
         } finally {
@@ -818,25 +692,21 @@ window.applyTheme = function (theme, syncServer) {
         }
     });
 
-    /* ---------- Server-side theme sync on load ---------- */
-    // If the server has a saved theme different from localStorage,
-    // apply the server version (localStorage was just a fast cache).
+    /* ---------- Sync theme from server on initial load ---------- */
     fetch('/settings', { cache: 'no-store' })
         .then(r => r.ok ? r.json() : null)
         .then(data => {
             if (!data || !data.ui_theme) return;
             const cur = document.documentElement.dataset.theme;
-            if (data.ui_theme !== cur) {
-                window.applyTheme(data.ui_theme, false);
-            }
+            if (data.ui_theme !== cur) window.applyTheme(data.ui_theme, false);
         })
         .catch(() => {});
 })();
 </script>
 
 <!-- ============================================================
-     Modern-UI-only polish: cursor spotlight + ripple
-     (auto-disabled when classic theme is active)
+     Modern-UI polish (spotlight + ripple)
+     Auto-disabled when classic theme active.
      ============================================================ -->
 <script>
 (function () {
