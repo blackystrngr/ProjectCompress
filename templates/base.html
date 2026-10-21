@@ -6,7 +6,26 @@
     <title>Media Compressor & Manager</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+
+    <!-- ============================================================
+         DUAL THEMES: classic (original) + modern (animated).
+         The early script below disables whichever is not active
+         BEFORE first paint, so there is no flash of wrong UI.
+         ============================================================ -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" id="theme-classic">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style-modern.css') }}" id="theme-modern">
+    <script>
+        (function () {
+            var theme = 'classic';
+            try { theme = localStorage.getItem('ui-theme') || 'classic'; } catch (e) {}
+            if (theme !== 'modern' && theme !== 'classic') theme = 'classic';
+            document.documentElement.dataset.theme = theme;
+            var classic = document.getElementById('theme-classic');
+            var modern  = document.getElementById('theme-modern');
+            if (classic) classic.disabled = (theme === 'modern');
+            if (modern)  modern.disabled  = (theme !== 'modern');
+        })();
+    </script>
 </head>
 <body>
 <div class="container">
@@ -47,6 +66,19 @@
             <i class="fas fa-images" id="thumbIcon"></i>
             <span class="sys-label" style="min-width:auto;">Pause&nbsp;Thumbs</span>
         </label>
+
+        <!-- ========== UI Theme Switcher ========== -->
+        <button id="themeToggleBtn"
+                class="sys-stat sys-toggle"
+                type="button"
+                title="Switch UI theme"
+                style="background:transparent; border:1px solid rgba(95,143,224,0.3);
+                       color:#b0c4ff; padding:4px 12px; border-radius:1rem; cursor:pointer;
+                       font-size:0.78rem; font-family:inherit;
+                       display:inline-flex; align-items:center; gap:6px;">
+            <i class="fas fa-wand-magic-sparkles" id="themeIcon"></i>
+            <span id="themeLabel" style="min-width:auto;">Modern</span>
+        </button>
     </div>
 
     <!-- ========== Header ========== -->
@@ -176,6 +208,102 @@ window.thumbnailsEnabled = true;
             setIcon(cb.checked);
         }
     });
+})();
+</script>
+
+<!-- ========== Theme Switcher + Modern UI polish ========== -->
+<script>
+/* ========================================================
+   Theme Switcher — flips between style.css and style-modern.css
+   ======================================================== */
+(function () {
+    var btn   = document.getElementById('themeToggleBtn');
+    var icon  = document.getElementById('themeIcon');
+    var label = document.getElementById('themeLabel');
+    if (!btn) return;
+
+    function updateUI(theme) {
+        if (theme === 'modern') {
+            icon.className    = 'fas fa-palette';
+            label.textContent = 'Classic';
+            btn.title         = 'Switch to Classic UI';
+        } else {
+            icon.className    = 'fas fa-wand-magic-sparkles';
+            label.textContent = 'Modern';
+            btn.title         = 'Switch to Animated Modern UI';
+        }
+    }
+
+    updateUI(document.documentElement.dataset.theme || 'classic');
+
+    btn.addEventListener('click', function () {
+        var next = (document.documentElement.dataset.theme === 'modern')
+                   ? 'classic' : 'modern';
+
+        /* Quick fade while swapping stylesheets */
+        document.body.style.transition = 'opacity 0.15s ease';
+        document.body.style.opacity    = '0.7';
+
+        setTimeout(function () {
+            document.documentElement.dataset.theme = next;
+            var classic = document.getElementById('theme-classic');
+            var modern  = document.getElementById('theme-modern');
+            if (classic) classic.disabled = (next === 'modern');
+            if (modern)  modern.disabled  = (next !== 'modern');
+            try { localStorage.setItem('ui-theme', next); } catch (e) {}
+            updateUI(next);
+
+            document.body.style.opacity = '1';
+            setTimeout(function () { document.body.style.transition = ''; }, 200);
+
+            if (typeof showToast === 'function') {
+                showToast(next === 'modern'
+                    ? '✨ Modern UI enabled'
+                    : '🎨 Classic UI restored');
+            }
+        }, 150);
+    });
+})();
+
+/* ========================================================
+   Modern-UI-only polish:
+     • cursor spotlight on cards
+     • click ripple on buttons/tabs
+   Both auto-disable when the classic theme is active.
+   ======================================================== */
+(function () {
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+
+    /* --- Cursor spotlight --- */
+    var pending = null;
+    document.addEventListener('mousemove', function (e) {
+        if (document.documentElement.dataset.theme !== 'modern') return;
+        if (pending) return;
+        pending = requestAnimationFrame(function () {
+            pending = null;
+            var el = e.target.closest('.card, .file-card, .task-card');
+            if (!el) return;
+            var r = el.getBoundingClientRect();
+            el.style.setProperty('--mx', (e.clientX - r.left) + 'px');
+            el.style.setProperty('--my', (e.clientY - r.top)  + 'px');
+        });
+    }, { passive: true });
+
+    /* --- Click ripple --- */
+    document.addEventListener('pointerdown', function (e) {
+        if (document.documentElement.dataset.theme !== 'modern') return;
+        var el = e.target.closest('button, .tab-btn, .file-actions button, .file-actions a');
+        if (!el) return;
+        var r    = el.getBoundingClientRect();
+        var size = Math.max(r.width, r.height);
+        var rip  = document.createElement('span');
+        rip.className    = 'ripple';
+        rip.style.width  = rip.style.height = size + 'px';
+        rip.style.left   = (e.clientX - r.left - size / 2) + 'px';
+        rip.style.top    = (e.clientY - r.top  - size / 2) + 'px';
+        el.appendChild(rip);
+        setTimeout(function () { rip.remove(); }, 650);
+    }, { passive: true });
 })();
 </script>
 </body>
