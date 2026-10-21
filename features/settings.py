@@ -1,9 +1,6 @@
 # features/settings.py
 """
 Central settings store + JSON API for the slide-out settings panel.
-
-settings.json is the source of truth. Existing consumers
-(thumbnails.py, google_drive.py) keep reading the same file.
 """
 
 import os
@@ -21,39 +18,45 @@ _write_lock = threading.Lock()
 
 
 # ============================================================
-# Low-level I/O
+# I/O
 # ============================================================
 def load_settings() -> dict:
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            return data if isinstance(data, dict) else {}
+            if isinstance(data, dict):
+                return data
+            logger.warning(f"settings.json is not a dict: {type(data)}")
         except Exception as e:
             logger.warning(f"Failed to load settings.json: {e}")
     return {}
 
 
-def save_settings(data: dict) -> bool:
+def save_settings(data: dict) -> tuple[bool, str]:
+    """Return (ok, error_message)."""
     with _write_lock:
         try:
+            os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
             tmp = SETTINGS_FILE + '.tmp'
             with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
             os.replace(tmp, SETTINGS_FILE)
-            return True
+            logger.info(f"settings.json saved: {sorted(data.keys())}")
+            return True, ''
+        except PermissionError as e:
+            msg = f"Permission denied writing {SETTINGS_FILE}: {e}"
+            logger.error(msg)
+            return False, msg
         except Exception as e:
-            logger.error(f"Failed to save settings.json: {e}")
-            return False
+            msg = f"Write failed: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            return False, msg
 
 
 # ============================================================
-# Schema — add new keys here
+# Schema
 # ============================================================
-# type: 'bool' | 'str' | 'int'
-# choices (optional): allowed string values
-# max (optional): max string length
-# min/max (optional): int bounds
 ALLOWED_KEYS = {
     'ui_theme':             {'type': 'str',  'choices': ('classic', 'modern')},
     'thumbnails_enabled':   {'type': 'bool'},
@@ -67,7 +70,6 @@ ALLOWED_KEYS = {
 
 
 def _coerce(key: str, value, spec: dict):
-    """Return (ok, coerced_value_or_error)."""
     t = spec['type']
 
     if t == 'bool':
@@ -78,7 +80,7 @@ def _coerce(key: str, value, spec: dict):
     if t == 'str':
         s = '' if value is None else str(value).strip()
         if 'max' in spec and len(s) > spec['max']:
-            return False, f'must be ≤ {spec["max"]} characters'
+            return False, f'must be ≤ {spec["max"]} chars'
         if 'choices' in spec and s not in spec['choices']:
             return False, f'must be one of: {", ".join(spec["choices"])}'
         return True, s
@@ -97,9 +99,6 @@ def _coerce(key: str, value, spec: dict):
     return False, 'unknown type'
 
 
-# ============================================================
-# Merge env vars with settings.json (settings.json wins)
-# ============================================================
 def get_effective_config() -> dict:
     s = load_settings()
 
@@ -139,36 +138,32 @@ def get_effective_config() -> dict:
 # ============================================================
 def register_routes(app):
 
+    logger.info(f"Registering settings routes (file={SETTINGS_FILE})")
+
     @app.route('/settings', methods=['GET'])
     def settings_get():
         cfg = get_effective_config()
-
-        # Mask the bot token; never expose it over the wire
         token = cfg.get('tg_log_bot_token') or ''
+        masked = ''
         if token:
             masked = (token[:8] + '…' + token[-4:]) if len(token) > 16 else '••••••••'
-        else:
-            masked = ''
 
-        # Which values came from env (read-only hints)
-        env_info = {
-            'TG_LOG_CHANNEL':     bool(os.environ.get('TG_LOG_CHANNEL')),
-            'TG_LOG_BOT_TOKEN':   bool(os.environ.get('TG_LOG_BOT_TOKEN')),
-            'TG_LOG_LEVEL':       bool(os.environ.get('TG_LOG_LEVEL')),
-            'TG_LOG_ENABLED':     bool(os.environ.get('TG_LOG_ENABLED')),
-        }
+        env_info = {k: bool(os.environ.get(k))
+                    for k in ('TG_LOG_CHANNEL', 'TG_LOG_BOT_TOKEN',
+                              'TG_LOG_LEVEL', 'TG_LOG_ENABLED')}
 
         return jsonify({
-            'ui_theme':              cfg['ui_theme'],
-            'thumbnails_enabled':    cfg['thumbnails_enabled'],
-            'coordinator_enabled':   cfg['coordinator_enabled'],
-            'tg_log_enabled':        cfg['tg_log_enabled'],
-            'tg_log_channel':        cfg['tg_log_channel'],
-            'tg_log_bot_token':      '',           # never send the real token
-            'tg_log_bot_token_set':  bool(token),
+            'ui_theme':                cfg['ui_theme'],
+            'thumbnails_enabled':      cfg['thumbnails_enabled'],
+            'coordinator_enabled':     cfg['coordinator_enabled'],
+            'tg_log_enabled':          cfg['tg_log_enabled'],
+            'tg_log_channel':          cfg['tg_log_channel'],
+            'tg_log_bot_token':        '',
+            'tg_log_bot_token_set':    bool(token),
             'tg_log_bot_token_masked': masked,
-            'tg_log_level':          cfg['tg_log_level'],
-            'env':                   env_info,
+            'tg_log_level':            cfg['tg_log_level'],
+            'env':                     env_info,
+            'settings_file':           SETTINGS_FILE,
         })
 
     @app.route('/settings', methods=['POST'])
@@ -177,7 +172,9 @@ def register_routes(app):
         if data is None:
             data = request.form.to_dict()
         if not data:
-            return jsonify({'error': 'No data'}), 400
+            return jsonify({'error': 'No data received'}), 400
+
+        logger.info(f"settings POST received keys: {sorted(data.keys())}")
 
         current = load_settings()
         errors = {}
@@ -185,22 +182,31 @@ def register_routes(app):
 
         for key, raw in data.items():
             if key not in ALLOWED_KEYS:
-                errors[key] = 'unknown setting'
+                errors[key] = 'unknown setting (not in ALLOWED_KEYS)'
+                logger.warning(f"Rejected unknown setting: {key}")
                 continue
             ok, val = _coerce(key, raw, ALLOWED_KEYS[key])
             if not ok:
                 errors[key] = val
+                logger.warning(f"Rejected {key}={raw!r}: {val}")
                 continue
             current[key] = val
             updated.append(key)
 
-        if not updated and errors:
-            return jsonify({'error': 'validation failed', 'errors': errors}), 400
+        if not updated:
+            return jsonify({
+                'error':   'no valid settings in request',
+                'errors':  errors,
+            }), 400
 
-        if updated and not save_settings(current):
-            return jsonify({'error': 'failed to save settings.json'}), 500
+        ok, err = save_settings(current)
+        if not ok:
+            return jsonify({
+                'error':  f'failed to save settings.json: {err}',
+                'errors': errors,
+            }), 500
 
-        # ---------- Apply to subsystems ----------
+        # Apply to subsystems
         applied = []
 
         if 'thumbnails_enabled' in updated:
@@ -209,6 +215,7 @@ def register_routes(app):
                 set_thumbnails_enabled(current['thumbnails_enabled'])
                 applied.append('thumbnails')
             except Exception as e:
+                logger.exception("Failed to apply thumbnails_enabled")
                 errors['thumbnails_enabled'] = str(e)
 
         if 'coordinator_enabled' in updated:
@@ -217,6 +224,7 @@ def register_routes(app):
                 set_coordinator_enabled(current['coordinator_enabled'])
                 applied.append('coordinator')
             except Exception as e:
+                logger.exception("Failed to apply coordinator_enabled")
                 errors['coordinator_enabled'] = str(e)
 
         if any(k.startswith('tg_log_') for k in updated):
@@ -225,21 +233,77 @@ def register_routes(app):
                 reconfigure()
                 applied.append('telegram_logger')
             except Exception as e:
+                logger.exception("Failed to apply tg_log settings")
                 errors['tg_log'] = str(e)
 
-        # ui_theme is applied client-side; nothing to do server-side
+        logger.info(f"settings saved: updated={updated}, applied={applied}")
 
         return jsonify({
             'status':  'ok',
             'updated': updated,
             'applied': applied,
             'errors':  errors or None,
-            'current': {
-                'ui_theme':            current.get('ui_theme', 'classic'),
-                'thumbnails_enabled':  current.get('thumbnails_enabled', True),
-                'coordinator_enabled': current.get('coordinator_enabled', True),
-                'tg_log_enabled':      current.get('tg_log_enabled', False),
-                'tg_log_channel':      current.get('tg_log_channel', ''),
-                'tg_log_level':        current.get('tg_log_level', 'WARNING'),
-            },
+            'current': get_effective_config_without_token(),
         })
+
+    @app.route('/settings/debug', methods=['GET'])
+    def settings_debug():
+        """Hit this to diagnose why saves might fail."""
+        import sys
+        info = {
+            'settings_file':  SETTINGS_FILE,
+            'file_exists':    os.path.exists(SETTINGS_FILE),
+            'dir_writable':   os.access(PROJECT_ROOT, os.W_OK),
+            'cwd':            os.getcwd(),
+            'python':         sys.version.split()[0],
+        }
+
+        if os.path.exists(SETTINGS_FILE):
+            try:
+                info['file_size']    = os.path.getsize(SETTINGS_FILE)
+                info['file_mtime']   = os.path.getmtime(SETTINGS_FILE)
+                info['file_writable']= os.access(SETTINGS_FILE, os.W_OK)
+                with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                    contents = json.load(f)
+                # Mask the token
+                if isinstance(contents, dict) and contents.get('tg_log_bot_token'):
+                    tok = contents['tg_log_bot_token']
+                    contents['tg_log_bot_token'] = (
+                        tok[:8] + '…' + tok[-4:] if len(tok) > 16 else '••••')
+                info['contents'] = contents
+            except Exception as e:
+                info['read_error'] = f"{type(e).__name__}: {e}"
+
+        # Live write test
+        try:
+            test = dict(load_settings())
+            test['__test__'] = int(os.times().elapsed)
+            ok, err = save_settings(test)
+            test.pop('__test__', None)
+            if ok:
+                # Restore (removes the __test__ key)
+                save_settings(test)
+                info['write_test'] = 'ok'
+            else:
+                info['write_test'] = f'FAILED: {err}'
+        except Exception as e:
+            info['write_test'] = f'EXCEPTION: {type(e).__name__}: {e}'
+
+        info['effective_config'] = get_effective_config_without_token()
+        info['env'] = {
+            'TG_LOG_CHANNEL':         os.environ.get('TG_LOG_CHANNEL') or None,
+            'TG_LOG_ENABLED':         os.environ.get('TG_LOG_ENABLED') or None,
+            'TG_LOG_LEVEL':           os.environ.get('TG_LOG_LEVEL') or None,
+            'TG_LOG_BOT_TOKEN_set':   bool(os.environ.get('TG_LOG_BOT_TOKEN')),
+        }
+
+        return jsonify(info)
+
+
+def get_effective_config_without_token() -> dict:
+    """Same as get_effective_config but with token replaced by a bool."""
+    cfg = get_effective_config()
+    token = cfg.get('tg_log_bot_token') or ''
+    cfg['tg_log_bot_token'] = ''
+    cfg['tg_log_bot_token_set'] = bool(token)
+    return cfg
