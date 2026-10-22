@@ -37,6 +37,7 @@ settings.json.bak
 # ============================================================
 tasks/
 downloads/
+workflows/
 proxy_cache/
 temp/
 tmp/
