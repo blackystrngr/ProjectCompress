@@ -282,7 +282,7 @@ async def download_selected_async(download_task_id, chat_link, message_ids):
 # ============================================================
 # SEND FILE (with cancellation + throttled progress)
 # ============================================================
-async def send_file_to_telegram_async(task_id, chat_link, file_path, original_filename):
+async def send_file_to_telegram_async(task_id, chat_link, file_path, original_filename, caption=None):
     client = await get_telegram_client()
     register_client(task_id, client)
     throttle = ProgressThrottle(1.0)   # save at most once per second
