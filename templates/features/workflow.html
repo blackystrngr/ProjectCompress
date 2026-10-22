@@ -1,0 +1,896 @@
+<div class="card">
+    <div style="display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center;">
+        <select id="wfSelect" style="padding: 0.5rem 0.8rem; background: #1e2438;
+                color: #eef2ff; border: 1px solid #2a3248; border-radius: 1rem;
+                font-size: 0.85rem; min-width: 200px;">
+            <option value="">— Load workflow —</option>
+        </select>
+        <input type="text" id="wfName" placeholder="Workflow name"
+               style="flex: 1; min-width: 200px; padding: 0.5rem 0.8rem;
+                      background: #1e2438; color: #eef2ff;
+                      border: 1px solid #2a3248; border-radius: 1rem;
+                      font-size: 0.85rem; font-family: inherit; outline: none;">
+        <button id="wfNewBtn" title="New workflow">
+            <i class="fas fa-plus"></i> New
+        </button>
+        <button id="wfSaveBtn">
+            <i class="fas fa-save"></i> Save
+        </button>
+        <button id="wfRunBtn" class="primary">
+            <i class="fas fa-play"></i> Run
+        </button>
+        <button id="wfStopBtn" class="danger" style="display: none;">
+            <i class="fas fa-stop"></i> Stop
+        </button>
+        <span id="wfStatus" style="margin-left: auto; font-size: 0.85rem;
+              color: #8a9bc0;"></span>
+    </div>
+
+    <div style="margin-top: 0.6rem; font-size: 0.75rem; color: #6b7a9c;">
+        <i class="fas fa-info-circle"></i>
+        Build a chain: <b>Trigger</b> → <b>Actions</b>. Each action runs once per URL in the trigger list.
+    </div>
+</div>
+
+<div style="display: grid; grid-template-columns: 1fr 340px; gap: 1rem;" class="wf-layout">
+    <div>
+        <div class="card">
+            <h2><i class="fas fa-project-diagram"></i> Chain</h2>
+            <div id="wfChain"></div>
+        </div>
+
+        <div class="card">
+            <h2 style="display: flex; justify-content: space-between; align-items: center;">
+                <span><i class="fas fa-terminal"></i> Execution Log</span>
+                <button id="wfClearLogBtn" style="padding: 0.25rem 0.7rem;
+                        font-size: 0.7rem;">Clear</button>
+            </h2>
+            <div id="wfLog" style="font-family: 'JetBrains Mono', monospace;
+                 font-size: 0.75rem; max-height: 400px; overflow-y: auto;
+                 background: rgba(10, 14, 24, 0.6); border-radius: 0.5rem;
+                 padding: 0.5rem;">
+                <div class="empty-state">Not running</div>
+            </div>
+        </div>
+    </div>
+
+    <div>
+        <div class="card">
+            <h2><i class="fas fa-plus-circle"></i> Add Node</h2>
+            <div id="wfPalette"></div>
+        </div>
+
+        <div class="card" id="wfConfigCard" style="display: none;">
+            <h2><i class="fas fa-cog"></i> Configure</h2>
+            <div id="wfConfigBody"></div>
+        </div>
+    </div>
+</div>
+
+<style>
+.wf-node {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    background: rgba(18, 22, 35, 0.8);
+    border: 1px solid rgba(80, 100, 140, 0.4);
+    border-left: 4px solid #5f8fe0;
+    border-radius: 0.75rem;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    position: relative;
+}
+.wf-node:hover {
+    background: rgba(30, 38, 58, 0.9);
+    border-color: #5f8fe0;
+    transform: translateX(2px);
+}
+.wf-node.selected {
+    box-shadow: 0 0 0 2px #5f8fe0, 0 8px 24px -8px rgba(95,143,224,0.6);
+}
+.wf-node.running { animation: wfPulse 1.5s ease-in-out infinite; }
+.wf-node.done { border-left-color: #4ade80; background: rgba(20, 50, 35, 0.4); }
+.wf-node.error { border-left-color: #ef4444; background: rgba(60, 20, 20, 0.4); }
+
+.wf-node-icon {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: rgba(30, 40, 60, 0.9);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1rem;
+    flex-shrink: 0;
+}
+.wf-node-body { flex: 1; min-width: 0; }
+.wf-node-title {
+    font-weight: 600;
+    font-size: 0.9rem;
+    color: #eef2ff;
+}
+.wf-node-sub {
+    font-size: 0.75rem;
+    color: #8a9bc0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    margin-top: 2px;
+}
+.wf-node-actions {
+    display: flex;
+    gap: 0.25rem;
+    flex-shrink: 0;
+}
+.wf-node-actions button {
+    padding: 0.25rem 0.55rem;
+    font-size: 0.72rem;
+    border-radius: 0.4rem;
+    min-width: auto;
+    background: rgba(30, 40, 60, 0.9);
+    border: 1px solid rgba(95,143,224,0.2);
+    color: #b0c4ff;
+}
+.wf-node-actions button:hover {
+    background: rgba(95,143,224,0.25);
+    border-color: #5f8fe0;
+}
+.wf-node-actions button:disabled {
+    opacity: 0.25;
+    cursor: not-allowed;
+}
+.wf-arrow {
+    text-align: center;
+    color: #5f8fe0;
+    padding: 0.3rem 0;
+    font-size: 0.9rem;
+    opacity: 0.6;
+}
+@keyframes wfPulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(95, 143, 224, 0.5); }
+    50% { box-shadow: 0 0 0 8px rgba(95, 143, 224, 0); }
+}
+
+.wf-palette-item {
+    padding: 0.55rem 0.75rem;
+    background: rgba(18, 22, 35, 0.8);
+    border: 1px solid rgba(80, 100, 140, 0.4);
+    border-radius: 0.6rem;
+    cursor: pointer;
+    margin-bottom: 0.4rem;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    transition: all 0.15s ease;
+}
+.wf-palette-item:hover {
+    background: rgba(30, 38, 58, 0.95);
+    border-color: #5f8fe0;
+    transform: translateX(4px);
+}
+.wf-palette-icon {
+    width: 24px;
+    text-align: center;
+    font-size: 0.9rem;
+    flex-shrink: 0;
+}
+.wf-palette-text { flex: 1; min-width: 0; }
+.wf-palette-label {
+    font-size: 0.82rem;
+    font-weight: 500;
+    color: #eef2ff;
+}
+.wf-palette-desc {
+    font-size: 0.68rem;
+    color: #8a9bc0;
+    margin-top: 1px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+}
+
+.wf-field {
+    display: block;
+    margin-bottom: 0.85rem;
+}
+.wf-field .wf-label {
+    display: block;
+    font-size: 0.75rem;
+    color: #b0c4ff;
+    margin-bottom: 0.3rem;
+    font-weight: 500;
+}
+.wf-field input,
+.wf-field select,
+.wf-field textarea {
+    width: 100%;
+    background: rgba(20, 26, 42, 0.95);
+    border: 1px solid rgba(95, 143, 224, 0.3);
+    color: #eef2ff;
+    padding: 0.5rem 0.7rem;
+    border-radius: 0.5rem;
+    font-size: 0.82rem;
+    font-family: inherit;
+    outline: none;
+    box-sizing: border-box;
+}
+.wf-field textarea {
+    resize: vertical;
+    min-height: 80px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+}
+.wf-field input:focus,
+.wf-field select:focus,
+.wf-field textarea:focus {
+    border-color: #5f8fe0;
+    box-shadow: 0 0 0 3px rgba(95, 143, 224, 0.18);
+}
+.wf-field .wf-help {
+    font-size: 0.68rem;
+    color: #6b7a9c;
+    margin-top: 0.25rem;
+    line-height: 1.35;
+}
+.wf-field-check {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.82rem;
+    color: #eef2ff;
+    cursor: pointer;
+    margin-bottom: 0.85rem;
+}
+.wf-field-check input { width: auto; accent-color: #5f8fe0; }
+
+.wf-log-line {
+    padding: 0.2rem 0;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    line-height: 1.4;
+}
+.wf-log-line:last-child { border-bottom: none; }
+.wf-log-ts { color: #6b7a9c; margin-right: 0.5rem; }
+.wf-log-line.info { color: #b0c4ff; }
+.wf-log-line.success { color: #4ade80; }
+.wf-log-line.warning { color: #f59e0b; }
+.wf-log-line.error { color: #ef4444; }
+
+.wf-empty-actions {
+    text-align: center;
+    padding: 2rem 1rem;
+    color: #8a9bc0;
+    font-size: 0.85rem;
+}
+
+@media (max-width: 900px) {
+    .wf-layout { grid-template-columns: 1fr !important; }
+}
+</style>
+
+<script>
+(function () {
+'use strict';
+
+// ---------- State ----------
+let NODE_TYPES = {};
+let nodes = [];
+let selectedNodeId = null;
+let currentWorkflowId = null;
+let isDirty = false;
+let runningTaskId = null;
+let pollInterval = null;
+let nodeStatuses = {};
+
+// ---------- DOM ----------
+const $ = (id) => document.getElementById(id);
+const wfSelect = $('wfSelect');
+const wfName = $('wfName');
+const wfChain = $('wfChain');
+const wfPalette = $('wfPalette');
+const wfConfigCard = $('wfConfigCard');
+const wfConfigBody = $('wfConfigBody');
+const wfLog = $('wfLog');
+const wfStatus = $('wfStatus');
+const runBtn = $('wfRunBtn');
+const stopBtn = $('wfStopBtn');
+const saveBtn = $('wfSaveBtn');
+const newBtn = $('wfNewBtn');
+const clearLogBtn = $('wfClearLogBtn');
+
+// ---------- Helpers ----------
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/[&<>"]/g, function (m) {
+        if (m === '&') return '&amp;';
+        if (m === '<') return '&lt;';
+        if (m === '>') return '&gt;';
+        if (m === '"') return '&quot;';
+        return m;
+    });
+}
+
+function showToast(msg, isErr) {
+    if (typeof window.showToast === 'function') window.showToast(msg, isErr);
+    else alert((isErr ? 'Error: ' : '') + msg);
+}
+
+function newId() {
+    return 'n_' + Math.random().toString(36).substring(2, 10);
+}
+
+function markDirty() {
+    isDirty = true;
+    updateToolbarState();
+}
+
+function updateToolbarState() {
+    const nameStr = wfName.value || '(unnamed)';
+    let status = '';
+    if (runningTaskId) {
+        status = '● Running';
+    } else if (isDirty) {
+        status = '● Unsaved changes';
+    } else if (currentWorkflowId) {
+        status = '● Saved';
+    }
+    wfStatus.textContent = nameStr + (status ? '  ·  ' + status : '');
+    wfStatus.style.color = runningTaskId ? '#5f8fe0'
+                          : isDirty ? '#f59e0b' : '#8a9bc0';
+}
+
+// ---------- Node summary ----------
+function nodeSummary(type, config) {
+    config = config || {};
+    if (type === 'trigger.url_list') {
+        const urls = String(config.urls || '').split('\n')
+            .filter(l => l.trim() && !l.trim().startsWith('#'));
+        const n = urls.length;
+        const q = config.quality || '1080p';
+        return `${n} URL${n === 1 ? '' : 's'} · ${q}`;
+    }
+    if (type === 'action.download') return 'yt-dlp';
+    if (type === 'action.download_file') return 'direct file';
+    if (type === 'action.telegram_send') return config.chat_link || 'no chat';
+    if (type === 'action.drive_upload') return 'account: ' + (config.account || 'default');
+    if (type === 'action.compress') {
+        return `${config.codec || 'x265'} · ${config.resolution || 720}p · crf ${config.crf || 27}`;
+    }
+    if (type === 'action.delete_local') return 'delete file';
+    if (type === 'action.delete_drive') return 'delete from Drive';
+    if (type === 'action.wait') return `${config.seconds || 5}s`;
+    if (type === 'action.webhook') return config.url ? config.url.slice(0, 40) : 'no url';
+    return '';
+}
+
+// ---------- Render ----------
+function renderChain() {
+    if (!nodes.length) {
+        wfChain.innerHTML = `<div class="wf-empty-actions">
+            <i class="fas fa-plus-circle" style="font-size: 2rem; opacity: 0.4;"></i>
+            <div style="margin-top: 0.5rem;">Add a <b>Trigger</b> node from the palette to begin.</div>
+        </div>`;
+        return;
+    }
+
+    let html = '';
+    nodes.forEach((n, i) => {
+        const meta = NODE_TYPES[n.type] || {};
+        const isSel = selectedNodeId === n.id;
+        const status = (nodeStatuses[n.id] && nodeStatuses[n.id].status) || 'idle';
+        const progress = (nodeStatuses[n.id] && nodeStatuses[n.id].progress) || 0;
+
+        if (i > 0) {
+            html += `<div class="wf-arrow"><i class="fas fa-arrow-down"></i></div>`;
+        }
+
+        html += `<div class="wf-node ${isSel ? 'selected' : ''} ${status}"
+                    data-node-id="${n.id}"
+                    style="border-left-color: ${meta.color || '#5f8fe0'};"
+                    onclick="__wf_selectNode('${n.id}')">
+            <div class="wf-node-icon" style="color: ${meta.color || '#5f8fe0'};">
+                <i class="fas ${meta.icon || 'fa-cog'}"></i>
+            </div>
+            <div class="wf-node-body">
+                <div class="wf-node-title">${escapeHtml(meta.label || n.type)}</div>
+                <div class="wf-node-sub">${escapeHtml(nodeSummary(n.type, n.config))}</div>
+                ${status === 'running' ? `<div class="progress-bar" style="margin-top: 4px; height: 3px;"><div class="progress-fill" style="width: ${progress}%; background: linear-gradient(90deg, ${meta.color || '#5f8fe0'}, #a5c0ff);"></div></div>` : ''}
+            </div>
+            <div class="wf-node-actions">
+                <button onclick="event.stopPropagation(); __wf_moveNode(${i}, -1)" ${i === 0 ? 'disabled' : ''} title="Move up">↑</button>
+                <button onclick="event.stopPropagation(); __wf_moveNode(${i}, 1)" ${i === nodes.length - 1 ? 'disabled' : ''} title="Move down">↓</button>
+                <button onclick="event.stopPropagation(); __wf_deleteNode('${n.id}')" title="Remove">×</button>
+            </div>
+        </div>`;
+    });
+    wfChain.innerHTML = html;
+}
+
+function renderPalette() {
+    const cats = {};
+    Object.entries(NODE_TYPES).forEach(([type, meta]) => {
+        const cat = meta.category || 'other';
+        if (!cats[cat]) cats[cat] = [];
+        cats[cat].push([type, meta]);
+    });
+
+    const catLabels = { trigger: 'Trigger', action: 'Actions' };
+    const catColors = { trigger: '#4ade80', action: '#5f8fe0' };
+
+    let html = '';
+    Object.entries(cats).forEach(([cat, list]) => {
+        html += `<div style="font-size: 0.72rem; text-transform: uppercase;
+                    letter-spacing: 0.05em; color: ${catColors[cat] || '#8a9bc0'};
+                    font-weight: 600; margin-bottom: 0.5rem; margin-top: 0.3rem;">
+                    ${catLabels[cat] || cat}
+                 </div>`;
+        list.forEach(([type, meta]) => {
+            html += `<div class="wf-palette-item" onclick="__wf_addNode('${type}')">
+                <div class="wf-palette-icon" style="color: ${meta.color};">
+                    <i class="fas ${meta.icon}"></i>
+                </div>
+                <div class="wf-palette-text">
+                    <div class="wf-palette-label">${escapeHtml(meta.label)}</div>
+                    <div class="wf-palette-desc">${escapeHtml(meta.description)}</div>
+                </div>
+            </div>`;
+        });
+    });
+    wfPalette.innerHTML = html;
+}
+
+function renderConfig() {
+    if (!selectedNodeId) {
+        wfConfigCard.style.display = 'none';
+        return;
+    }
+    const node = nodes.find(n => n.id === selectedNodeId);
+    if (!node) {
+        wfConfigCard.style.display = 'none';
+        return;
+    }
+    const meta = NODE_TYPES[node.type];
+    if (!meta) return;
+
+    wfConfigCard.style.display = 'block';
+
+    let html = `<div style="margin-bottom: 0.8rem;">
+        <div style="font-size: 0.9rem; font-weight: 600; color: ${meta.color};">
+            <i class="fas ${meta.icon}"></i> ${escapeHtml(meta.label)}
+        </div>
+        <div style="font-size: 0.72rem; color: #8a9bc0; margin-top: 0.3rem; line-height: 1.4;">
+            ${escapeHtml(meta.description)}
+        </div>
+    </div>`;
+
+    if (!meta.fields || !meta.fields.length) {
+        html += `<div style="font-size: 0.75rem; color: #6b7a9c; padding: 0.5rem; background: rgba(30,40,60,0.4); border-radius: 0.4rem;">
+            This node has no configuration.
+        </div>`;
+    } else {
+        meta.fields.forEach(field => {
+            const val = (node.config && node.config[field.name]) !== undefined
+                ? node.config[field.name]
+                : (field.default !== undefined ? field.default : '');
+
+            if (field.type === 'checkbox') {
+                html += `<label class="wf-field-check">
+                    <input type="checkbox" data-field="${field.name}" ${val ? 'checked' : ''}>
+                    ${escapeHtml(field.label)}
+                </label>`;
+            } else if (field.type === 'select') {
+                html += `<label class="wf-field">
+                    <span class="wf-label">${escapeHtml(field.label)}</span>
+                    <select data-field="${field.name}">`;
+                (field.options || []).forEach(opt => {
+                    html += `<option value="${escapeHtml(opt)}" ${String(opt) === String(val) ? 'selected' : ''}>${escapeHtml(opt)}</option>`;
+                });
+                html += `</select>`;
+                if (field.help) html += `<div class="wf-help">${escapeHtml(field.help)}</div>`;
+                html += `</label>`;
+            } else if (field.type === 'textarea') {
+                html += `<label class="wf-field">
+                    <span class="wf-label">${escapeHtml(field.label)}</span>
+                    <textarea data-field="${field.name}" rows="6"
+                        placeholder="${escapeHtml(field.placeholder || '')}">${escapeHtml(String(val || ''))}</textarea>`;
+                if (field.help) html += `<div class="wf-help">${escapeHtml(field.help)}</div>`;
+                html += `</label>`;
+            } else {
+                html += `<label class="wf-field">
+                    <span class="wf-label">${escapeHtml(field.label)}</span>
+                    <input type="${field.type || 'text'}" data-field="${field.name}"
+                           value="${escapeHtml(String(val || ''))}"
+                           placeholder="${escapeHtml(field.placeholder || '')}">`;
+                if (field.help) html += `<div class="wf-help">${escapeHtml(field.help)}</div>`;
+                html += `</label>`;
+            }
+        });
+    }
+
+    wfConfigBody.innerHTML = html;
+
+    // Attach input handlers
+    wfConfigBody.querySelectorAll('[data-field]').forEach(el => {
+        el.addEventListener('input', () => {
+            if (!node.config) node.config = {};
+            if (el.type === 'checkbox') {
+                node.config[el.dataset.field] = el.checked;
+            } else if (el.type === 'number') {
+                const n = parseFloat(el.value);
+                node.config[el.dataset.field] = isNaN(n) ? el.value : n;
+            } else {
+                node.config[el.dataset.field] = el.value;
+            }
+            markDirty();
+            renderChain();
+        });
+    });
+}
+
+// ---------- Public functions (used in inline onclick) ----------
+window.__wf_addNode = function (type) {
+    if (!NODE_TYPES[type]) return;
+    if (type.startsWith('trigger.') && nodes.some(n => n.type.startsWith('trigger.'))) {
+        showToast('Only one trigger allowed per workflow', true);
+        return;
+    }
+    if (!type.startsWith('trigger.') && !nodes.some(n => n.type.startsWith('trigger.'))) {
+        showToast('Add a trigger first', true);
+        return;
+    }
+    const meta = NODE_TYPES[type];
+    const config = {};
+    (meta.fields || []).forEach(f => {
+        if (f.default !== undefined) config[f.name] = f.default;
+    });
+    const node = { id: newId(), type, config };
+    nodes.push(node);
+    selectedNodeId = node.id;
+    markDirty();
+    renderChain();
+    renderConfig();
+};
+
+window.__wf_selectNode = function (id) {
+    selectedNodeId = id;
+    renderChain();
+    renderConfig();
+};
+
+window.__wf_deleteNode = function (id) {
+    if (!confirm('Remove this node?')) return;
+    nodes = nodes.filter(n => n.id !== id);
+    if (selectedNodeId === id) selectedNodeId = null;
+    markDirty();
+    renderChain();
+    renderConfig();
+};
+
+window.__wf_moveNode = function (idx, delta) {
+    const newIdx = idx + delta;
+    if (newIdx < 0 || newIdx >= nodes.length) return;
+    [nodes[idx], nodes[newIdx]] = [nodes[newIdx], nodes[idx]];
+    markDirty();
+    renderChain();
+};
+
+// ---------- Workflow list ----------
+async function loadWorkflowList() {
+    try {
+        const r = await fetch('/workflow/list', { cache: 'no-store' });
+        const list = await r.json();
+        let html = '<option value="">— Load workflow —</option>';
+        list.forEach(wf => {
+            html += `<option value="${escapeHtml(wf.id)}">${escapeHtml(wf.name)} (${wf.node_count} nodes)</option>`;
+        });
+        wfSelect.innerHTML = html;
+        if (currentWorkflowId) wfSelect.value = currentWorkflowId;
+    } catch (e) {
+        console.error('Failed to load workflow list:', e);
+    }
+}
+
+async function loadWorkflow(id) {
+    if (!id) return;
+    try {
+        const r = await fetch(`/workflow/get/${id}`, { cache: 'no-store' });
+        if (!r.ok) { showToast('Failed to load workflow', true); return; }
+        const wf = await r.json();
+        currentWorkflowId = wf.id;
+        wfName.value = wf.name || '';
+        nodes = wf.nodes || [];
+        selectedNodeId = null;
+        nodeStatuses = {};
+        isDirty = false;
+        try { localStorage.setItem('wf_last_id', wf.id); } catch (e) {}
+        renderChain();
+        renderConfig();
+        updateToolbarState();
+    } catch (e) {
+        showToast('Failed to load workflow: ' + e.message, true);
+    }
+}
+
+async function saveWorkflow() {
+    if (!nodes.length) {
+        showToast('Add nodes before saving', true);
+        return;
+    }
+    if (!nodes[0].type.startsWith('trigger.')) {
+        showToast('First node must be a trigger', true);
+        return;
+    }
+    const payload = {
+        id: currentWorkflowId || undefined,
+        name: wfName.value || 'Untitled Workflow',
+        nodes: nodes,
+    };
+    saveBtn.disabled = true;
+    saveBtn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Saving…';
+    try {
+        const r = await fetch('/workflow/save', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'Save failed');
+        currentWorkflowId = data.id;
+        try { localStorage.setItem('wf_last_id', data.id); } catch (e) {}
+        isDirty = false;
+        updateToolbarState();
+        await loadWorkflowList();
+        showToast('Workflow saved');
+    } catch (e) {
+        showToast(e.message, true);
+    } finally {
+        saveBtn.disabled = false;
+        saveBtn.innerHTML = '<i class="fas fa-save"></i> Save';
+    }
+}
+
+// ---------- Run / Stop ----------
+async function runWorkflow() {
+    if (runningTaskId) return;
+    if (!nodes.length || !nodes[0].type.startsWith('trigger.')) {
+        showToast('First node must be a trigger', true);
+        return;
+    }
+    if (nodes.length < 2) {
+        showToast('Add at least one action node', true);
+        return;
+    }
+
+    const payload = {
+        name: wfName.value || 'Untitled Workflow',
+        nodes: nodes,
+    };
+
+    try {
+        const r = await fetch('/workflow/run', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'Run failed');
+
+        runningTaskId = data.task_id;
+        try { localStorage.setItem('wf_last_task_id', runningTaskId); } catch (e) {}
+        nodeStatuses = {};
+        wfLog.innerHTML = '';
+        runBtn.disabled = true;
+        stopBtn.style.display = '';
+        updateToolbarState();
+        renderChain();
+        startPolling(runningTaskId);
+    } catch (e) {
+        showToast(e.message, true);
+    }
+}
+
+async function stopWorkflow() {
+    if (!runningTaskId) return;
+    try {
+        await fetch(`/cancel/${runningTaskId}`, { method: 'POST' });
+        showToast('Cancellation requested');
+    } catch (e) {
+        showToast('Failed to cancel: ' + e.message, true);
+    }
+}
+
+function startPolling(taskId) {
+    if (pollInterval) clearInterval(pollInterval);
+    let lastLogCount = 0;
+    let lastNodeStatusesJSON = '';
+
+    const tick = async () => {
+        try {
+            const r = await fetch(`/progress/${taskId}`);
+            if (r.status === 404) {
+                clearInterval(pollInterval);
+                runningTaskId = null;
+                resetRunButtons();
+                return;
+            }
+            const t = await r.json();
+
+            // Node statuses (only re-render if changed)
+            const newStatusesJSON = JSON.stringify(t.node_statuses || {});
+            if (newStatusesJSON !== lastNodeStatusesJSON) {
+                lastNodeStatusesJSON = newStatusesJSON;
+                nodeStatuses = t.node_statuses || {};
+                renderChain();
+            }
+
+            // Logs (append new)
+            const logs = t.logs || [];
+            if (logs.length > lastLogCount) {
+                logs.slice(lastLogCount).forEach(entry => {
+                    appendLogEntry(entry);
+                });
+                lastLogCount = logs.length;
+            }
+
+            // Status text
+            if (t.status === 'running') {
+                const idx = (t.current_item_index || 0) + 1;
+                const total = t.total_items || 0;
+                wfStatus.textContent = `● Running · item ${idx}/${total}`;
+                wfStatus.style.color = '#5f8fe0';
+            } else if (t.status === 'done') {
+                wfStatus.textContent = '✅ Complete';
+                wfStatus.style.color = '#4ade80';
+                clearInterval(pollInterval);
+                runningTaskId = null;
+                resetRunButtons();
+            } else if (t.status === 'error') {
+                wfStatus.textContent = '❌ ' + (t.error_msg || 'Failed');
+                wfStatus.style.color = '#ff8a8a';
+                clearInterval(pollInterval);
+                runningTaskId = null;
+                resetRunButtons();
+            } else if (t.status === 'cancelled') {
+                wfStatus.textContent = '⛔ Cancelled';
+                wfStatus.style.color = '#f59e0b';
+                clearInterval(pollInterval);
+                runningTaskId = null;
+                resetRunButtons();
+            }
+        } catch (e) {
+            console.error('Poll error:', e);
+        }
+    };
+    tick();
+    pollInterval = setInterval(tick, 1000);
+}
+
+function resetRunButtons() {
+    runBtn.disabled = false;
+    stopBtn.style.display = 'none';
+    updateToolbarState();
+}
+
+function appendLogEntry(entry) {
+    const emoji = {
+        info: 'ℹ️', success: '✅', warning: '⚠️', error: '❌',
+    }[entry.level] || '•';
+    const ts = new Date((entry.ts || 0) * 1000).toLocaleTimeString();
+    const line = document.createElement('div');
+    line.className = 'wf-log-line ' + (entry.level || 'info');
+    line.innerHTML = `<span class="wf-log-ts">${ts}</span>${emoji} ${escapeHtml(entry.msg)}`;
+    wfLog.appendChild(line);
+    wfLog.scrollTop = wfLog.scrollHeight;
+}
+
+// ---------- Load existing log on page load ----------
+async function loadExistingRun(taskId) {
+    try {
+        const r = await fetch(`/progress/${taskId}`);
+        if (!r.ok) {
+            try { localStorage.removeItem('wf_last_task_id'); } catch (e) {}
+            return;
+        }
+        const t = await r.json();
+        if (t.type !== 'workflow') return;
+        nodeStatuses = t.node_statuses || {};
+        (t.logs || []).forEach(appendLogEntry);
+        wfLog.scrollTop = wfLog.scrollHeight;
+        renderChain();
+        if (t.status === 'running') {
+            runningTaskId = taskId;
+            runBtn.disabled = true;
+            stopBtn.style.display = '';
+            startPolling(taskId);
+        }
+    } catch (e) {
+        console.error('Failed to load existing run:', e);
+    }
+}
+
+// ---------- Toolbar wiring ----------
+wfSelect.addEventListener('change', () => {
+    if (isDirty && !confirm('Discard unsaved changes?')) {
+        wfSelect.value = currentWorkflowId || '';
+        return;
+    }
+    const id = wfSelect.value;
+    if (!id) {
+        // New blank
+        currentWorkflowId = null;
+        wfName.value = '';
+        nodes = [];
+        selectedNodeId = null;
+        nodeStatuses = {};
+        isDirty = false;
+        renderChain();
+        renderConfig();
+        updateToolbarState();
+        return;
+    }
+    loadWorkflow(id);
+});
+
+wfName.addEventListener('input', markDirty);
+
+newBtn.addEventListener('click', () => {
+    if (isDirty && !confirm('Discard unsaved changes?')) return;
+    currentWorkflowId = null;
+    wfName.value = '';
+    nodes = [];
+    selectedNodeId = null;
+    nodeStatuses = {};
+    isDirty = false;
+    try { localStorage.removeItem('wf_last_id'); } catch (e) {}
+    wfSelect.value = '';
+    wfLog.innerHTML = '<div class="empty-state">Not running</div>';
+    renderChain();
+    renderConfig();
+    updateToolbarState();
+});
+
+saveBtn.addEventListener('click', saveWorkflow);
+runBtn.addEventListener('click', runWorkflow);
+stopBtn.addEventListener('click', stopWorkflow);
+
+clearLogBtn.addEventListener('click', () => {
+    wfLog.innerHTML = '<div class="empty-state">Cleared</div>';
+});
+
+// ---------- Init ----------
+(async () => {
+    try {
+        const r = await fetch('/workflow/node-types', { cache: 'no-store' });
+        NODE_TYPES = await r.json();
+    } catch (e) {
+        console.error('Failed to load node types:', e);
+        wfChain.innerHTML = '<div class="empty-state" style="color: #ff8a8a;">Failed to load workflow engine. Refresh the page.</div>';
+        return;
+    }
+    renderPalette();
+    await loadWorkflowList();
+
+    // Restore last workflow
+    let lastId = null;
+    try { lastId = localStorage.getItem('wf_last_id'); } catch (e) {}
+    if (lastId) {
+        await loadWorkflow(lastId);
+    } else {
+        renderChain();
+        updateToolbarState();
+    }
+
+    // Restore last run
+    let lastTaskId = null;
+    try { lastTaskId = localStorage.getItem('wf_last_task_id'); } catch (e) {}
+    if (lastTaskId) {
+        await loadExistingRun(lastTaskId);
+    }
+})();
+
+})();
+</script>
