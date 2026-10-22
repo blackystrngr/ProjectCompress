@@ -49,7 +49,6 @@ def has_video_stream(file_path):
 
 
 def get_duration_clip(clip_path):
-    """Same as get_video_duration but returns None on failure."""
     try:
         return get_video_duration(clip_path)
     except Exception:
@@ -61,12 +60,6 @@ def get_duration_clip(clip_path):
 # ------------------------------------------------------------
 def extract_clip(video_path, start_time, clip_duration, output_path,
                  task_id=None, idx=None, total=None):
-    """
-    Extract a single clip:
-      - video: stream copy
-      - audio: re-encoded with aresample=async=1 so A/V start
-        at the same timestamp (fixes accumulated drift on concat)
-    """
     cmd = [
         'ffmpeg',
         '-ss', f'{start_time:.3f}',
@@ -86,7 +79,6 @@ def extract_clip(video_path, start_time, clip_duration, output_path,
             or not os.path.exists(output_path)
             or os.path.getsize(output_path) == 0
             or not has_video_stream(output_path)):
-        # Fallback to re-encode (rarely needed but safer)
         cmd_re = [
             'ffmpeg',
             '-i', video_path,
@@ -118,17 +110,6 @@ def extract_clip(video_path, start_time, clip_duration, output_path,
 
 
 def _write_concat_list_with_durations(clip_files, clip_durations, concat_list):
-    """
-    Write a concat list with explicit `duration` directives.
-
-    Why: ffmpeg's concat demuxer relies on each clip's container duration
-    to advance to the next file. Stream-copied clips often report 0 or -1,
-    which causes the demuxer to hit EOF early (encoder stops at ~26s of a
-    14-min timeline). The `duration` line forces the correct advance.
-
-    The final repeat of the last file is a concat-demuxer quirk that
-    ensures the last clip's audio tail is flushed.
-    """
     with open(concat_list, 'w') as f:
         for c, d in zip(clip_files, clip_durations):
             f.write(f"file '{os.path.abspath(c)}'\n")
@@ -138,7 +119,6 @@ def _write_concat_list_with_durations(clip_files, clip_durations, concat_list):
 
 
 def merge_clips(clip_files, output_path, task_id):
-    """Stream-copy concat of clips into one file. No re-encode."""
     if not clip_files:
         raise Exception("No clips to merge")
     task = load_task(task_id)
@@ -177,11 +157,6 @@ ALLOWED_AV1_PRESETS = {8, 9, 10, 11, 12, 13}
 
 def _run_progress_ffmpeg(cmd, total_duration, task_id,
                          progress_lo, progress_hi):
-    """
-    Run an ffmpeg command, parse `out_time_us=` for progress, update task.
-    Progress is mapped linearly into [progress_lo, progress_hi].
-    Returns True on success, raises on failure.
-    """
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -235,14 +210,6 @@ def _run_progress_ffmpeg(cmd, total_duration, task_id,
 def process_clips_task(video_path, base, task_id,
                        segment_duration, clip_duration, tail_seconds,
                        compress, codec, resolution, crf, preset):
-    """
-    Unified pipeline:
-      1. Extract stream-copied clips with audio-sync handling.
-      2. If compress:
-           Write concat list with durations → encode directly to H.265/AV1.
-         Else:
-           Stream-copy concat merge (fast).
-    """
     task = load_task(task_id)
     if not task:
         return
@@ -257,7 +224,6 @@ def process_clips_task(video_path, base, task_id,
         task['preset'] = preset
     save_task(task_id, task)
 
-    # Build output filename
     if compress:
         tag = f"_clips_{resolution}p_{codec}"
     else:
@@ -285,7 +251,6 @@ def process_clips_task(video_path, base, task_id,
         task['total_duration'] = total_duration
         save_task(task_id, task)
 
-        # Build segments (clip windows + tail chunks)
         tail_start = max(0, total_duration - tail_seconds)
         clip_end = tail_start if tail_seconds > 0 else total_duration
 
@@ -299,7 +264,6 @@ def process_clips_task(video_path, base, task_id,
                 segments.append((start, 'clip'))
             current += segment_duration
 
-        # Tail chunks
         if tail_seconds > 0 and tail_start < total_duration:
             ct = tail_start
             while ct < total_duration - 0.5:
@@ -325,7 +289,6 @@ def process_clips_task(video_path, base, task_id,
             clip_path = os.path.join(temp_dir, f"clip_{idx:05d}.mp4")
 
             if kind == 'tail':
-                # Tail chunks are larger; the last one may be truncated
                 dur = min(30.0, total_duration - start)
             else:
                 dur = clip_duration
@@ -334,7 +297,6 @@ def process_clips_task(video_path, base, task_id,
                          task_id, idx, total_segments)
             d = get_duration_clip(clip_path)
             if d is None or d < 0.1:
-                # Skip unreadable clip
                 try:
                     os.remove(clip_path)
                 except Exception:
@@ -354,7 +316,6 @@ def process_clips_task(video_path, base, task_id,
         total_clip_dur = sum(clip_durations)
 
         if compress:
-            # ---- ENCODE DIRECTLY FROM CONCAT LIST ----
             concat_list = os.path.join(temp_dir, "concat.txt")
             _write_concat_list_with_durations(clip_files, clip_durations,
                                               concat_list)
@@ -383,7 +344,7 @@ def process_clips_task(video_path, base, task_id,
                     '-movflags', '+faststart',
                     out_path
                 ]
-            else:  # av1
+            else:
                 cmd = [
                     'ffmpeg', '-y',
                     '-progress', 'pipe:2', '-stats_period', '0.5',
@@ -409,7 +370,6 @@ def process_clips_task(video_path, base, task_id,
 
             _run_progress_ffmpeg(cmd, total_clip_dur, task_id, 50, 99)
         else:
-            # ---- MERGE ONLY ----
             merge_clips(clip_files, out_path, task_id)
 
         if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
@@ -452,7 +412,7 @@ def process_clips_task(video_path, base, task_id,
 
 
 # ------------------------------------------------------------
-# AI Summarizer (unchanged, still uses stream copy merge)
+# AI Summarizer
 # ------------------------------------------------------------
 def process_summarizer(video_path, target_duration_sec, clip_duration_sec,
                        output_path, task_id):
@@ -689,6 +649,71 @@ def process_trim_task(video_path, start_sec, end_sec, output_path,
 
 
 # ------------------------------------------------------------
+# Public compressor (reusable from other modules)
+# ------------------------------------------------------------
+def compress_video_file(input_path, output_path, task_id,
+                        codec='x265', resolution=720, crf=27,
+                        preset='veryfast'):
+    """
+    Compress a single video file. Progress updates are written to task_id.
+    Returns output_path on success, raises on failure.
+    """
+    if not check_ffmpeg():
+        raise Exception('ffmpeg not installed')
+    if not os.path.exists(input_path):
+        raise Exception(f'Input file not found: {input_path}')
+
+    codec = (codec or 'x265').lower()
+    resolution = str(resolution or '720')
+    try:
+        crf = int(crf or 27)
+    except (TypeError, ValueError):
+        crf = 27
+
+    duration = get_video_duration(input_path)
+
+    vf = f"scale=-2:{resolution}:flags=lanczos,fps=30"
+
+    if codec == 'x265':
+        cmd = ['ffmpeg', '-y',
+               '-progress', 'pipe:2', '-stats_period', '0.5',
+               '-i', input_path, '-vf', vf,
+               '-c:v', 'libx265',
+               '-preset', str(preset),
+               '-crf', str(crf),
+               '-pix_fmt', 'yuv420p',
+               '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
+               '-af', 'aresample=async=1:first_pts=0',
+               '-movflags', '+faststart',
+               output_path]
+    else:  # av1
+        cmd = ['ffmpeg', '-y',
+               '-progress', 'pipe:2', '-stats_period', '0.5',
+               '-i', input_path, '-vf', vf,
+               '-c:v', 'libsvtav1',
+               '-preset', str(preset),
+               '-crf', str(crf),
+               '-pix_fmt', 'yuv420p10le',
+               '-svtav1-params',
+               'lp=2:film-grain=6:tune=0:scd=1:keyint=240:aq-mode=2',
+               '-c:a', 'libopus', '-b:a', '128k', '-ac', '2',
+               '-af', 'aresample=async=1:first_pts=0',
+               '-movflags', '+faststart',
+               output_path]
+
+    log_info(f'compress_video_file: codec={codec}, res={resolution}p, '
+             f'crf={crf}, preset={preset}, '
+             f'input={os.path.basename(input_path)}')
+
+    _run_progress_ffmpeg(cmd, duration, task_id, 0, 99)
+
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise Exception('Compression produced empty output')
+
+    return output_path
+
+
+# ------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------
 def register_routes(app):
@@ -707,7 +732,6 @@ def register_routes(app):
             logger.exception("Error listing videos")
             return jsonify({'error': str(e)}), 500
 
-    # ---- Unified clips endpoint (extract, optional compress) ----
     @app.route('/clipper/clips', methods=['POST'])
     def clipper_clips():
         if not check_ffmpeg():
@@ -762,7 +786,7 @@ def register_routes(app):
                     return jsonify({'error':
                         f'Invalid x265 preset. Allowed: '
                         f'{sorted(ALLOWED_X265_PRESETS)}'}), 400
-            else:  # av1
+            else:
                 if crf < 15 or crf > 45:
                     return jsonify({'error': 'AV1 CRF must be 15–45'}), 400
                 try:
@@ -823,7 +847,6 @@ def register_routes(app):
             'resolution': resolution,
         })
 
-    # ---- AI Summarizer ----
     @app.route('/clipper/summarize', methods=['POST'])
     def clipper_summarize():
         if not check_ffmpeg():
@@ -861,7 +884,6 @@ def register_routes(app):
         threading.Thread(target=run, daemon=True).start()
         return jsonify({'task_id': task_id})
 
-    # ---- Frame extractor ----
     @app.route('/clipper/extract_frames', methods=['POST'])
     def clipper_extract_frames():
         if not check_ffmpeg():
@@ -890,7 +912,6 @@ def register_routes(app):
         threading.Thread(target=run, daemon=True).start()
         return jsonify({'task_id': task_id})
 
-    # ---- Trim ----
     @app.route('/clipper/trim', methods=['POST'])
     def clipper_trim():
         if not check_ffmpeg():
