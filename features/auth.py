@@ -14,7 +14,13 @@ def _candidate_paths():
     env_override = os.environ.get('AUTH_PASSWORD_FILE', '').strip()
     if env_override:
         paths.append(env_override)
-    paths.append('/root/secrets/.password')
+    # New: secrets/ dir first (co-located with settings.json)
+    try:
+        from config import SECRETS_PASSWORD_FILE
+        paths.append(SECRETS_PASSWORD_FILE)
+    except Exception:
+        pass
+    paths.append('/root/.password')
     try:
         home = os.path.expanduser('~')
         if home and home not in ('~', '/'):
