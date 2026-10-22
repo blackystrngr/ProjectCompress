@@ -10,25 +10,14 @@ Handles:
   - Torrents (magnet + .torrent) — with DHT, public trackers, timeouts
   - Any media page via 15-strategy video cracking
 
-Playwright lifecycle
---------------------
-The sniffer ALWAYS closes the browser context, the browser, and the
-Playwright driver in a try/finally. After every sniff, orphaned
-headless_shell processes are killed via _cleanup_playwright_processes().
-
-Torrent lifecycle
------------------
-Every torrent session enables DHT, LSD, UPnP, NAT-PMP and adds public
-trackers. Metadata fetch has a hard 5-min timeout; download loop has a
-2-min stall detector. No more infinite hangs on dead magnets.
-
-yt-dlp robustness (2026-10-22)
-------------------------------
-  - Multi-client extractor fallback (android, web, tv_embedded, ios)
+Robustness (2026-10-22)
+-----------------------
+  - Uses --extractor-args youtube:player_client=mweb (proven reliable)
   - --retries 20, --fragment-retries 20, --retry-sleep 5
-  - --socket-timeout 30, --http-chunk-size 10M
+  - --socket-timeout 30
   - Resumes via .part files (--continue, no --no-part)
-  - title_based=True uses %(title)s in the output filename
+  - title_based=True → output uses %(title)s
+  - Reports real yt-dlp error lines, not just exit codes
 """
 
 import os
@@ -1337,7 +1326,7 @@ def download_direct_file(url, task_id):
 
 
 # ============================================================
-# YT-DLP DOWNLOADER — robust, resumable, title-aware
+# YT-DLP DOWNLOADER — reverts to mweb, keeps robustness
 # ============================================================
 def download_with_ytdlp(url, task_id, quality='best', title_based=False):
     """
@@ -1347,8 +1336,7 @@ def download_with_ytdlp(url, task_id, quality='best', title_based=False):
         url:         Video URL
         task_id:     Task identifier (for progress + cancellation)
         quality:     best|2160p|1440p|1080p|720p|480p|360p|audio
-        title_based: If True, output filename uses %(title)s from yt-dlp
-                     instead of watch.mp4. Titles are sanitized and byte-truncated.
+        title_based: If True, output filename uses %(title)s.
     """
     task = load_task(task_id)
     if not task:
@@ -1370,7 +1358,6 @@ def download_with_ytdlp(url, task_id, quality='best', title_based=False):
 
     format_choice = QUALITY_MAP.get(quality, QUALITY_MAP['best'])
 
-    # Output template: title-based (readable) or ID-based (safe fallback)
     if title_based:
         output_template = os.path.join(
             UPLOAD_FOLDER, f"{task_id}_dl.%(title).150B.%(ext)s")
@@ -1378,6 +1365,7 @@ def download_with_ytdlp(url, task_id, quality='best', title_based=False):
         output_template = os.path.join(
             UPLOAD_FOLDER, f"{task_id}_dl.%(ext)s")
 
+    # ── Client: mweb (reverted from multi-client — that broke formats) ──
     cmd = [
         'yt-dlp',
         '-o', output_template,
@@ -1385,20 +1373,16 @@ def download_with_ytdlp(url, task_id, quality='best', title_based=False):
         '--merge-output-format', 'mp4',
         '--no-mtime', '--no-warnings', '--ignore-errors',
         '--impersonate', 'chrome',
-        # Multi-client fallback — mweb alone is unstable
-        '--extractor-args',
-        'youtube:player_client=android,web,tv_embedded,ios',
+        '--extractor-args', 'youtube:player_client=mweb',
         '--extractor-args', 'generic:impersonate',
         '--ffmpeg-location', ffmpeg_path,
         '--newline', '--progress', '--no-colors',
-        '--concurrent-fragments', '1',
-        # Patient retry policy for flaky CDN connections
+        '--concurrent-fragments', CONCURRENT_FRAGMENTS,
+        # Robustness against flaky CDN connections
         '--retries', '20',
         '--fragment-retries', '20',
         '--retry-sleep', '5',
         '--socket-timeout', '30',
-        '--http-chunk-size', '10M',
-        # Resume .part files between retries
         '--continue',
         '--no-playlist',
     ]
@@ -1479,7 +1463,6 @@ def download_with_ytdlp(url, task_id, quality='best', title_based=False):
     if process.returncode != 0:
         full_output = ''.join(output_lines)
         logger.error(f"yt-dlp failed (code {process.returncode}):\n{full_output[-3000:]}")
-        # Extract the useful error line if present
         err_lines = [l.strip() for l in full_output.splitlines()
                      if 'ERROR' in l]
         err_text = '\n'.join(err_lines) if err_lines else full_output[-500:]
@@ -1491,7 +1474,6 @@ def download_with_ytdlp(url, task_id, quality='best', title_based=False):
     if not all_files:
         raise Exception("No output file found.")
 
-    # Exclude intermediate fragments like <taskid>_dl.f137.mp4
     final_files = [f for f in all_files if not re.search(r'\.f\d+\.', f)]
     if not final_files:
         final_files = all_files
@@ -1520,12 +1502,9 @@ def download_with_ytdlp(url, task_id, quality='best', title_based=False):
 
     # ── Build final filename ──
     if title_based:
-        # Strip "<taskid>_dl." prefix to recover the raw title from yt-dlp
         raw_title = chosen[len(prefix):]
         base_name = re.sub(r'\.mp4$', '', raw_title, flags=re.IGNORECASE)
-        # Sanitize anything yt-dlp might have missed
         base_name = re.sub(r'[/\\:*?"<>|]', '_', base_name)
-        # Byte-safe truncation for extreme Unicode titles
         if len(base_name.encode('utf-8')) > 200:
             base_name = base_name.encode('utf-8')[:200].decode(
                 'utf-8', errors='ignore')
@@ -1557,7 +1536,7 @@ def download_with_ytdlp(url, task_id, quality='best', title_based=False):
 
 
 # ============================================================
-# PLAYLIST DOWNLOADER — robust, resumable
+# PLAYLIST DOWNLOADER — mweb, robustness kept
 # ============================================================
 def download_playlist(url, task_id, quality='best', range_start=1, range_end=0):
     task = load_task(task_id)
@@ -1604,17 +1583,15 @@ def download_playlist(url, task_id, quality='best', range_start=1, range_end=0):
         '--merge-output-format', 'mp4',
         '--no-mtime', '--no-warnings', '--ignore-errors',
         '--impersonate', 'chrome',
-        '--extractor-args',
-        'youtube:player_client=android,web,tv_embedded,ios',
+        '--extractor-args', 'youtube:player_client=mweb',
         '--extractor-args', 'generic:impersonate',
         '--ffmpeg-location', ffmpeg_path,
         '--newline', '--progress', '--no-colors',
-        '--concurrent-fragments', '1',
+        '--concurrent-fragments', CONCURRENT_FRAGMENTS,
         '--retries', '20',
         '--fragment-retries', '20',
         '--retry-sleep', '5',
         '--socket-timeout', '30',
-        '--http-chunk-size', '10M',
         '--continue',
         '--yes-playlist',
         '--download-archive', archive_file,
