@@ -398,8 +398,8 @@ def upload_to_colab_processing(input_path, account='default',
                                 task_id=None, node_id=None):
     """
     Upload a file to Colab_Processing (no Colab wait).
-    Returns the Drive API response dict ({id, name, webViewLink}).
-    If task_id given, progress is written to task['upload_progress'].
+    Returns the Drive API response dict ({id, name, webViewLink, size}).
+    If task_id is given, progress is written to the workflow node.
     """
     from googleapiclient.http import MediaFileUpload
 
@@ -435,7 +435,7 @@ def upload_to_colab_processing(input_path, account='default',
     logger.info(f"Uploaded '{filename}' to Colab_Processing ({account}): "
                 f"id={response.get('id')}")
     return response
-                                    
+
 
 def get_all_processed_outputs(force_refresh=False):
     with _processed_cache['lock']:
