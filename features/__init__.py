@@ -13,6 +13,7 @@ from . import face_swap
 from . import ocr
 from . import web_crawler
 from . import thumbnails
+from . import workflow
 from . import settings              # ← NEW
 from . import telegram_logger
 
@@ -40,6 +41,7 @@ def register_all_features(app):
     ocr.register_routes(app)
     web_crawler.register_routes(app)
     thumbnails.register_routes(app)
+    workflow.register_routes(app)
     settings.register_routes(app)       # ← NEW
     telegram_logger.register_routes(app)
 
