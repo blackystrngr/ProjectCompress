@@ -11,9 +11,8 @@ from flask import request, jsonify
 
 logger = logging.getLogger(__name__)
 
+from config import SETTINGS_FILE, SECRETS_DIR
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SETTINGS_FILE = os.path.join(PROJECT_ROOT, 'settings.json')
-
 _write_lock = threading.Lock()
 
 
