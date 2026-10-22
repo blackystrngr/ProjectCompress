@@ -1165,3 +1165,282 @@ async function saveWorkflow() {
         name: wfName.value || 'Untitled Workflow',
         nodes: cleanNodes,
         edges: edges.map(e => ({ from: e.from, to: e.to })),
+    };
+    saveBtn.disabled = true;
+    saveBtn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i>';
+    try {
+        const r = await fetch('/workflow/save', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'Save failed');
+        currentWorkflowId = data.id;
+        try { localStorage.setItem('wf_last_id', data.id); } catch (e) {}
+        isDirty = false;
+        updateToolbarState();
+        await loadWorkflowList();
+        showToast('Workflow saved');
+    } catch (e) {
+        showToast(e.message, true);
+    } finally {
+        saveBtn.disabled = false;
+        saveBtn.innerHTML = '<i class="fas fa-save"></i> Save';
+    }
+}
+
+// ============================================================
+// Run / Stop / Poll
+// ============================================================
+async function runWorkflow() {
+    if (runningTaskId) return;
+    if (!nodes.length) { showToast('Empty workflow', true); return; }
+    const trigger = nodes.find(n => n.type.startsWith('trigger.'));
+    if (!trigger) { showToast('Need a trigger node', true); return; }
+    if (nodes.length < 2) { showToast('Add at least one action', true); return; }
+    if (edges.length !== nodes.length - 1) {
+        showToast('Connect all nodes into one chain', true);
+        return;
+    }
+
+    const cleanNodes = nodes.map(n => ({
+        id: n.id, type: n.type, config: n.config || {},
+        x: Math.round(n.x), y: Math.round(n.y),
+    }));
+    const payload = {
+        name: wfName.value || 'Untitled Workflow',
+        nodes: cleanNodes,
+        edges: edges.map(e => ({ from: e.from, to: e.to })),
+    };
+
+    try {
+        const r = await fetch('/workflow/run', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'Run failed');
+        runningTaskId = data.task_id;
+        try { localStorage.setItem('wf_last_task_id', runningTaskId); } catch (e) {}
+        nodeStatuses = {};
+        wfLog.innerHTML = '';
+        runBtn.disabled = true;
+        stopBtn.style.display = '';
+        updateToolbarState();
+        renderAll();
+        startPolling(runningTaskId);
+    } catch (e) {
+        showToast(e.message, true);
+    }
+}
+
+async function stopWorkflow() {
+    if (!runningTaskId) return;
+    try {
+        await fetch(`/cancel/${runningTaskId}`, { method: 'POST' });
+        showToast('Cancellation requested');
+    } catch (e) { showToast('Failed: ' + e.message, true); }
+}
+
+function startPolling(taskId) {
+    if (pollInterval) clearInterval(pollInterval);
+    let lastLogCount = 0;
+    let lastStatusesJSON = '';
+
+    const tick = async () => {
+        try {
+            const r = await fetch(`/progress/${taskId}`);
+            if (r.status === 404) {
+                clearInterval(pollInterval);
+                runningTaskId = null;
+                resetRunButtons();
+                return;
+            }
+            const t = await r.json();
+
+            const statusesJSON = JSON.stringify(t.node_statuses || {});
+            if (statusesJSON !== lastStatusesJSON) {
+                lastStatusesJSON = statusesJSON;
+                nodeStatuses = t.node_statuses || {};
+                renderNodes();
+            }
+
+            const logs = t.logs || [];
+            if (logs.length > lastLogCount) {
+                logs.slice(lastLogCount).forEach(appendLogEntry);
+                lastLogCount = logs.length;
+            }
+
+            if (t.status === 'running') {
+                const idx = (t.current_item_index || 0) + 1;
+                const total = t.total_items || 0;
+                wfStatus.textContent = `● Running · item ${idx}/${total}`;
+                wfStatus.style.color = '#5f8fe0';
+            } else if (t.status === 'done') {
+                wfStatus.textContent = '✅ Complete';
+                wfStatus.style.color = '#4ade80';
+                clearInterval(pollInterval);
+                runningTaskId = null;
+                try { localStorage.removeItem('wf_last_task_id'); } catch (e) {}
+                resetRunButtons();
+            } else if (t.status === 'error') {
+                wfStatus.textContent = '❌ ' + (t.error_msg || 'Failed');
+                wfStatus.style.color = '#ff8a8a';
+                clearInterval(pollInterval);
+                runningTaskId = null;
+                try { localStorage.removeItem('wf_last_task_id'); } catch (e) {}
+                resetRunButtons();
+            } else if (t.status === 'cancelled') {
+                wfStatus.textContent = '⛔ Cancelled';
+                wfStatus.style.color = '#f59e0b';
+                clearInterval(pollInterval);
+                runningTaskId = null;
+                try { localStorage.removeItem('wf_last_task_id'); } catch (e) {}
+                resetRunButtons();
+            }
+        } catch (e) { console.error('Poll error:', e); }
+    };
+    tick();
+    pollInterval = setInterval(tick, 1000);
+}
+
+function resetRunButtons() {
+    runBtn.disabled = false;
+    stopBtn.style.display = 'none';
+    updateToolbarState();
+}
+
+function appendLogEntry(entry) {
+    const emoji = { info: 'ℹ️', success: '✅', warning: '⚠️', error: '❌' }[entry.level] || '•';
+    const ts = new Date((entry.ts || 0) * 1000).toLocaleTimeString();
+    const line = document.createElement('div');
+    line.className = 'wf-log-line ' + (entry.level || 'info');
+    line.innerHTML = `<span class="wf-log-ts">${ts}</span>${emoji} ${escapeHtml(entry.msg)}`;
+    wfLog.appendChild(line);
+    wfLog.scrollTop = wfLog.scrollHeight;
+}
+
+async function loadExistingRun(taskId) {
+    try {
+        const r = await fetch(`/progress/${taskId}`);
+        if (!r.ok) {
+            try { localStorage.removeItem('wf_last_task_id'); } catch (e) {}
+            return;
+        }
+        const t = await r.json();
+        if (t.type !== 'workflow') return;
+        nodeStatuses = t.node_statuses || {};
+        (t.logs || []).forEach(appendLogEntry);
+        wfLog.scrollTop = wfLog.scrollHeight;
+        renderNodes();
+        if (t.status === 'running') {
+            runningTaskId = taskId;
+            runBtn.disabled = true;
+            stopBtn.style.display = '';
+            startPolling(taskId);
+        }
+    } catch (e) { console.error(e); }
+}
+
+// ============================================================
+// Toolbar
+// ============================================================
+wfSelect.addEventListener('change', () => {
+    if (isDirty && !confirm('Discard unsaved changes?')) {
+        wfSelect.value = currentWorkflowId || '';
+        return;
+    }
+    const id = wfSelect.value;
+    if (!id) {
+        currentWorkflowId = null;
+        wfName.value = '';
+        nodes = []; edges = [];
+        selectedNodeId = null;
+        nodeStatuses = {};
+        isDirty = false;
+        panX = 0; panY = 0; zoom = 1;
+        applyTransform();
+        try { localStorage.removeItem('wf_last_id'); } catch (e) {}
+        renderAll();
+        updateToolbarState();
+        return;
+    }
+    loadWorkflow(id);
+});
+
+wfName.addEventListener('input', markDirty);
+
+$('wfNewBtn').addEventListener('click', () => {
+    if (isDirty && !confirm('Discard unsaved changes?')) return;
+    currentWorkflowId = null;
+    wfName.value = '';
+    nodes = []; edges = [];
+    selectedNodeId = null;
+    nodeStatuses = {};
+    isDirty = false;
+    panX = 0; panY = 0; zoom = 1;
+    applyTransform();
+    try { localStorage.removeItem('wf_last_id'); } catch (e) {}
+    wfSelect.value = '';
+    wfLog.innerHTML = '<div class="empty-state">Not running</div>';
+    renderAll();
+    updateToolbarState();
+});
+
+saveBtn.addEventListener('click', saveWorkflow);
+runBtn.addEventListener('click', runWorkflow);
+stopBtn.addEventListener('click', stopWorkflow);
+$('wfClearLogBtn').addEventListener('click', () => {
+    wfLog.innerHTML = '<div class="empty-state">Cleared</div>';
+});
+
+// ============================================================
+// Zoom buttons
+// ============================================================
+$('wfZoomIn').addEventListener('click', () => {
+    const r = viewport.getBoundingClientRect();
+    zoomAt(1.2, r.left + r.width / 2, r.top + r.height / 2);
+});
+$('wfZoomOut').addEventListener('click', () => {
+    const r = viewport.getBoundingClientRect();
+    zoomAt(1 / 1.2, r.left + r.width / 2, r.top + r.height / 2);
+});
+$('wfZoomReset').addEventListener('click', () => {
+    panX = 0; panY = 0; zoom = 1;
+    applyTransform();
+});
+
+// ============================================================
+// Init
+// ============================================================
+(async () => {
+    try {
+        const r = await fetch('/workflow/node-types', { cache: 'no-store' });
+        NODE_TYPES = await r.json();
+    } catch (e) {
+        console.error(e);
+        wfHint.textContent = 'Failed to load workflow engine';
+        return;
+    }
+    renderPalette();
+    applyTransform();
+    await loadWorkflowList();
+
+    let lastId = null;
+    try { lastId = localStorage.getItem('wf_last_id'); } catch (e) {}
+    if (lastId) {
+        await loadWorkflow(lastId);
+    } else {
+        renderAll();
+        updateToolbarState();
+    }
+
+    let lastTaskId = null;
+    try { lastTaskId = localStorage.getItem('wf_last_task_id'); } catch (e) {}
+    if (lastTaskId) await loadExistingRun(lastTaskId);
+})();
+
+})();
+</script>
