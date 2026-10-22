@@ -1,14 +1,16 @@
 import os
 import sys
+import glob
+import shutil
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ============================================================
-# Directories
+# Base directories
 # ============================================================
-UPLOAD_FOLDER    = os.path.join(BASE_DIR, 'downloads')
-TASKS_DIR        = os.path.join(BASE_DIR, 'tasks')
-PROXY_CACHE_DIR  = os.path.join(BASE_DIR, 'proxy_cache')
+UPLOAD_FOLDER   = os.path.join(BASE_DIR, 'downloads')
+TASKS_DIR       = os.path.join(BASE_DIR, 'tasks')
+PROXY_CACHE_DIR = os.path.join(BASE_DIR, 'proxy_cache')
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(TASKS_DIR, exist_ok=True)
@@ -45,31 +47,92 @@ def _ensure_secrets_dir():
 
 SECRETS_DIR = _ensure_secrets_dir()
 
-SETTINGS_FILE        = os.path.join(SECRETS_DIR, 'settings.json')
-LEGACY_SETTINGS_FILE = os.path.join(BASE_DIR, 'settings.json')
+
+# ============================================================
+# One-time idempotent migration of all secret files
+# ============================================================
+_SECRET_PATTERNS = [
+    'cookies.txt',
+    'telegram_creds.json',
+    'token.json',
+    'token_*.json',
+    'telegram_session.session',
+    'telegram_session.session-journal',
+    'telegram_logger_session.session',
+    'telegram_logger_session.session-journal',
+    'telegram_logger_bot.session',
+    'telegram_logger_bot.session-journal',
+    'settings.json',
+    '.password',
+]
+
+
+def _migrate_secrets():
+    sources = [(BASE_DIR, _SECRET_PATTERNS)]
+    # /root/.password is a common legacy location
+    if os.path.exists('/root/.password'):
+        sources.append(('/root', ['.password']))
+
+    for base, patterns in sources:
+        for pat in patterns:
+            for legacy in glob.glob(os.path.join(base, pat)):
+                name = os.path.basename(legacy)
+                new = os.path.join(SECRETS_DIR, name)
+                if os.path.exists(new):
+                    continue  # already migrated, target wins
+                try:
+                    try:
+                        os.rename(legacy, new)
+                    except OSError:
+                        shutil.copy2(legacy, new)
+                        os.remove(legacy)
+                    try:
+                        os.chmod(new, 0o600)
+                    except OSError:
+                        pass
+                    print(f"[config] Migrated {name} → {SECRETS_DIR}",
+                          file=sys.stderr)
+                except Exception as e:
+                    print(f"[config] Migration failed for {name}: {e}",
+                          file=sys.stderr)
+
+
+_migrate_secrets()
+
+
+# ============================================================
+# Resolved file paths (secrets first, legacy fallback)
+# ============================================================
+def _resolve(name):
+    new = os.path.join(SECRETS_DIR, name)
+    if os.path.exists(new):
+        return new
+    legacy = os.path.join(BASE_DIR, name)
+    if os.path.exists(legacy):
+        return legacy
+    return new  # default target for new files
+
+
+SETTINGS_FILE         = _resolve('settings.json')
+LEGACY_SETTINGS_FILE  = os.path.join(BASE_DIR, 'settings.json')
 SECRETS_PASSWORD_FILE = os.path.join(SECRETS_DIR, '.password')
 
-# Auto-migrate legacy settings.json → secrets/ (one-time, idempotent)
-if (not os.path.exists(SETTINGS_FILE)
-        and os.path.exists(LEGACY_SETTINGS_FILE)):
-    try:
-        import shutil as _shutil
-        _shutil.copy2(LEGACY_SETTINGS_FILE, SETTINGS_FILE)
-        try:
-            os.chmod(SETTINGS_FILE, 0o600)
-        except OSError:
-            pass
-        print(f"[config] Migrated settings.json → {SETTINGS_FILE}",
-              file=sys.stderr)
-    except Exception as _e:
-        print(f"[config] Could not migrate legacy settings: {_e}",
-              file=sys.stderr)
-        SETTINGS_FILE = LEGACY_SETTINGS_FILE
-elif os.path.exists(SETTINGS_FILE):
+COOKIES_FILE         = _resolve('cookies.txt')
+TELEGRAM_CREDS_FILE  = _resolve('telegram_creds.json')
+TOKEN_FILE           = _resolve('token.json')
+
+# Telegram session base paths (Telethon appends .session)
+TELEGRAM_SESSION_FILE       = os.path.join(SECRETS_DIR, 'telegram_session')
+TELEGRAM_LOGGER_SESSION     = os.path.join(SECRETS_DIR, 'telegram_logger_session')
+TELEGRAM_LOGGER_BOT_SESSION = os.path.join(SECRETS_DIR, 'telegram_logger_bot')
+
+# Tighten settings.json permissions if it exists
+if os.path.exists(SETTINGS_FILE):
     try:
         os.chmod(SETTINGS_FILE, 0o600)
     except OSError:
         pass
+
 
 # ============================================================
 # Media / network config
@@ -79,41 +142,28 @@ ALLOWED_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.m4v'}
 PROXY_URL  = os.environ.get('PROXY_URL', '')
 PROXY_DICT = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 
-# ============================================================
-# Google Drive
-# ============================================================
-DRIVE_FOLDER_ID = os.environ.get('DRIVE_FOLDER_ID',
-                                  '1pWRXvzo6KmnMfboTr4yfrD0AseRR0KEu')
-TOKEN_FILE = os.path.join(BASE_DIR, 'token.json')
-if not os.path.exists(TOKEN_FILE):
-    print("WARNING: token.json not found. Google Drive features may not work.",
-          file=sys.stderr)
+DRIVE_FOLDER_ID = os.environ.get(
+    'DRIVE_FOLDER_ID', '1pWRXvzo6KmnMfboTr4yfrD0AseRR0KEu')
+
+TELEGRAM_PROXY = None
+
+SECRET_KEY         = os.environ.get('SECRET_KEY', 'whyyouleftme')
+MAX_CONTENT_LENGTH = 2 * 1024 * 1024 * 1024  # 2 GB
+
 
 # ============================================================
-# Telegram
+# Multi-account Drive tokens — search both dirs (secrets wins)
 # ============================================================
-TELEGRAM_SESSION_FILE = os.path.join(BASE_DIR, 'telegram_session')
-TELEGRAM_CREDS_FILE   = os.path.join(BASE_DIR, 'telegram_creds.json')
-TELEGRAM_PROXY        = None
-
-# ============================================================
-# Flask
-# ============================================================
-SECRET_KEY          = os.environ.get('SECRET_KEY', 'whyyouleftme')
-MAX_CONTENT_LENGTH  = 2 * 1024 * 1024 * 1024   # 2 GB
-
-# ============================================================
-# Multi-account Drive tokens
-# ============================================================
-import glob as _glob
-
 def discover_drive_accounts():
-    """Return {account_name: token_path}."""
+    """Return {account_name: token_path}. Secrets dir overrides legacy."""
     out = {}
-    for path in sorted(_glob.glob(os.path.join(BASE_DIR, 'token*.json'))):
-        name = os.path.splitext(os.path.basename(path))[0]
-        if name == 'token':
-            out['default'] = path
-        elif name.startswith('token_'):
-            out[name[len('token_'):]] = path
+    for base in (BASE_DIR, SECRETS_DIR):
+        if not os.path.isdir(base):
+            continue
+        for path in sorted(glob.glob(os.path.join(base, 'token*.json'))):
+            name = os.path.splitext(os.path.basename(path))[0]
+            if name == 'token':
+                out['default'] = path
+            elif name.startswith('token_'):
+                out[name[len('token_'):]] = path
     return out
