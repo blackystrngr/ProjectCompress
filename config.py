@@ -13,6 +13,65 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(TASKS_DIR, exist_ok=True)
 os.makedirs(PROXY_CACHE_DIR, exist_ok=True)
 
+# ============================================================
+# Secrets directory (outside project tree)
+# ============================================================
+# Default: /root/secrets (chmod 700)
+# Override: PROJECT_SECRETS_DIR env var
+# Fallback: <project>/secrets if /root/secrets isn't writable
+SECRETS_DIR = os.environ.get('PROJECT_SECRETS_DIR', '/root/secrets')
+
+def _ensure_secrets_dir():
+    try:
+        os.makedirs(SECRETS_DIR, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(SECRETS_DIR, 0o700)
+        except OSError:
+            pass
+        return SECRETS_DIR
+    except PermissionError:
+        fallback = os.path.join(BASE_DIR, 'secrets')
+        os.makedirs(fallback, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(fallback, 0o700)
+        except OSError:
+            pass
+        print(f"WARNING: Cannot write to {SECRETS_DIR} (not running as root?) "
+              f"— falling back to {fallback}",
+              file=sys.stderr)
+        return fallback
+
+SECRETS_DIR = _ensure_secrets_dir()
+
+# Central settings file — lives in the secrets dir
+SETTINGS_FILE         = os.path.join(SECRETS_DIR, 'settings.json')
+LEGACY_SETTINGS_FILE  = os.path.join(BASE_DIR, 'settings.json')
+
+# Auto-migrate legacy settings.json → secrets/ (one-time, idempotent)
+if (not os.path.exists(SETTINGS_FILE)
+        and os.path.exists(LEGACY_SETTINGS_FILE)):
+    try:
+        import shutil as _shutil
+        _shutil.copy2(LEGACY_SETTINGS_FILE, SETTINGS_FILE)
+        try:
+            os.chmod(SETTINGS_FILE, 0o600)
+        except OSError:
+            pass
+        print(f"[config] Migrated settings.json → {SETTINGS_FILE}",
+              file=sys.stderr)
+    except Exception as _e:
+        print(f"[config] Could not migrate legacy settings: {_e}",
+              file=sys.stderr)
+        SETTINGS_FILE = LEGACY_SETTINGS_FILE
+elif os.path.exists(SETTINGS_FILE):
+    try:
+        os.chmod(SETTINGS_FILE, 0o600)
+    except OSError:
+        pass
+
+# Password file candidates (adds /root/secrets/.password as an option)
+SECRETS_PASSWORD_FILE = os.path.join(SECRETS_DIR, '.password')
+
 # Allowed video extensions (for backward compatibility)
 ALLOWED_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.m4v'}
 
