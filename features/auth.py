@@ -14,12 +14,14 @@ def _candidate_paths():
     env_override = os.environ.get('AUTH_PASSWORD_FILE', '').strip()
     if env_override:
         paths.append(env_override)
-    # New: secrets/ dir first (co-located with settings.json)
+
+    # Secrets dir first (co-located with settings.json)
     try:
         from config import SECRETS_PASSWORD_FILE
         paths.append(SECRETS_PASSWORD_FILE)
     except Exception:
         pass
+
     paths.append('/root/.password')
     try:
         home = os.path.expanduser('~')
@@ -61,11 +63,7 @@ EXEMPT_PREFIXES = (
     '/mark_processing/',
     '/mark_done/',
     '/mark_failed/',
-    # SSE stream: EventSource cannot send Authorization headers.
-    # task_id is a UUID4 (122 bits of entropy) and is only revealed
-    # through authenticated API responses, so it functions as a
-    # bearer token for the stream itself.
-    '/workflow/stream/',
+    '/workflow/stream/',   # EventSource can't send Authorization headers
 )
 
 
@@ -108,11 +106,9 @@ def _load_password():
 def _check_basic_auth(auth) -> bool:
     if auth is None or auth.type != 'basic':
         return False
-
     configured = _load_password()
     if not configured:
         return False
-
     supplied = (auth.password or '').encode('utf-8')
     expected = configured.encode('utf-8')
     return hmac.compare_digest(supplied, expected)
