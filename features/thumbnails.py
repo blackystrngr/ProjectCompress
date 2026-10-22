@@ -19,8 +19,8 @@ VIDEO_EXTS = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.m4v', '.ts', '.
 # ============================================================
 # Settings (persisted to project root)
 # ============================================================
+from config import SETTINGS_FILE
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SETTINGS_FILE = os.path.join(PROJECT_ROOT, 'settings.json')
 _settings_lock = threading.Lock()
 
 
