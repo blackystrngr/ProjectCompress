@@ -38,8 +38,9 @@ _last_net_sample = None
 _net_sample_lock = threading.Lock()
 
 COOKIE_UPLOAD_TOKEN = os.environ.get('COOKIE_UPLOAD_TOKEN', 'whyyouleftme')
-COOKIES_SAVE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
-TOKEN_UPLOAD_DIR = os.path.dirname(os.path.abspath(__file__))
+from config import SECRETS_DIR
+COOKIES_SAVE_PATH = os.path.join(SECRETS_DIR, 'cookies.txt')
+TOKEN_UPLOAD_DIR = SECRETS_DIR
 
 
 def create_app():
