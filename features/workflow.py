@@ -1,19 +1,13 @@
 # features/workflow.py
 """
-Smart node-based workflow engine.
+Advanced node-based workflow engine.
 
-Execution model: token-based traversal with multi-output-port branching.
-
-Storage (v3):
-    {
-      "id", "name",
-      "nodes": [{"id","type","config","x","y"}, ...],
-      "edges": [{"from","from_port","to"}, ...]
-    }
-
-Edges without `from_port` default to "out" (v2 compat).
-Execution is per-item: a "token" starts at the trigger and flows
-through nodes, activating output ports, until no more tokens are active.
+Features:
+  • Branching (Condition/Switch/Fork), merging (Merge), parallel branches
+  • Sub-workflows (recursion-limited), user-input gates, dry run mode
+  • Per-node timeout, retry with exponential backoff, error policies
+  • Context snapshots, node timings, comments, import/export
+  • Safe Python expressions in locked namespace
 """
 
 import os
@@ -25,7 +19,8 @@ import threading
 import subprocess
 import logging
 import shutil
-from flask import request, jsonify
+import copy
+from flask import request, jsonify, Response
 from tasks import save_task, load_task, delete_task
 from config import UPLOAD_FOLDER
 
@@ -35,38 +30,51 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKFLOWS_DIR = os.path.join(PROJECT_ROOT, 'workflows')
 os.makedirs(WORKFLOWS_DIR, exist_ok=True)
 
+MAX_SUBWORKFLOW_DEPTH = 10
+MAX_CONTEXT_SNAPSHOTS = 5
+MAX_TIMINGS = 20
+
 
 class _Cancelled(Exception):
     pass
 
 
+class _TimedOut(Exception):
+    pass
+
+
 # ============================================================
-# Node types — fields, ports, retry/error config
+# Common advanced fields for all nodes
 # ============================================================
-# Common per-node advanced fields (rendered under "Advanced" in inspector):
 COMMON_ADVANCED = [
     {'name': 'retry_max',   'type': 'number', 'label': 'Retries on failure',
-     'default': 0, 'help': '0 = no retry. Failed attempts sleep then retry.'},
-    {'name': 'retry_delay', 'type': 'number', 'label': 'Retry delay (s)',
+     'default': 0, 'help': '0 = no retry'},
+    {'name': 'retry_delay', 'type': 'number', 'label': 'Base retry delay (s)',
      'default': 3},
+    {'name': 'retry_backoff', 'type': 'select', 'label': 'Retry backoff',
+     'options': ['fixed', 'exponential'], 'default': 'fixed',
+     'help': 'exponential: delay, 2×delay, 4×delay… capped at 60s'},
+    {'name': 'timeout_sec', 'type': 'number', 'label': 'Timeout (s, 0 = none)',
+     'default': 0,
+     'help': 'Kills the node if it runs longer. Subprocesses are terminated '
+             'cleanly.'},
     {'name': 'on_error',    'type': 'select', 'label': 'On error',
-     'options': ['stop', 'continue'],
-     'default': 'stop',
-     'help': '"stop" cancels the whole item. "continue" skips the node '
-             'and moves on (context is left unchanged).'},
+     'options': ['stop', 'continue'], 'default': 'stop',
+     'help': '"stop" cancels the whole item. "continue" skips to next node.'},
     {'name': 'skip_if',     'type': 'text', 'label': 'Skip if (Python expr)',
      'default': '',
-     'help': 'If this evaluates to True, the node is skipped. '
-             'Example: size < 1000  ·  "sample" in filename'},
+     'help': 'If evaluates True → node is skipped and passes through.'},
 ]
 
+
+# ============================================================
+# Node type registry
+# ============================================================
 NODE_TYPES = {
-    # ---------------- Triggers ----------------
+    # ---------- Triggers ----------
     'trigger.url_list': {
         'label': 'URL List',
-        'category': 'trigger',
-        'icon': 'fa-list',
-        'color': '#4ade80',
+        'category': 'trigger', 'icon': 'fa-list', 'color': '#4ade80',
         'description': 'Provides a list of URLs. Each downstream action runs '
                        'once per URL.',
         'ports': {'in': [], 'out': ['out']},
@@ -80,9 +88,7 @@ NODE_TYPES = {
              'default': '1080p'},
             {'name': 'expand_playlists', 'type': 'checkbox',
              'label': 'Expand playlists into individual videos',
-             'default': True,
-             'help': 'Each playlist URL becomes N videos — one per video. '
-                     'Each flows through the whole chain independently.'},
+             'default': True},
             {'name': 'max_items', 'type': 'number',
              'label': 'Max videos per playlist (0 = all)', 'default': 0},
         ],
@@ -90,23 +96,19 @@ NODE_TYPES = {
     },
     'trigger.file_glob': {
         'label': 'File Glob',
-        'category': 'trigger',
-        'icon': 'fa-folder-open',
-        'color': '#4ade80',
-        'description': 'Provides a list of files matching a glob pattern '
-                       'inside the downloads folder.',
+        'category': 'trigger', 'icon': 'fa-folder-open', 'color': '#4ade80',
+        'description': 'Files matching a glob pattern inside downloads/.',
         'ports': {'in': [], 'out': ['out']},
         'fields': [
             {'name': 'pattern', 'type': 'text', 'label': 'Glob pattern',
-             'required': True, 'default': '**/*.mp4',
-             'help': 'Relative to downloads/. Examples: *.mp4, playlist_*/*.mp4'},
+             'required': True, 'default': '**/*.mp4'},
             {'name': 'max_items', 'type': 'number',
              'label': 'Max files (0 = all)', 'default': 0},
         ],
         'advanced_fields': [],
     },
 
-    # ---------------- Actions ----------------
+    # ---------- Actions ----------
     'action.download': {
         'label': 'Download Video',
         'category': 'action', 'icon': 'fa-download', 'color': '#5f8fe0',
@@ -134,7 +136,7 @@ NODE_TYPES = {
             {'name': 'caption', 'type': 'text', 'label': 'Caption',
              'default': '📁 {filename}',
              'help': 'Placeholders: {filename}, {url}, {index}, {total}, '
-                     '{size}, {basename}, {ext}'},
+                     '{size}, {basename}, {ext}, {vars.name}'},
         ],
         'advanced_fields': COMMON_ADVANCED,
     },
@@ -159,8 +161,7 @@ NODE_TYPES = {
              'options': ['x265', 'av1'], 'default': 'x265'},
             {'name': 'resolution', 'type': 'select', 'label': 'Resolution',
              'options': ['360', '480', '720', '1080'], 'default': '720'},
-            {'name': 'crf', 'type': 'number', 'label': 'CRF', 'default': 27,
-             'help': 'x265: 24-30 · AV1: 28-35'},
+            {'name': 'crf', 'type': 'number', 'label': 'CRF', 'default': 27},
             {'name': 'preset', 'type': 'text', 'label': 'Preset',
              'default': 'veryfast'},
         ],
@@ -188,15 +189,13 @@ NODE_TYPES = {
     'action.wait': {
         'label': 'Wait',
         'category': 'action', 'icon': 'fa-clock', 'color': '#8a9bc0',
-        'description': 'Pauses the workflow for N seconds.',
+        'description': 'Pauses for N seconds.',
         'ports': {'in': ['in'], 'out': ['out']},
         'fields': [
             {'name': 'seconds', 'type': 'number', 'label': 'Seconds',
              'default': 5},
             {'name': 'jitter', 'type': 'number', 'label': 'Random jitter (s)',
-             'default': 0,
-             'help': 'Adds 0..jitter seconds randomly. Avoids thundering-herd '
-                     'when processing large playlists.'},
+             'default': 0},
         ],
         'advanced_fields': COMMON_ADVANCED,
     },
@@ -211,8 +210,7 @@ NODE_TYPES = {
             {'name': 'method', 'type': 'select', 'label': 'Method',
              'options': ['POST', 'GET'], 'default': 'POST'},
             {'name': 'body', 'type': 'textarea', 'label': 'Body',
-             'default': '{"text": "Downloaded {filename} from {url}"}',
-             'help': 'Placeholders: {filename}, {url}, {size}, {index}, {total}'},
+             'default': '{"text": "Downloaded {filename} from {url}"}'},
         ],
         'advanced_fields': COMMON_ADVANCED,
     },
@@ -220,46 +218,162 @@ NODE_TYPES = {
         'label': 'Extract Metadata',
         'category': 'action', 'icon': 'fa-info-circle', 'color': '#22d3ee',
         'description': 'Extracts video metadata (duration, resolution, codecs) '
-                       'into the context as {duration}, {width}, {height}, '
-                       '{vcodec}, {acodec}.',
+                       'into {duration}, {width}, {height}, {vcodec}, {acodec}.',
         'ports': {'in': ['in'], 'out': ['out']},
         'fields': [],
         'advanced_fields': COMMON_ADVANCED,
     },
+    'action.sub_workflow': {
+        'label': 'Run Sub-Workflow',
+        'category': 'action', 'icon': 'fa-cubes', 'color': '#a78bfa',
+        'description': 'Runs another saved workflow synchronously. Its final '
+                       'context is returned. Depth-limited to 10.',
+        'ports': {'in': ['in'], 'out': ['out']},
+        'fields': [
+            {'name': 'workflow_id', 'type': 'text', 'label': 'Workflow ID',
+             'required': True,
+             'help': 'Copy the ID from the workflow selector (e.g. a1b2c3d4e5f6)'},
+            {'name': 'inherit_context', 'type': 'checkbox',
+             'label': 'Pass parent context to sub-workflow',
+             'default': True},
+            {'name': 'return_context', 'type': 'checkbox',
+             'label': 'Merge sub-workflow result into parent context',
+             'default': True},
+        ],
+        'advanced_fields': COMMON_ADVANCED,
+    },
+    'action.user_input': {
+        'label': 'Wait for Approval',
+        'category': 'action', 'icon': 'fa-user-check', 'color': '#f59e0b',
+        'description': 'Pauses the workflow until you approve/reject from the UI. '
+                       'Routes to "approved", "rejected", or "timeout".',
+        'ports': {'in': ['in'], 'out': ['approved', 'rejected', 'timeout']},
+        'fields': [
+            {'name': 'message', 'type': 'text', 'label': 'Prompt',
+             'default': 'Approve this step?'},
+            {'name': 'approval_timeout', 'type': 'number',
+             'label': 'Approval timeout (s)', 'default': 3600},
+        ],
+        'advanced_fields': [],
+    },
+    'action.json_parse': {
+        'label': 'JSON Parse',
+        'category': 'action', 'icon': 'fa-code', 'color': '#4ade80',
+        'description': 'Parses a JSON string into vars. Sets vars.<prefix>.* or '
+                       'vars.<key> directly.',
+        'ports': {'in': ['in'], 'out': ['out']},
+        'fields': [
+            {'name': 'source', 'type': 'text', 'label': 'Source expression',
+             'required': True, 'default': 'vars.body',
+             'help': 'Where to read the JSON string from. '
+                     'Example: vars.body or filename'},
+            {'name': 'into_var', 'type': 'text', 'label': 'Store into var',
+             'default': 'parsed',
+             'help': 'If the JSON is an object, its keys land in vars.<name>.*. '
+                     'If it\'s an array, the array goes into vars.<name>.'},
+        ],
+        'advanced_fields': COMMON_ADVANCED,
+    },
+    'action.string_ops': {
+        'label': 'String Ops',
+        'category': 'action', 'icon': 'fa-font', 'color': '#4ade80',
+        'description': 'Manipulate a string value.',
+        'ports': {'in': ['in'], 'out': ['out']},
+        'fields': [
+            {'name': 'source', 'type': 'text', 'label': 'Source expression',
+             'required': True, 'default': 'filename',
+             'help': 'e.g. filename, basename, vars.title, url'},
+            {'name': 'operation', 'type': 'select', 'label': 'Operation',
+             'options': ['lower', 'upper', 'trim', 'strip_ext', 'replace',
+                         'split_take_first', 'split_take_last', 'slice',
+                         'regex_replace', 'regex_extract'],
+             'default': 'lower'},
+            {'name': 'arg1', 'type': 'text', 'label': 'Arg 1',
+             'default': '',
+             'help': 'For replace: search string · For regex: pattern · '
+                     'For slice: start:end'},
+            {'name': 'arg2', 'type': 'text', 'label': 'Arg 2',
+             'default': '',
+             'help': 'For replace/regex_replace: replacement'},
+            {'name': 'target', 'type': 'text', 'label': 'Store into',
+             'required': True, 'default': 'vars.result',
+             'help': 'Example: vars.clean_name or filename'},
+        ],
+        'advanced_fields': COMMON_ADVANCED,
+    },
+    'action.assert': {
+        'label': 'Assert',
+        'category': 'action', 'icon': 'fa-shield-alt', 'color': '#ef4444',
+        'description': 'Fails the workflow with a message if the condition is '
+                       'false.',
+        'ports': {'in': ['in'], 'out': ['out']},
+        'fields': [
+            {'name': 'expression', 'type': 'text', 'label': 'Must be True',
+             'required': True, 'default': 'size > 0'},
+            {'name': 'message', 'type': 'text', 'label': 'Error message',
+             'default': 'Assertion failed: {filename}'},
+        ],
+        'advanced_fields': COMMON_ADVANCED,
+    },
+    'action.http_fetch': {
+        'label': 'HTTP Fetch',
+        'category': 'action', 'icon': 'fa-cloud-download-alt', 'color': '#4ade80',
+        'description': 'GET a URL and store the response body in vars.',
+        'ports': {'in': ['in'], 'out': ['out']},
+        'fields': [
+            {'name': 'url', 'type': 'text', 'label': 'URL',
+             'required': True,
+             'help': 'Supports {url}, {filename}, {vars.x} placeholders'},
+            {'name': 'into_var', 'type': 'text', 'label': 'Store into var',
+             'default': 'body'},
+            {'name': 'max_bytes', 'type': 'number', 'label': 'Max response size',
+             'default': 1048576,
+             'help': 'Truncates response if larger (default 1 MB)'},
+        ],
+        'advanced_fields': COMMON_ADVANCED,
+    },
+    'action.log': {
+        'label': 'Log Message',
+        'category': 'action', 'icon': 'fa-comment', 'color': '#8a9bc0',
+        'description': 'Adds a custom message to the execution log.',
+        'ports': {'in': ['in'], 'out': ['out']},
+        'fields': [
+            {'name': 'level', 'type': 'select', 'label': 'Level',
+             'options': ['info', 'success', 'warning', 'error'],
+             'default': 'info'},
+            {'name': 'message', 'type': 'text', 'label': 'Message',
+             'default': 'Processing {filename}',
+             'help': 'Supports {url}, {filename}, {size}, {vars.x}'},
+        ],
+        'advanced_fields': [],
+    },
 
-    # ---------------- Logic ----------------
+    # ---------- Logic ----------
     'logic.condition': {
         'label': 'Condition',
         'category': 'logic', 'icon': 'fa-code-branch', 'color': '#a78bfa',
-        'description': 'Evaluates an expression. Routes to "true" or "false" '
-                       'port based on the result.',
+        'description': 'Routes to "true" or "false" port based on an expression.',
         'ports': {'in': ['in'], 'out': ['true', 'false']},
         'fields': [
             {'name': 'expression', 'type': 'text', 'label': 'Expression',
              'required': True, 'default': 'size > 1000000',
-             'help': 'Python expression. Available: filename, basename, ext, '
-                     'url, size, index, total, duration, width, height, '
-                     'vcodec, acodec, vars (dict), re (module). '
-                     'Example: "mp4" in filename and size > 10_000_000'},
+             'help': 'Available: filename, basename, ext, url, size, index, '
+                     'total, duration, width, height, vcodec, acodec, vars, re'},
         ],
         'advanced_fields': [],
     },
     'logic.switch': {
         'label': 'Switch',
         'category': 'logic', 'icon': 'fa-sitemap', 'color': '#a78bfa',
-        'description': 'Evaluates an expression and routes to the matching '
-                       'case port, or "default".',
-        'ports': {'in': ['in'],
-                  'out': ['1', '2', '3', 'default']},  # rendered per config
+        'description': 'Routes to a matching case port, or "default".',
+        'ports': {'in': ['in'], 'out': ['1', '2', '3', 'default']},
         'fields': [
             {'name': 'expression', 'type': 'text', 'label': 'Expression',
-             'required': True, 'default': 'ext',
-             'help': 'Python expression. Result is compared to each case key. '
-                     'Example: ext  →  cases "mp4", "mkv", "webm"'},
+             'required': True, 'default': 'ext'},
             {'name': 'cases', 'type': 'text', 'label': 'Cases (comma-separated)',
              'default': 'mp4,mkv,webm',
-             'help': 'If expression matches a case, that port fires. '
-                     'Otherwise the "default" port fires.'},
+             'help': 'If expression matches case N, port "N" fires. '
+                     'Otherwise "default" fires.'},
         ],
         'advanced_fields': [],
     },
@@ -271,44 +385,62 @@ NODE_TYPES = {
         'fields': [
             {'name': 'mode', 'type': 'select', 'label': 'Mode',
              'options': ['all', 'any'], 'default': 'all',
-             'help': '"all" waits for every input branch to arrive. '
-                     '"any" fires on the first incoming wire.'},
+             'help': '"all" waits for every incoming branch. '
+                     '"any" fires on first arrival.'},
         ],
         'advanced_fields': [],
     },
+    'logic.fork': {
+        'label': 'Fork',
+        'category': 'logic', 'icon': 'fa-code', 'color': '#a78bfa',
+        'description': 'Fires ALL output ports in parallel branches. '
+                       'Use a Merge later to re-join.',
+        'ports': {'in': ['in'], 'out': ['a', 'b', 'c']},
+        'fields': [],
+        'advanced_fields': [],
+    },
+    'logic.delay_until': {
+        'label': 'Delay Until',
+        'category': 'logic', 'icon': 'fa-hourglass-half', 'color': '#8a9bc0',
+        'description': 'Waits until a specific timestamp.',
+        'ports': {'in': ['in'], 'out': ['out']},
+        'fields': [
+            {'name': 'target_time', 'type': 'text', 'label': 'Target time',
+             'required': True, 'default': '',
+             'placeholder': 'HH:MM or ISO timestamp',
+             'help': 'HH:MM (today or tomorrow) or full ISO '
+                     '(2025-12-31T23:59:00)'},
+        ],
+        'advanced_fields': COMMON_ADVANCED,
+    },
 
-    # ---------------- Data ----------------
+    # ---------- Data ----------
     'data.transform': {
         'label': 'Transform',
         'category': 'data', 'icon': 'fa-wand-magic-sparkles', 'color': '#4ade80',
-        'description': 'Modifies a context value using a Python expression, '
-                       'or sets a variable from a template.',
+        'description': 'Modify a context value with a Python expression or template.',
         'ports': {'in': ['in'], 'out': ['out']},
         'fields': [
             {'name': 'target', 'type': 'text', 'label': 'Target key',
              'required': True, 'default': 'filename',
-             'help': 'Which context key to write. Use "vars.<name>" to set '
-                     'a custom variable.'},
-            {'name': 'expression', 'type': 'text', 'label': 'Value expression',
+             'help': 'Use "vars.name" for custom variables.'},
+            {'name': 'expression', 'type': 'text', 'label': 'Value',
              'required': True, 'default': 'filename.lower()',
-             'help': 'Python expression or template. If it looks like a '
-                     'template ({filename}), placeholders are expanded. '
-                     'Otherwise it is evaluated as Python.'},
+             'help': 'Template ({filename}) → expanded. '
+                     'Otherwise → evaluated as Python.'},
         ],
         'advanced_fields': COMMON_ADVANCED,
     },
     'data.set_variable': {
         'label': 'Set Variable',
         'category': 'data', 'icon': 'fa-tag', 'color': '#4ade80',
-        'description': 'Sets a custom variable you can reference later as '
-                       '{vars.name} or in expressions as vars["name"].',
+        'description': 'Sets a custom variable accessible as {vars.name}.',
         'ports': {'in': ['in'], 'out': ['out']},
         'fields': [
             {'name': 'name', 'type': 'text', 'label': 'Variable name',
              'required': True, 'default': 'my_var'},
-            {'name': 'value', 'type': 'text', 'label': 'Value',
-             'default': '{url}',
-             'help': 'Template — {url}, {filename}, {index}, etc. are expanded.'},
+            {'name': 'value', 'type': 'text', 'label': 'Value (template)',
+             'default': '{url}'},
         ],
         'advanced_fields': COMMON_ADVANCED,
     },
@@ -322,12 +454,14 @@ _SAFE_BUILTINS = {
     'abs': abs, 'bool': bool, 'float': float, 'int': int,
     'len': len, 'max': max, 'min': min, 'str': str, 'round': round,
     'True': True, 'False': False, 'None': None,
-    'any': any, 'all': all,
+    'any': any, 'all': all, 'sorted': sorted, 'reversed': reversed,
+    'list': list, 'dict': dict, 'tuple': tuple, 'set': set,
+    'enumerate': enumerate, 'zip': zip, 'range': range,
+    'sum': sum, 'isinstance': isinstance,
 }
 
 
 def _safe_eval(expr, ctx_dict):
-    """Evaluate a Python expression in a locked namespace."""
     if not expr or not str(expr).strip():
         return None
     ns = dict(_SAFE_BUILTINS)
@@ -340,8 +474,7 @@ def _safe_eval(expr, ctx_dict):
 
 
 def _ctx_to_dict(ctx):
-    """Flatten context into an eval namespace."""
-    d = {
+    return {
         'url':      ctx.get('url', ''),
         'filename': ctx.get('filename', ''),
         'basename': ctx.get('basename', ''),
@@ -357,14 +490,26 @@ def _ctx_to_dict(ctx):
         'acodec':   ctx.get('acodec', ''),
         'vars':     ctx.get('vars', {}),
     }
-    return d
+
+
+def _safe_ctx_snapshot(ctx):
+    """JSON-safe copy of ctx for storage."""
+    def safe(v):
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            return v if not isinstance(v, str) or len(v) < 500 else v[:500] + '…'
+        if isinstance(v, dict):
+            return {str(k): safe(val) for k, val in list(v.items())[:30]}
+        if isinstance(v, (list, tuple)):
+            return [safe(x) for x in v[:30]]
+        return str(v)[:200]
+
+    return {str(k): safe(v) for k, v in ctx.items() if not str(k).startswith('_')}
 
 
 # ============================================================
 # Graph helpers
 # ============================================================
 def _norm_edge(e):
-    """Ensure edge has a from_port. v2 edges lack it."""
     if 'from_port' not in e or not e.get('from_port'):
         e['from_port'] = 'out'
     return e
@@ -386,18 +531,14 @@ def _out_edges(node_id, edges, port=None):
 
 
 def _topological_order(nodes, edges):
-    """Kahn's algorithm — returns list of node dicts or None if cycle."""
     ids = {n['id'] for n in nodes}
     adj = {nid: [] for nid in ids}
     indeg = {nid: 0 for nid in ids}
-
     for e in edges:
-        f = e.get('from')
-        t = e.get('to')
+        f, t = e.get('from'), e.get('to')
         if f in ids and t in ids:
             adj[f].append(t)
             indeg[t] += 1
-
     queue = [nid for nid, d in indeg.items() if d == 0]
     order = []
     while queue:
@@ -407,40 +548,31 @@ def _topological_order(nodes, edges):
             indeg[nxt] -= 1
             if indeg[nxt] == 0:
                 queue.append(nxt)
-
     if len(order) != len(nodes):
         return None
-
     node_map = {n['id']: n for n in nodes}
     return [node_map[nid] for nid in order]
 
 
 def _migrate_workflow(wf):
-    """Migrate v2 (no positions, no ports) to v3."""
     if not isinstance(wf, dict):
         return wf
     nodes = wf.get('nodes') or []
     if not nodes:
         return wf
-
-    # Add positions if missing
     for i, node in enumerate(nodes):
         if 'x' not in node or not isinstance(node.get('x'), (int, float)):
             node['x'] = 80 + i * 280
         if 'y' not in node or not isinstance(node.get('y'), (int, float)):
             node['y'] = 200
-
-    # Normalize edges
-    edges = wf.get('edges') or []
-    for e in edges:
+    for e in (wf.get('edges') or []):
         _norm_edge(e)
-    wf['edges'] = edges
-
+    wf['edges'] = wf.get('edges') or []
     return wf
 
 
 # ============================================================
-# Progress throttling
+# Progress / logging / abort helpers
 # ============================================================
 _last_save = {}
 _last_save_lock = threading.Lock()
@@ -475,9 +607,46 @@ def _log(task_id, node_id, level, msg):
     save_task(task_id, task)
 
 
-def _is_cancelled(task_id):
+def _should_abort(task_id):
     task = load_task(task_id)
-    return bool(task and task.get('cancelled'))
+    if not task:
+        return False
+    return bool(task.get('cancelled') or task.get('_abort'))
+
+
+def _abort_reason(task_id):
+    task = load_task(task_id)
+    if not task:
+        return None
+    if task.get('cancelled'):
+        return 'cancelled'
+    if task.get('_abort'):
+        return task.get('_abort')
+    return None
+
+
+def _record_timing(task_id, node_id, duration_ms):
+    task = load_task(task_id)
+    if not task:
+        return
+    timings = task.get('node_timings', [])
+    timings.append({'node_id': node_id, 'duration_ms': int(duration_ms),
+                    'ts': time.time()})
+    task['node_timings'] = timings[-MAX_TIMINGS:]
+    save_task(task_id, task)
+
+
+def _record_context_snapshot(task_id, node_id, ctx):
+    task = load_task(task_id)
+    if not task:
+        return
+    snaps = task.get('context_snapshots', {})
+    snaps[node_id] = {'ts': time.time(), 'ctx': _safe_ctx_snapshot(ctx)}
+    if len(snaps) > MAX_CONTEXT_SNAPSHOTS:
+        oldest = min(snaps.items(), key=lambda x: x[1]['ts'])[0]
+        del snaps[oldest]
+    task['context_snapshots'] = snaps
+    save_task(task_id, task)
 
 
 # ============================================================
@@ -524,16 +693,16 @@ def _format_size(n):
 
 
 def _expand_template(text, ctx):
-    """Replace {key} placeholders."""
     if not text:
         return ''
     d = _ctx_to_dict(ctx)
-    d['vars'] = ctx.get('vars', {})
+    d['vars'] = ctx.get('vars', {}) or {}
     def repl(m):
         key = m.group(1)
-        # vars.name form
         if key.startswith('vars.'):
             return str(d['vars'].get(key[5:], ''))
+        if key == 'item':
+            return str(ctx.get('item', ''))
         return str(d.get(key, m.group(0)))
     return re.sub(r'\{([\w.]+)\}', repl, text)
 
@@ -552,8 +721,7 @@ def _expand_playlist(url, max_items=0):
     cmd.append(url)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    except Exception as e:
-        logger.warning(f'Playlist expansion failed: {e}')
+    except Exception:
         return []
     if r.returncode != 0:
         return []
@@ -567,7 +735,7 @@ def _expand_playlist(url, max_items=0):
 
 
 # ============================================================
-# Node handlers — return list of output ports to fire
+# Node handlers (return list of fired output port names)
 # ============================================================
 def _h_download(task_id, node_id, config, ctx):
     url = ctx.get('url')
@@ -582,7 +750,6 @@ def _h_download(task_id, node_id, config, ctx):
     if not base_name or not os.path.splitext(base_name)[1]:
         base_name = _safe_name(ctx.get('basename') or f'video_{uuid.uuid4().hex[:8]}') + '.mp4'
     out_name = _unique_filename(base_name)
-    out_path = os.path.join(UPLOAD_FOLDER, out_name)
     template = os.path.join(UPLOAD_FOLDER, f"_wf_{task_id}_{node_id}.%(ext)s")
 
     cmd = ['yt-dlp', '-o', template, '-f', format_choice,
@@ -601,11 +768,12 @@ def _h_download(task_id, node_id, config, ctx):
                             stderr=subprocess.STDOUT, text=True, bufsize=1,
                             preexec_fn=os.setsid)
     try:
-        from features.url_download import register_process, unregister_process, kill_process
+        from features.url_download import (register_process, unregister_process,
+                                            kill_process)
         register_process(task_id, proc)
         try:
             for line in proc.stdout:
-                if _is_cancelled(task_id):
+                if _should_abort(task_id):
                     kill_process(task_id)
                     raise _Cancelled()
                 m = re.search(r'\[download\]\s+(\d+(?:\.\d+)?)%', line)
@@ -667,7 +835,7 @@ def _h_download_file(task_id, node_id, config, ctx):
             downloaded = 0
             with open(tmp_path, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=65536):
-                    if _is_cancelled(task_id):
+                    if _should_abort(task_id):
                         raise _Cancelled()
                     if not chunk:
                         continue
@@ -731,7 +899,7 @@ def _h_telegram_send(task_id, node_id, config, ctx):
 
     deadline = time.time() + 3600
     while time.time() < deadline:
-        if _is_cancelled(task_id):
+        if _should_abort(task_id):
             try:
                 from features.telegram import cancel_telegram_task
                 cancel_telegram_task(sub_id)
@@ -779,7 +947,7 @@ def _h_drive_upload(task_id, node_id, config, ctx):
     )
     response = None
     while response is None:
-        if _is_cancelled(task_id):
+        if _should_abort(task_id):
             raise _Cancelled()
         status, response = req.next_chunk()
         if status:
@@ -840,11 +1008,12 @@ def _h_compress(task_id, node_id, config, ctx):
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                             text=True, bufsize=1, preexec_fn=os.setsid)
     try:
-        from features.url_download import register_process, unregister_process, kill_process
+        from features.url_download import (register_process, unregister_process,
+                                            kill_process)
         register_process(task_id, proc)
         try:
             for line in proc.stderr:
-                if _is_cancelled(task_id):
+                if _should_abort(task_id):
                     kill_process(task_id)
                     raise _Cancelled()
                 m = re.search(r'out_time_us=(\d+)', line)
@@ -907,7 +1076,7 @@ def _h_delete_local(task_id, node_id, config, ctx):
 def _h_delete_drive(task_id, node_id, config, ctx):
     file_id = ctx.get('drive_file_id')
     if not file_id:
-        _log(task_id, node_id, 'warning', 'No Drive file in context — skipping')
+        _log(task_id, node_id, 'warning', 'No Drive file — skipping')
         return ['out']
     account = (config.get('account') or 'default').strip()
     from features.google_drive import get_drive_service
@@ -938,7 +1107,7 @@ def _h_wait(task_id, node_id, config, ctx):
     _log(task_id, node_id, 'info', f'Waiting {seconds:.1f}s')
     end = time.time() + seconds
     while time.time() < end:
-        if _is_cancelled(task_id):
+        if _should_abort(task_id):
             raise _Cancelled()
         time.sleep(0.2)
     return ['out']
@@ -961,7 +1130,7 @@ def _h_webhook(task_id, node_id, config, ctx):
         if 200 <= r.status_code < 300:
             _log(task_id, node_id, 'success', f'HTTP {r.status_code}')
         else:
-            raise Exception(f'Webhook returned HTTP {r.status_code}')
+            raise Exception(f'HTTP {r.status_code}')
         return ['out']
     except Exception as e:
         raise Exception(f'Webhook failed: {e}')
@@ -997,9 +1166,8 @@ def _h_extract_metadata(task_id, node_id, config, ctx):
     ctx['height'] = int(v.get('height', 0) or 0)
     ctx['vcodec'] = v.get('codec_name', '')
     ctx['acodec'] = a.get('codec_name', '')
-
     _log(task_id, node_id, 'success',
-         f'Metadata: {ctx["width"]}x{ctx["height"]} · {ctx["duration"]:.1f}s · '
+         f'{ctx["width"]}x{ctx["height"]} · {ctx["duration"]:.1f}s · '
          f'{ctx["vcodec"] or "?"}/{ctx["acodec"] or "?"}')
     return ['out']
 
@@ -1007,7 +1175,7 @@ def _h_extract_metadata(task_id, node_id, config, ctx):
 def _h_condition(task_id, node_id, config, ctx):
     expr = (config.get('expression') or '').strip()
     if not expr:
-        raise Exception('Condition expression is empty')
+        raise Exception('Condition expression empty')
     result = _safe_eval(expr, _ctx_to_dict(ctx))
     fired = 'true' if bool(result) else 'false'
     _log(task_id, node_id, 'info', f'Condition → {fired} ({expr[:60]})')
@@ -1017,24 +1185,66 @@ def _h_condition(task_id, node_id, config, ctx):
 def _h_switch(task_id, node_id, config, ctx):
     expr = (config.get('expression') or '').strip()
     if not expr:
-        raise Exception('Switch expression is empty')
-    raw_cases = (config.get('cases') or '').strip()
-    cases = [c.strip() for c in raw_cases.split(',') if c.strip()]
-
+        raise Exception('Switch expression empty')
+    cases = [c.strip() for c in (config.get('cases') or '').split(',') if c.strip()]
     result = _safe_eval(expr, _ctx_to_dict(ctx))
     result_str = str(result) if result is not None else ''
-
     if result_str in cases:
-        _log(task_id, node_id, 'info', f'Switch → "{result_str}"')
-        return [result_str]
-    _log(task_id, node_id, 'info', f'Switch → "default" ({result_str!r})')
+        port = str(cases.index(result_str) + 1)
+        _log(task_id, node_id, 'info', f'Switch → "{result_str}" (port {port})')
+        return [port]
+    _log(task_id, node_id, 'info', f'Switch → default ({result_str!r})')
     return ['default']
 
 
 def _h_merge(task_id, node_id, config, ctx):
-    # Runtime already checked readiness before calling us
     mode = (config.get('mode') or 'all').lower()
     _log(task_id, node_id, 'info', f'Merge ({mode})')
+    return ['out']
+
+
+def _h_fork(task_id, node_id, config, ctx):
+    """Fires all three output ports. Downstream nodes run sequentially but
+    share the same ctx — use Merge nodes to rendezvous."""
+    _log(task_id, node_id, 'info', 'Fork → a, b, c')
+    return ['a', 'b', 'c']
+
+
+def _h_delay_until(task_id, node_id, config, ctx):
+    from datetime import datetime, timedelta
+    target_str = (config.get('target_time') or '').strip()
+    if not target_str:
+        raise Exception('Target time required')
+
+    target_ts = None
+    # HH:MM form
+    m = re.match(r'^(\d{1,2}):(\d{2})$', target_str)
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2))
+        now = datetime.now()
+        target = now.replace(hour=h, minute=mi, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        target_ts = target.timestamp()
+    else:
+        try:
+            target_ts = datetime.fromisoformat(target_str).timestamp()
+        except Exception:
+            raise Exception(f'Cannot parse target time: {target_str}')
+
+    wait = target_ts - time.time()
+    if wait <= 0:
+        _log(task_id, node_id, 'info', 'Delay: already past target')
+        return ['out']
+    if wait > 86400:
+        raise Exception(f'Target is more than 24h away ({wait/3600:.1f}h)')
+
+    _log(task_id, node_id, 'info', f'Delaying until {target_str} ({wait:.0f}s)')
+    end = time.time() + wait
+    while time.time() < end:
+        if _should_abort(task_id):
+            raise _Cancelled()
+        time.sleep(1.0)
     return ['out']
 
 
@@ -1043,8 +1253,6 @@ def _h_transform(task_id, node_id, config, ctx):
     if not target:
         raise Exception('Target key required')
     expr = (config.get('expression') or '').strip()
-
-    # If it looks like a template with {placeholders}, expand.
     if '{' in expr and '}' in expr:
         value = _expand_template(expr, ctx)
     else:
@@ -1052,13 +1260,10 @@ def _h_transform(task_id, node_id, config, ctx):
 
     if target.startswith('vars.'):
         var_name = target[5:]
-        if 'vars' not in ctx or not isinstance(ctx['vars'], dict):
-            ctx['vars'] = {}
-        ctx['vars'][var_name] = value
+        ctx.setdefault('vars', {})[var_name] = value
     else:
         ctx[target] = value
-    _log(task_id, node_id, 'success',
-         f'{target} = {str(value)[:80]}')
+    _log(task_id, node_id, 'success', f'{target} = {str(value)[:80]}')
     return ['out']
 
 
@@ -1066,12 +1271,234 @@ def _h_set_variable(task_id, node_id, config, ctx):
     name = (config.get('name') or '').strip()
     if not name:
         raise Exception('Variable name required')
-    template = config.get('value') or ''
-    value = _expand_template(template, ctx)
-    if 'vars' not in ctx or not isinstance(ctx['vars'], dict):
-        ctx['vars'] = {}
-    ctx['vars'][name] = value
+    value = _expand_template(config.get('value') or '', ctx)
+    ctx.setdefault('vars', {})[name] = value
     _log(task_id, node_id, 'success', f'vars["{name}"] = {value[:80]}')
+    return ['out']
+
+
+def _h_sub_workflow(task_id, node_id, config, ctx):
+    wf_id = (config.get('workflow_id') or '').strip()
+    if not wf_id:
+        raise Exception('Workflow ID required')
+
+    depth = int(ctx.get('_depth', 0))
+    if depth >= MAX_SUBWORKFLOW_DEPTH:
+        raise Exception(f'Sub-workflow depth limit ({MAX_SUBWORKFLOW_DEPTH}) exceeded')
+
+    wf = _load_workflow(wf_id)
+    if not wf:
+        raise Exception(f'Workflow not found: {wf_id}')
+
+    inherit = config.get('inherit_context', True)
+    ret_ctx = config.get('return_context', True)
+
+    sub_ctx = dict(ctx) if inherit else {
+        'url': ctx.get('url', ''),
+        'index': ctx.get('index', 0),
+        'total': ctx.get('total', 0),
+        'quality': ctx.get('quality', 'best'),
+        'vars': dict(ctx.get('vars', {})),
+    }
+    sub_ctx['_depth'] = depth + 1
+
+    _log(task_id, node_id, 'info',
+         f'Running sub-workflow "{wf.get("name", wf_id)}" (depth {depth + 1})')
+
+    # Run the sub-workflow synchronously — this is a nested execution
+    try:
+        final_ctx = _run_workflow_sync(wf, sub_ctx, parent_task_id=task_id,
+                                       parent_node_id=node_id)
+    except Exception as e:
+        raise Exception(f'Sub-workflow failed: {e}')
+
+    if ret_ctx and final_ctx:
+        for k, v in final_ctx.items():
+            if not str(k).startswith('_') and k not in ('item', 'index', 'total', 'quality'):
+                if k == 'vars':
+                    merged = dict(ctx.get('vars', {}))
+                    merged.update(v or {})
+                    ctx['vars'] = merged
+                elif k in ('file_path', 'filename', 'basename', 'size',
+                           'drive_file_id', 'drive_link', 'duration',
+                           'width', 'height', 'vcodec', 'acodec'):
+                    ctx[k] = v
+
+    _log(task_id, node_id, 'success', 'Sub-workflow complete')
+    return ['out']
+
+
+def _h_user_input(task_id, node_id, config, ctx):
+    message = _expand_template(config.get('message') or 'Approve?', ctx)
+    try:
+        timeout = float(config.get('approval_timeout') or 3600)
+    except (TypeError, ValueError):
+        timeout = 3600
+
+    # Set task state
+    task = load_task(task_id)
+    task['awaiting_input'] = {
+        'node_id': node_id,
+        'message': message,
+        'created_at': time.time(),
+        'expires_at': time.time() + timeout,
+    }
+    save_task(task_id, task)
+    _log(task_id, node_id, 'warning', f'⏸ Awaiting approval: {message[:80]}')
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _should_abort(task_id):
+            task = load_task(task_id)
+            task['awaiting_input'] = None
+            save_task(task_id, task)
+            raise _Cancelled()
+        t = load_task(task_id)
+        resp = t.get('_user_input_response')
+        if resp and resp.get('node_id') == node_id:
+            t['awaiting_input'] = None
+            t['_user_input_response'] = None
+            save_task(task_id, t)
+            if resp.get('response') == 'approve':
+                _log(task_id, node_id, 'success', '✅ Approved')
+                return ['approved']
+            else:
+                _log(task_id, node_id, 'warning', '❌ Rejected')
+                return ['rejected']
+        time.sleep(0.5)
+
+    task = load_task(task_id)
+    task['awaiting_input'] = None
+    save_task(task_id, task)
+    _log(task_id, node_id, 'warning', '⏱ Approval timed out')
+    return ['timeout']
+
+
+def _h_json_parse(task_id, node_id, config, ctx):
+    src = _safe_eval(config.get('source') or '', _ctx_to_dict(ctx))
+    into = (config.get('into_var') or 'parsed').strip()
+    if src is None:
+        raise Exception('Source expression returned None')
+    if isinstance(src, (dict, list)):
+        data = src
+    else:
+        try:
+            data = json.loads(str(src))
+        except Exception as e:
+            raise Exception(f'JSON parse failed: {e}')
+
+    ctx.setdefault('vars', {})
+    if isinstance(data, dict):
+        for k, v in data.items():
+            ctx['vars'][f'{into}.{k}'] = v
+        # Also expose the whole object for expressions
+        ctx['vars'][into] = data
+    else:
+        ctx['vars'][into] = data
+
+    n = len(data) if hasattr(data, '__len__') else 0
+    _log(task_id, node_id, 'success',
+         f'Parsed {n} item(s) into vars.{into}')
+    return ['out']
+
+
+def _h_string_ops(task_id, node_id, config, ctx):
+    source = _safe_eval(config.get('source') or '', _ctx_to_dict(ctx))
+    s = '' if source is None else str(source)
+    op = (config.get('operation') or 'lower').lower()
+    a1 = _expand_template(config.get('arg1') or '', ctx)
+    a2 = _expand_template(config.get('arg2') or '', ctx)
+    target = (config.get('target') or 'vars.result').strip()
+
+    try:
+        if op == 'lower':
+            result = s.lower()
+        elif op == 'upper':
+            result = s.upper()
+        elif op == 'trim':
+            result = s.strip()
+        elif op == 'strip_ext':
+            result = os.path.splitext(s)[0]
+        elif op == 'replace':
+            result = s.replace(a1, a2)
+        elif op == 'split_take_first':
+            result = s.split(a1 or ' ')[0]
+        elif op == 'split_take_last':
+            result = s.split(a1 or ' ')[-1]
+        elif op == 'slice':
+            parts = (a1 or '0:').split(':')
+            start = int(parts[0]) if parts[0] else 0
+            end = int(parts[1]) if len(parts) > 1 and parts[1] else None
+            result = s[start:end]
+        elif op == 'regex_replace':
+            result = re.sub(a1, a2, s)
+        elif op == 'regex_extract':
+            m = re.search(a1, s)
+            result = m.group(0) if m else ''
+        else:
+            raise Exception(f'Unknown operation: {op}')
+    except Exception as e:
+        raise Exception(f'String op failed: {e}')
+
+    if target.startswith('vars.'):
+        ctx.setdefault('vars', {})[target[5:]] = result
+    else:
+        ctx[target] = result
+    _log(task_id, node_id, 'success', f'{target} = {str(result)[:80]}')
+    return ['out']
+
+
+def _h_assert(task_id, node_id, config, ctx):
+    expr = (config.get('expression') or '').strip()
+    if not expr:
+        raise Exception('Expression required')
+    result = _safe_eval(expr, _ctx_to_dict(ctx))
+    if not result:
+        msg = _expand_template(config.get('message') or 'Assertion failed', ctx)
+        raise Exception(msg)
+    _log(task_id, node_id, 'success', 'Assertion passed')
+    return ['out']
+
+
+def _h_http_fetch(task_id, node_id, config, ctx):
+    import requests
+    url = _expand_template(config.get('url') or '', ctx).strip()
+    if not url:
+        raise Exception('URL required')
+    into = (config.get('into_var') or 'body').strip()
+    try:
+        max_bytes = int(config.get('max_bytes') or 1048576)
+    except (TypeError, ValueError):
+        max_bytes = 1048576
+
+    _log(task_id, node_id, 'info', f'GET {url[:80]}')
+    try:
+        r = requests.get(url, timeout=30, stream=True)
+        r.raise_for_status()
+        content = b''
+        for chunk in r.iter_content(chunk_size=8192):
+            if _should_abort(task_id):
+                raise _Cancelled()
+            content += chunk
+            if len(content) >= max_bytes:
+                content = content[:max_bytes]
+                break
+        text = content.decode('utf-8', errors='replace')
+    except _Cancelled:
+        raise
+    except Exception as e:
+        raise Exception(f'HTTP fetch failed: {e}')
+
+    ctx.setdefault('vars', {})[into] = text
+    _log(task_id, node_id, 'success',
+         f'Fetched {len(text)} chars into vars.{into}')
+    return ['out']
+
+
+def _h_log(task_id, node_id, config, ctx):
+    level = (config.get('level') or 'info').lower()
+    msg = _expand_template(config.get('message') or '', ctx)
+    _log(task_id, node_id, level, msg)
     return ['out']
 
 
@@ -1086,9 +1513,18 @@ NODE_HANDLERS = {
     'action.wait':              _h_wait,
     'action.webhook':           _h_webhook,
     'action.extract_metadata':  _h_extract_metadata,
+    'action.sub_workflow':      _h_sub_workflow,
+    'action.user_input':        _h_user_input,
+    'action.json_parse':        _h_json_parse,
+    'action.string_ops':        _h_string_ops,
+    'action.assert':            _h_assert,
+    'action.http_fetch':        _h_http_fetch,
+    'action.log':               _h_log,
     'logic.condition':          _h_condition,
     'logic.switch':             _h_switch,
     'logic.merge':              _h_merge,
+    'logic.fork':               _h_fork,
+    'logic.delay_until':        _h_delay_until,
     'data.transform':           _h_transform,
     'data.set_variable':        _h_set_variable,
 }
@@ -1175,17 +1611,15 @@ def _validate_workflow(workflow):
             return f'Duplicate node id: {node["id"]}'
         ntype = node.get('type')
         if ntype not in NODE_TYPES:
-            return f'Node {i} has unknown type: {ntype}'
+            return f'Node {i} unknown type: {ntype}'
         node_map[node['id']] = node
 
         config = node.get('config') or {}
         for field in NODE_TYPES[ntype].get('fields', []):
             if field.get('required'):
-                val = str(config.get(field['name'], '')).strip()
-                if not val:
-                    return f'{NODE_TYPES[ntype]["label"]}: {field["label"]} is required'
+                if not str(config.get(field['name'], '')).strip():
+                    return f'{NODE_TYPES[ntype]["label"]}: {field["label"]} required'
 
-    # Edge validation
     for i, e in enumerate(edges):
         if not isinstance(e, dict):
             return f'Edge {i} must be an object'
@@ -1195,15 +1629,12 @@ def _validate_workflow(workflow):
         if f == t:
             return f'Edge {i} is a self-loop'
         from_port = e.get('from_port') or 'out'
-        from_ports = _node_ports(node_map[f]['type'])['out']
-        if from_port not in from_ports:
-            return (f'Edge {i}: node {f[:8]} has no output port "{from_port}" '
-                    f'(available: {", ".join(from_ports)})')
+        if from_port not in _node_ports(node_map[f]['type'])['out']:
+            return (f'Edge {i}: node {f[:8]} has no output port "{from_port}"')
 
-    # Trigger validation
     triggers = [n for n in nodes if n['type'].startswith('trigger.')]
     if not triggers:
-        return 'Need at least one trigger node'
+        return 'Need at least one trigger'
     if len(triggers) > 1:
         return 'Only one trigger allowed'
     trigger = triggers[0]
@@ -1211,24 +1642,21 @@ def _validate_workflow(workflow):
     if _in_edges(trigger['id'], edges):
         return 'Trigger cannot have incoming connections'
 
-    # Incoming edge count per non-trigger node
     for node in nodes:
         if node['id'] == trigger['id']:
             continue
         ins = _in_edges(node['id'], edges)
         if node['type'] == 'logic.merge':
             if len(ins) < 2:
-                return f'{NODE_TYPES[node["type"]]["label"]} needs at least 2 incoming connections'
+                return f'{NODE_TYPES[node["type"]]["label"]} needs ≥2 incoming'
         else:
             if len(ins) != 1:
-                return (f'{NODE_TYPES[node["type"]]["label"]}: must have exactly '
-                        f'1 incoming connection (has {len(ins)})')
+                return (f'{NODE_TYPES[node["type"]]["label"]}: needs exactly '
+                        f'1 incoming (has {len(ins)})')
 
-    # Cycle detection
     if _topological_order(nodes, edges) is None:
         return 'Workflow contains a cycle'
 
-    # Reachability check
     reachable = {trigger['id']}
     changed = True
     while changed:
@@ -1239,73 +1667,162 @@ def _validate_workflow(workflow):
                 changed = True
     unreachable = [n['id'] for n in nodes if n['id'] not in reachable]
     if unreachable:
-        return (f'{len(unreachable)} node(s) unreachable from trigger. '
-                f'Connect them or delete them.')
+        return f'{len(unreachable)} node(s) unreachable from trigger'
 
     return None
 
 
 # ============================================================
-# Executor
+# Node execution with retry / timeout / dry-run
 # ============================================================
-def _execute_node(task_id, node, node_config, ctx):
-    """Run a single node with retry/error handling."""
-    handler = NODE_HANDLERS.get(node['type'])
+class _TimeoutContext:
+    def __init__(self, task_id, timeout_sec):
+        self.task_id = task_id
+        self.timer = None
+        if timeout_sec > 0:
+            self.timer = threading.Timer(timeout_sec, self._fire)
+            self.timer.daemon = True
+            self.timer.start()
+
+    def _fire(self):
+        task = load_task(self.task_id)
+        if task and not task.get('_abort'):
+            task['_abort'] = 'timeout'
+            save_task(self.task_id, task)
+
+    def cancel(self):
+        if self.timer:
+            self.timer.cancel()
+
+
+def _execute_node(task_id, node, node_config, ctx, dry_run=False):
+    node_type = node['type']
+    if node_type.startswith('trigger.'):
+        raise Exception(f'Trigger node cannot be executed: {node_type}')
+
+    handler = NODE_HANDLERS.get(node_type)
     if not handler:
-        raise Exception(f'No handler for {node["type"]}')
+        raise Exception(f'No handler for {node_type}')
 
     # Skip condition
     skip_expr = (node_config.get('skip_if') or '').strip()
     if skip_expr:
         try:
             if _safe_eval(skip_expr, _ctx_to_dict(ctx)):
-                _log(task_id, node['id'], 'info', f'Skipped ({skip_expr})')
-                return ['out']  # pass through
+                _log(task_id, node['id'], 'info', f'Skipped ({skip_expr[:60]})')
+                return ['out']
         except Exception as e:
             _log(task_id, node['id'], 'warning',
                  f'skip_if error: {e} — running anyway')
 
-    retry_max = int(node_config.get('retry_max') or 0)
-    retry_delay = float(node_config.get('retry_delay') or 3)
+    # Dry run: skip side-effectful nodes
+    if dry_run and node_type.startswith(('action.', 'data.')):
+        label = NODE_TYPES[node_type]['label']
+        _log(task_id, node['id'], 'info', f'[DRY RUN] Would run {label}')
+        # Determine what ports would fire
+        if node_type == 'logic.switch':
+            # Still evaluate to show routing
+            try:
+                ports = handler(task_id, node['id'], node_config, ctx)
+                _log(task_id, node['id'], 'info',
+                     f'[DRY RUN] Ports: {", ".join(ports)}')
+                return ports
+            except Exception:
+                pass
+        # Default to all non-special ports (or 'out')
+        ports = _node_ports(node_type)['out']
+        # For action/user_input etc., dry-run returns first non-error port
+        if 'out' in ports:
+            return ['out']
+        return [ports[0]] if ports else ['out']
+
+    # Retry settings
+    try:
+        retry_max = int(node_config.get('retry_max') or 0)
+    except (TypeError, ValueError):
+        retry_max = 0
+    try:
+        retry_delay = float(node_config.get('retry_delay') or 3)
+    except (TypeError, ValueError):
+        retry_delay = 3
+    backoff = (node_config.get('retry_backoff') or 'fixed').lower()
     on_error = (node_config.get('on_error') or 'stop').lower()
+    try:
+        timeout_sec = float(node_config.get('timeout_sec') or 0)
+    except (TypeError, ValueError):
+        timeout_sec = 0
 
     attempt = 0
     last_err = None
+    start_time = time.time()
+
     while attempt <= retry_max:
-        if _is_cancelled(task_id):
+        if _should_abort(task_id):
+            reason = _abort_reason(task_id)
+            if reason == 'timeout':
+                raise _TimedOut('Node timeout')
             raise _Cancelled()
+
+        tctx = _TimeoutContext(task_id, timeout_sec)
         try:
             ports = handler(task_id, node['id'], node_config, ctx)
+            tctx.cancel()
             _update_node_progress(task_id, node['id'], 100, 'done')
+            _record_timing(task_id, node['id'],
+                           (time.time() - start_time) * 1000)
+            _record_context_snapshot(task_id, node['id'], ctx)
             return ports or ['out']
         except _Cancelled:
+            tctx.cancel()
             raise
+        except _TimedOut:
+            tctx.cancel()
+            last_err = _TimedOut('Node timed out')
+            attempt += 1
         except Exception as e:
+            tctx.cancel()
             last_err = e
             attempt += 1
-            if attempt <= retry_max:
-                _log(task_id, node['id'], 'warning',
-                     f'Attempt {attempt}/{retry_max + 1} failed: {e}. '
-                     f'Retrying in {retry_delay}s…')
-                end = time.time() + retry_delay
-                while time.time() < end:
-                    if _is_cancelled(task_id):
-                        raise _Cancelled()
-                    time.sleep(0.2)
+
+        # Check for timeout abort
+        if _abort_reason(task_id) == 'timeout':
+            task = load_task(task_id)
+            if task:
+                task['_abort'] = None
+                save_task(task_id, task)
+            last_err = _TimedOut(f'Node timed out after {timeout_sec}s')
+
+        if attempt <= retry_max:
+            if backoff == 'exponential':
+                delay = min(retry_delay * (2 ** (attempt - 1)), 60)
+            else:
+                delay = retry_delay
+            _log(task_id, node['id'], 'warning',
+                 f'Attempt {attempt}/{retry_max + 1} failed: {last_err}. '
+                 f'Retry in {delay:.1f}s…')
+            end = time.time() + delay
+            while time.time() < end:
+                if _should_abort(task_id):
+                    raise _Cancelled()
+                time.sleep(0.2)
 
     # All retries exhausted
+    _update_node_progress(task_id, node['id'], 100, 'error')
+    _record_timing(task_id, node['id'], (time.time() - start_time) * 1000)
+    _record_context_snapshot(task_id, node['id'], ctx)
+
     if on_error == 'continue':
         _log(task_id, node['id'], 'error',
              f'Failed (continuing): {last_err}')
-        _update_node_progress(task_id, node['id'], 100, 'error')
-        return ['out']  # pass through anyway
-    else:
-        _update_node_progress(task_id, node['id'], 100, 'error')
-        raise last_err
+        return ['out']
+
+    raise last_err
 
 
+# ============================================================
+# Item preparation (trigger execution)
+# ============================================================
 def _prepare_items(task_id, trigger, edges):
-    """Expand trigger config into a list of items."""
     cfg = trigger.get('config') or {}
 
     if trigger['type'] == 'trigger.url_list':
@@ -1325,7 +1842,7 @@ def _prepare_items(task_id, trigger, edges):
                  f'Checking {len(raw)} URL(s) for playlists…')
             expanded = []
             for u in raw:
-                if _is_cancelled(task_id):
+                if _should_abort(task_id):
                     raise _Cancelled()
                 if is_playlist_url(u):
                     _log(task_id, trigger['id'], 'info',
@@ -1364,14 +1881,102 @@ def _prepare_items(task_id, trigger, edges):
     raise Exception(f'Unknown trigger type: {trigger["type"]}')
 
 
-def _run_workflow(task_id, workflow):
+# ============================================================
+# Workflow execution
+# ============================================================
+def _run_workflow_sync(workflow, initial_ctx, parent_task_id=None,
+                        parent_node_id=None):
+    """
+    Run a workflow synchronously and return the final context.
+    Used by the sub-workflow node.
+
+    Doesn't create a visible task — logs into parent task.
+    """
     nodes = workflow['nodes']
     edges = workflow.get('edges', [])
     node_map = {n['id']: n for n in nodes}
 
     order = _topological_order(nodes, edges)
     if not order:
-        _log(task_id, None, 'error', 'Cycle detected — cannot run')
+        raise Exception('Cycle in sub-workflow')
+
+    trigger = next((n for n in nodes if n['type'].startswith('trigger.')), None)
+    if not trigger:
+        raise Exception('Sub-workflow has no trigger')
+
+    # For sub-workflows we start fresh: extract items from trigger
+    items = _prepare_items(parent_task_id or 'sub', trigger, edges)
+
+    # Run only the FIRST item to keep semantics simple.
+    # (If sub-workflow needs to iterate, use its own trigger loop.)
+    if not items:
+        raise Exception('Sub-workflow trigger produced no items')
+
+    item = items[0]
+    ctx = dict(initial_ctx)
+    ctx['item'] = item
+    ctx['url'] = str(item)
+    ctx['index'] = 1
+    ctx['total'] = 1
+    ctx['quality'] = (trigger.get('config') or {}).get('quality', 'best')
+
+    # Execute the graph (same token model as parent)
+    incoming_count = {nid: 0 for nid in node_map}
+    expected_count = {nid: len(_in_edges(nid, edges)) for nid in node_map}
+    completed = {trigger['id']}
+    worklist = []
+
+    for edge in _out_edges(trigger['id'], edges, 'out'):
+        to_id = edge['to']
+        incoming_count[to_id] = incoming_count.get(to_id, 0) + 1
+        if incoming_count[to_id] >= expected_count.get(to_id, 1):
+            worklist.append(to_id)
+
+    while worklist:
+        if _should_abort(parent_task_id or 'sub'):
+            raise _Cancelled()
+
+        node_id = worklist.pop(0)
+        if node_id in completed:
+            continue
+        node = node_map[node_id]
+        node_cfg = node.get('config') or {}
+
+        in_count = incoming_count[node_id]
+        exp = expected_count[node_id]
+        if exp > 0 and in_count < exp:
+            if not (node['type'] == 'logic.merge' and
+                    (node_cfg.get('mode') or 'all').lower() == 'any'):
+                continue
+
+        ports = _execute_node(parent_task_id or 'sub', node, node_cfg, ctx,
+                              dry_run=False)
+        completed.add(node_id)
+
+        for port in ports:
+            for edge in _out_edges(node_id, edges, port):
+                to_id = edge['to']
+                if to_id in completed:
+                    continue
+                incoming_count[to_id] = incoming_count.get(to_id, 0) + 1
+                exp_to = expected_count.get(to_id, 0)
+                if exp_to == 0 or incoming_count[to_id] >= exp_to:
+                    worklist.append(to_id)
+                elif (node_map[to_id]['type'] == 'logic.merge' and
+                      (node_map[to_id].get('config') or {}).get('mode', 'all').lower() == 'any'):
+                    worklist.append(to_id)
+
+    return ctx
+
+
+def _run_workflow(task_id, workflow, dry_run=False):
+    nodes = workflow['nodes']
+    edges = workflow.get('edges', [])
+    node_map = {n['id']: n for n in nodes}
+
+    order = _topological_order(nodes, edges)
+    if not order:
+        _log(task_id, None, 'error', 'Cycle detected')
         raise Exception('Invalid workflow graph')
 
     trigger = next((n for n in nodes if n['type'].startswith('trigger.')), None)
@@ -1384,23 +1989,26 @@ def _run_workflow(task_id, workflow):
             raise Exception('Trigger produced no items')
 
         task = load_task(task_id)
-        task['items'] = [str(x)[:200] for x in items]  # truncate for storage
+        task['items'] = [str(x)[:200] for x in items]
         task['total_items'] = len(items)
         save_task(task_id, task)
 
+        mode_label = '[DRY RUN] ' if dry_run else ''
         _log(task_id, None, 'info',
-             f'Starting "{workflow.get("name", "Untitled")}" — '
+             f'{mode_label}Starting "{workflow.get("name", "Untitled")}" — '
              f'{len(items)} item(s), {len(nodes) - 1} node(s)')
 
         for idx, item in enumerate(items):
-            if _is_cancelled(task_id):
+            if _should_abort(task_id):
                 raise _Cancelled()
 
             task = load_task(task_id)
             task['current_item_index'] = idx
             task['current_item'] = str(item)[:200]
             task['progress'] = int(100 * idx / len(items))
-            task['node_statuses'] = {}
+            task['node_statuses'] = {
+                trigger['id']: {'status': 'done', 'progress': 100},
+            }
             save_task(task_id, task)
 
             _log(task_id, None, 'info',
@@ -1413,16 +2021,30 @@ def _run_workflow(task_id, workflow):
                 'total': len(items),
                 'quality': (trigger.get('config') or {}).get('quality', 'best'),
                 'vars': {},
+                '_depth': 0,
             }
 
             # ---- Token-based traversal ----
             incoming_count = {nid: 0 for nid in node_map}
             expected_count = {nid: len(_in_edges(nid, edges)) for nid in node_map}
-            completed = set()
-            worklist = [trigger['id']]
+            completed = {trigger['id']}
+            worklist = []
+
+            # Seed worklist from trigger's 'out' port (trigger already ran)
+            for edge in _out_edges(trigger['id'], edges, 'out'):
+                to_id = edge['to']
+                if to_id in completed:
+                    continue
+                incoming_count[to_id] = incoming_count.get(to_id, 0) + 1
+                exp_to = expected_count.get(to_id, 0)
+                if exp_to == 0 or incoming_count[to_id] >= exp_to:
+                    worklist.append(to_id)
+                elif (node_map[to_id]['type'] == 'logic.merge' and
+                      (node_map[to_id].get('config') or {}).get('mode', 'all').lower() == 'any'):
+                    worklist.append(to_id)
 
             while worklist:
-                if _is_cancelled(task_id):
+                if _should_abort(task_id):
                     raise _Cancelled()
 
                 node_id = worklist.pop(0)
@@ -1432,17 +2054,13 @@ def _run_workflow(task_id, workflow):
                 node = node_map[node_id]
                 node_cfg = node.get('config') or {}
 
-                # Readiness check for merge nodes
                 in_count = incoming_count[node_id]
                 exp = expected_count[node_id]
                 if exp > 0 and in_count < exp:
-                    if node['type'] == 'logic.merge' and \
-                       (node_cfg.get('mode') or 'all').lower() == 'any':
-                        pass  # 'any' mode: fire now
-                    else:
-                        continue  # wait for more inputs
+                    if not (node['type'] == 'logic.merge' and
+                            (node_cfg.get('mode') or 'all').lower() == 'any'):
+                        continue
 
-                # Mark running
                 task = load_task(task_id)
                 task['current_node_id'] = node_id
                 task['node_statuses'][node_id] = {'status': 'running', 'progress': 0}
@@ -1451,7 +2069,11 @@ def _run_workflow(task_id, workflow):
                      f'Running {NODE_TYPES[node["type"]]["label"]}')
 
                 try:
-                    fired_ports = _execute_node(task_id, node, node_cfg, ctx)
+                    fired_ports = _execute_node(task_id, node, node_cfg, ctx,
+                                                dry_run=dry_run)
+                except _TimedOut as e:
+                    raise Exception(
+                        f'{NODE_TYPES[node["type"]]["label"]}: timed out')
                 except _Cancelled:
                     raise
                 except Exception as e:
@@ -1461,7 +2083,6 @@ def _run_workflow(task_id, workflow):
 
                 completed.add(node_id)
 
-                # Fire output ports
                 for port in fired_ports:
                     for edge in _out_edges(node_id, edges, port):
                         to_id = edge['to']
@@ -1473,8 +2094,15 @@ def _run_workflow(task_id, workflow):
                             worklist.append(to_id)
                         elif (node_map[to_id]['type'] == 'logic.merge' and
                               (node_map[to_id].get('config') or {}).get('mode', 'all').lower() == 'any'):
-                            # 'any' merge fires on first incoming
                             worklist.append(to_id)
+
+            # Stall detection
+            stalled = [nid for nid in node_map if nid not in completed]
+            if stalled:
+                labels = [NODE_TYPES[node_map[nid]['type']]['label'] for nid in stalled]
+                _log(task_id, None, 'warning',
+                     f'Item {idx+1}: {len(stalled)} node(s) never fired: '
+                     f'{", ".join(labels[:5])}')
 
         task = load_task(task_id)
         if task:
@@ -1542,6 +2170,36 @@ def register_routes(app):
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 
+    @app.route('/workflow/export/<wf_id>')
+    def workflow_export(wf_id):
+        wf = _load_workflow(wf_id)
+        if not wf:
+            return jsonify({'error': 'Not found'}), 404
+        return Response(
+            json.dumps(wf, indent=2),
+            mimetype='application/json',
+            headers={
+                'Content-Disposition':
+                    f'attachment; filename=workflow_{wf_id}.json'
+            }
+        )
+
+    @app.route('/workflow/import', methods=['POST'])
+    def workflow_import():
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({'error': 'No JSON data'}), 400
+        old_id = data.get('id')
+        data.pop('id', None)
+        data['name'] = (data.get('name') or 'Imported') + ' (imported)'
+        err = _validate_workflow(data)
+        if err:
+            return jsonify({'error': err, 'source_id': old_id}), 400
+        new_id = _save_workflow(data)
+        if not new_id:
+            return jsonify({'error': 'Failed to save'}), 500
+        return jsonify({'id': new_id, 'name': data['name']})
+
     @app.route('/workflow/run', methods=['POST'])
     def workflow_run():
         data = request.get_json(silent=True) or {}
@@ -1551,6 +2209,7 @@ def register_routes(app):
         if len(data['nodes']) < 2:
             return jsonify({'error': 'Add at least one action node'}), 400
 
+        dry_run = bool(data.get('dry_run', False))
         task_id = str(uuid.uuid4())
         save_task(task_id, {
             'task_id': task_id, 'status': 'running', 'progress': 0,
@@ -1559,9 +2218,111 @@ def register_routes(app):
             'items': [], 'total_items': 0,
             'current_item_index': 0, 'current_item': '',
             'current_node_id': None, 'node_statuses': {}, 'logs': [],
+            'context_snapshots': {}, 'node_timings': [],
+            'dry_run': dry_run,
             'type': 'workflow',
         })
 
-        threading.Thread(target=_run_workflow, args=(task_id, data),
+        threading.Thread(target=_run_workflow,
+                         args=(task_id, data, dry_run),
                          daemon=True).start()
-        return jsonify({'task_id': task_id})
+        return jsonify({'task_id': task_id, 'dry_run': dry_run})
+
+    @app.route('/workflow/input/<task_id>', methods=['POST'])
+    def workflow_input_response(task_id):
+        data = request.get_json(silent=True) or {}
+        response = (data.get('response') or '').strip().lower()
+        if response not in ('approve', 'reject'):
+            return jsonify({'error': 'response must be "approve" or "reject"'}), 400
+        task = load_task(task_id)
+        if not task:
+            return jsonify({'error': 'Task not found'}), 404
+        awaiting = task.get('awaiting_input')
+        if not awaiting:
+            return jsonify({'error': 'No pending input'}), 400
+        task['_user_input_response'] = {
+            'node_id': awaiting['node_id'],
+            'response': response,
+            'ts': time.time(),
+        }
+        save_task(task_id, task)
+        return jsonify({'status': 'ok', 'response': response})
+
+    @app.route('/workflow/context/<task_id>')
+    def workflow_context(task_id):
+        task = load_task(task_id)
+        if not task:
+            return jsonify({'error': 'Not found'}), 404
+        return jsonify({
+            'current_item': task.get('current_item'),
+            'current_node_id': task.get('current_node_id'),
+            'context_snapshots': task.get('context_snapshots', {}),
+            'node_timings': task.get('node_timings', []),
+            'awaiting_input': task.get('awaiting_input'),
+        })
+
+    @app.route('/workflow/test_node', methods=['POST'])
+    def workflow_test_node():
+        data = request.get_json(silent=True) or {}
+        node_type = data.get('type')
+        node_config = data.get('config') or {}
+        dry_run = bool(data.get('dry_run', True))
+
+        if node_type not in NODE_TYPES:
+            return jsonify({'error': 'Unknown node type'}), 400
+        if node_type.startswith('trigger.'):
+            return jsonify({'error': 'Cannot test a trigger node directly'}), 400
+        if node_type not in NODE_HANDLERS:
+            return jsonify({'error': f'No handler for {node_type}'}), 400
+
+        sample_ctx = {
+            'url': data.get('url', 'https://example.com/test.mp4'),
+            'filename': data.get('filename', 'test.mp4'),
+            'basename': os.path.splitext(data.get('filename', 'test.mp4'))[0],
+            'size': data.get('size', 1024 * 1024),
+            'index': 1, 'total': 1, 'quality': 'best',
+            'duration': 0, 'width': 0, 'height': 0,
+            'vcodec': '', 'acodec': '',
+            'vars': {},
+            '_depth': 0,
+        }
+        sample_ctx.update(data.get('ctx') or {})
+
+        task_id = str(uuid.uuid4())
+        save_task(task_id, {
+            'task_id': task_id, 'status': 'running', 'progress': 0,
+            'created_at': time.time(), 'cancelled': False,
+            'logs': [], 'node_statuses': {}, 'node_timings': [],
+            'context_snapshots': {},
+            'dry_run': dry_run,
+            '_hidden': True,
+            'type': 'workflow_test',
+        })
+
+        try:
+            node = {'id': 'test', 'type': node_type, 'config': node_config}
+            ports = _execute_node(task_id, node, node_config, sample_ctx,
+                                  dry_run=dry_run)
+
+            t = load_task(task_id)
+            logs = t.get('logs', []) if t else []
+
+            delete_task(task_id)
+
+            return jsonify({
+                'status': 'ok',
+                'output_ports': ports,
+                'ctx_after': _safe_ctx_snapshot(sample_ctx),
+                'logs': logs,
+                'dry_run': dry_run,
+            })
+        except Exception as e:
+            t = load_task(task_id)
+            logs = t.get('logs', []) if t else []
+            delete_task(task_id)
+            return jsonify({
+                'status': 'error',
+                'error': str(e),
+                'logs': logs,
+                'dry_run': dry_run,
+            }), 200
