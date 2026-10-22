@@ -224,6 +224,7 @@ button.danger:hover {
     flex-direction: column;
     gap: 0.5rem;
     position: relative;
+    contain: layout style;
 }
 
 .file-card:hover {
@@ -304,6 +305,8 @@ button.danger:hover {
     border-radius: 1rem;
     padding: 1rem 1.2rem;
     border-left: 4px solid #5f8fe0;
+    content-visibility: auto;
+    contain-intrinsic-size: auto 90px;
 }
 
 .task-header {
