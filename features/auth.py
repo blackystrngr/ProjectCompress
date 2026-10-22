@@ -14,7 +14,7 @@ def _candidate_paths():
     env_override = os.environ.get('AUTH_PASSWORD_FILE', '').strip()
     if env_override:
         paths.append(env_override)
-    paths.append('/root/.password')
+    paths.append('/root/secrets/.password')
     try:
         home = os.path.expanduser('~')
         if home and home not in ('~', '/'):
