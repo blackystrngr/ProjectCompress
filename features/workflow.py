@@ -1,16 +1,13 @@
 # features/workflow.py
 """
-Advanced node-based workflow engine with resume-from-checkpoint.
+Advanced node-based workflow engine with:
+  • Autosave support (frontend-triggered /workflow/save)
+  • Resume that loads the LATEST saved workflow file, not the stale snapshot
+  • Checkpoint validation — drops partial checkpoints whose node was deleted
+  • All runs (Run / Dry Run / Resume) use the current saved graph
 
-After every successful node, a checkpoint is saved with the exact ctx and
-which node completed. On failure, POST /workflow/resume/<task_id> creates a
-new task that reuses those checkpoints:
-  • Completed items (1..N-1) are skipped entirely
-  • The failed item resumes from the node *after* the last successful one
-  • Remaining items run normally
-
-The original workflow is embedded as `workflow_snapshot` in the task, so
-resume works even if the source workflow was edited or deleted.
+The workflow_id + workflow_signature are stamped on every task so resume
+can detect whether the graph changed since the failure.
 """
 
 import os
@@ -22,6 +19,7 @@ import shutil
 import threading
 import subprocess
 import logging
+import hashlib
 import glob as _glob
 from collections import deque
 from flask import request, jsonify, Response
@@ -474,10 +472,9 @@ def _safe_ctx_snapshot(ctx):
 
 
 # ============================================================
-# Checkpoint helpers (resume system)
+# Checkpoint helpers
 # ============================================================
 def _checkpoint_ctx(ctx):
-    """Serialize ctx for checkpoint storage — preserves file paths."""
     out = {}
     for k, v in ctx.items():
         key = str(k)
@@ -528,13 +525,11 @@ def _checkpoint_ctx(ctx):
 
 def _build_initial_worklist_from_checkpoint(trigger, edges, node_map,
                                               last_node_id, last_ports_fired):
-    """Seed worklist starting from a checkpoint's last node output ports."""
     incoming_count = {nid: 0 for nid in node_map}
     expected_count = {nid: len(_in_edges(nid, edges)) for nid in node_map}
     completed = {trigger['id'], last_node_id}
     worklist = []
 
-    # Walk upstream — every node that can reach last_node via in-edges is done
     upstream = {last_node_id}
     stack = [last_node_id]
     while stack:
@@ -545,7 +540,6 @@ def _build_initial_worklist_from_checkpoint(trigger, edges, node_map,
                 stack.append(e['from'])
     completed.update(upstream)
 
-    # Fire last_node's output ports
     for port in (last_ports_fired or ['out']):
         for edge in _out_edges(last_node_id, edges, port):
             to_id = edge['to']
@@ -560,6 +554,24 @@ def _build_initial_worklist_from_checkpoint(trigger, edges, node_map,
                 worklist.append(to_id)
 
     return incoming_count, expected_count, completed, worklist
+
+
+def _workflow_signature(workflow):
+    """Stable hash of node IDs, types, and edge topology.
+    Used to detect if the graph changed between failure and resume."""
+    if not workflow:
+        return ''
+    nodes = workflow.get('nodes') or []
+    edges = workflow.get('edges') or []
+    node_parts = sorted(
+        f"{n.get('id','')}:{n.get('type','')}" for n in nodes
+    )
+    edge_parts = sorted(
+        f"{e.get('from','')}:{e.get('from_port','out')}->{e.get('to','')}"
+        for e in edges
+    )
+    blob = '|'.join(node_parts) + '||' + '|'.join(edge_parts)
+    return hashlib.md5(blob.encode('utf-8')).hexdigest()
 
 
 # ============================================================
@@ -754,7 +766,7 @@ def _expand_template(text, ctx):
 
 
 # ============================================================
-# Feature API bridge (inlined — calls real modules via sub-tasks)
+# Feature API bridge
 # ============================================================
 def _make_subtask(parent_task_id, node_id):
     sub_id = str(uuid.uuid4())
@@ -1064,8 +1076,26 @@ def _h_download_file(task_id, node_id, config, ctx):
 
 def _h_telegram_send(task_id, node_id, config, ctx):
     file_path = ctx.get('file_path')
-    if not file_path or not os.path.exists(file_path):
-        raise Exception('No file in context — add a Download node first')
+
+    if not file_path:
+        ctx_keys = sorted(k for k in ctx.keys() if not k.startswith('_'))
+        raise Exception(
+            f'No file_path in context. '
+            f'Context keys present: {ctx_keys}. '
+            f'This usually means: (a) the Download node was skipped via '
+            f'"skip_if", (b) the Download node failed with '
+            f'"on_error: continue", or (c) the Download node is not wired '
+            f'to this node. Check the previous node in the log.'
+        )
+    if not os.path.exists(file_path):
+        raise Exception(
+            f'file_path is set ({file_path}) but the file is gone from disk. '
+            f'It may have been deleted by a Delete node earlier in this run, '
+            f'or by a prior run of this workflow. '
+            f'If your chain has Download → Delete → Telegram, move Delete '
+            f'to the end of the chain.'
+        )
+
     chat_link = (config.get('chat_link') or '').strip()
     if not chat_link:
         raise Exception('Chat link required')
@@ -1721,6 +1751,25 @@ def _execute_node(task_id, node, node_config, ctx, dry_run=False):
             _log(task_id, node['id'], 'warning',
                  f'skip_if error: {e} — running anyway')
 
+    # ── Guard: nodes that require a file must have one ──
+    requires_file = {
+        'action.telegram_send',
+        'action.drive_upload',
+        'action.compress',
+        'action.delete_local',
+        'action.extract_metadata',
+    }
+    if node_type in requires_file:
+        fp = ctx.get('file_path')
+        if not fp or not os.path.exists(fp):
+            ctx_keys = sorted(k for k in ctx.keys() if not k.startswith('_'))
+            raise Exception(
+                f'{NODE_TYPES[node_type]["label"]} needs a file in context, '
+                f'but none is present. Context keys: {ctx_keys}. '
+                f'The upstream Download node must succeed and produce a file. '
+                f'Check "skip_if" and "on_error: continue" on the Download node.'
+            )
+
     if dry_run and node_type.startswith(('action.', 'data.')):
         label = NODE_TYPES[node_type]['label']
         _log(task_id, node['id'], 'info', f'[DRY RUN] Would run {label}')
@@ -1965,7 +2014,6 @@ def _run_workflow_sync(workflow, initial_ctx, parent_task_id=None):
 
 
 def _run_workflow(task_id, workflow, dry_run=False, items_override=None):
-    """Main execution with checkpoint-based resume support."""
     nodes = workflow['nodes']
     edges = workflow.get('edges', [])
     node_map = {n['id']: n for n in nodes}
@@ -1979,7 +2027,6 @@ def _run_workflow(task_id, workflow, dry_run=False, items_override=None):
         raise Exception('No trigger node')
 
     try:
-        # ── Items: override (resume) or fresh from trigger ──
         if items_override is not None:
             items = list(items_override)
             _log(task_id, None, 'info',
@@ -1993,9 +2040,10 @@ def _run_workflow(task_id, workflow, dry_run=False, items_override=None):
         task['items'] = [str(x)[:200] for x in items]
         task['total_items'] = len(items)
         task['workflow_snapshot'] = workflow
+        task['workflow_id'] = workflow.get('id')
+        task['workflow_signature'] = _workflow_signature(workflow)
         save_task(task_id, task)
 
-        # Inherit checkpoints from resume (or start empty)
         task = load_task(task_id)
         checkpoints = dict(task.get('checkpoints') or {})
 
@@ -2007,9 +2055,12 @@ def _run_workflow(task_id, workflow, dry_run=False, items_override=None):
                  f'from previous run — will skip')
 
         mode_label = '[DRY RUN] ' if dry_run else ''
+        action_types = [n['type'].split('.', 1)[1]
+                        for n in nodes if not n['type'].startswith('trigger.')]
         _log(task_id, None, 'info',
              f'{mode_label}Starting "{workflow.get("name", "Untitled")}" — '
-             f'{len(items)} item(s), {len(nodes) - 1} node(s)')
+             f'{len(items)} item(s), {len(nodes) - 1} action node(s): '
+             f'{", ".join(action_types) or "(none)"}')
 
         trigger_cfg = trigger.get('config') or {}
 
@@ -2020,7 +2071,6 @@ def _run_workflow(task_id, workflow, dry_run=False, items_override=None):
             item_key = str(idx)
             prev_cp = checkpoints.get(item_key)
 
-            # ── Skip completed items ──
             if prev_cp and prev_cp.get('completed'):
                 task = load_task(task_id)
                 task['current_item_index'] = idx
@@ -2043,7 +2093,6 @@ def _run_workflow(task_id, workflow, dry_run=False, items_override=None):
             }
             save_task(task_id, task)
 
-            # ── Build ctx + worklist (fresh or resumed) ──
             if prev_cp and prev_cp.get('last_node_id'):
                 last_node_id = prev_cp['last_node_id']
                 last_ports = prev_cp.get('last_ports_fired') or ['out']
@@ -2081,7 +2130,6 @@ def _run_workflow(task_id, workflow, dry_run=False, items_override=None):
                 incoming_count, expected_count, completed, worklist = \
                     _build_initial_worklist(trigger, edges, node_map)
 
-            # ── Execute node graph ──
             while worklist:
                 if _should_abort(task_id):
                     raise _Cancelled()
@@ -2122,7 +2170,6 @@ def _run_workflow(task_id, workflow, dry_run=False, items_override=None):
 
                 completed.add(node_id)
 
-                # ── Checkpoint after each successful node ──
                 task = load_task(task_id)
                 cps = task.get('checkpoints', {})
                 cps[item_key] = {
@@ -2140,7 +2187,6 @@ def _run_workflow(task_id, workflow, dry_run=False, items_override=None):
                                incoming_count, expected_count,
                                completed, worklist)
 
-            # ── Item fully complete ──
             stalled = [nid for nid in node_map if nid not in completed]
             if stalled:
                 labels = [NODE_TYPES[node_map[nid]['type']]['label']
@@ -2169,6 +2215,8 @@ def _run_workflow(task_id, workflow, dry_run=False, items_override=None):
             task['status'] = 'cancelled'
             task['failed_item_index'] = task.get('current_item_index', 0)
             task['workflow_snapshot'] = workflow
+            task['workflow_id'] = workflow.get('id')
+            task['workflow_signature'] = _workflow_signature(workflow)
             save_task(task_id, task)
         _log(task_id, None, 'warning', '⛔ Cancelled')
     except Exception as e:
@@ -2179,6 +2227,8 @@ def _run_workflow(task_id, workflow, dry_run=False, items_override=None):
             task['error_msg'] = str(e)
             task['failed_item_index'] = task.get('current_item_index', 0)
             task['workflow_snapshot'] = workflow
+            task['workflow_id'] = workflow.get('id')
+            task['workflow_signature'] = _workflow_signature(workflow)
             save_task(task_id, task)
         _log(task_id, None, 'error', f'❌ {e}')
 
@@ -2273,6 +2323,8 @@ def register_routes(app):
             'context_snapshots': {}, 'node_timings': [],
             'checkpoints': {},
             'workflow_snapshot': data,
+            'workflow_id': data.get('id'),
+            'workflow_signature': _workflow_signature(data),
             'dry_run': dry_run, 'type': 'workflow',
         })
         threading.Thread(target=_run_workflow,
@@ -2335,10 +2387,15 @@ def register_routes(app):
         partial = sum(1 for cp in cps.values()
                       if not cp.get('completed') and cp.get('last_node_id'))
 
+        wf_id = task.get('workflow_id') or workflow.get('id')
+        latest_available = bool(wf_id and _load_workflow(wf_id))
+
         return jsonify({
             'resumable': True,
             'status': task.get('status'),
             'workflow_name': task.get('workflow_name'),
+            'workflow_id': wf_id,
+            'latest_file_available': latest_available,
             'total_items': task.get('total_items', 0),
             'completed_items': completed,
             'partial_items': partial,
@@ -2358,16 +2415,59 @@ def register_routes(app):
         if source.get('_hidden'):
             return jsonify({'error': 'Cannot resume an internal task'}), 400
 
-        workflow = source.get('workflow_snapshot')
+        source_snapshot = source.get('workflow_snapshot') or {}
+        source_sig = (source.get('workflow_signature')
+                      or _workflow_signature(source_snapshot))
+        wf_id = source.get('workflow_id') or source_snapshot.get('id')
+
+        workflow = None
+        latest_source = 'snapshot'
+        if wf_id:
+            workflow = _load_workflow(wf_id)
+            if workflow:
+                latest_source = 'file'
+            else:
+                logger.info(
+                    f'Resume: workflow file {wf_id} missing, using snapshot')
+
         if not workflow:
-            return jsonify({'error': 'No workflow snapshot in source task'}), 400
+            workflow = source_snapshot
+
+        if not workflow:
+            return jsonify({'error': 'No workflow available (snapshot missing)'}), 400
+
+        new_sig = _workflow_signature(workflow)
+        graph_changed = (new_sig != source_sig)
 
         items = source.get('items', [])
         if not items:
             return jsonify({'error': 'Source task has no items'}), 400
 
         checkpoints = source.get('checkpoints', {})
-        completed = sum(1 for cp in checkpoints.values() if cp.get('completed'))
+        stats = {'kept_completed': 0, 'kept_partial': 0,
+                 'dropped_partial': 0, 'total': len(checkpoints)}
+
+        if graph_changed:
+            new_node_ids = {n['id'] for n in workflow.get('nodes', [])}
+            filtered = {}
+            for k, cp in checkpoints.items():
+                if cp.get('completed'):
+                    filtered[k] = cp
+                    stats['kept_completed'] += 1
+                elif cp.get('last_node_id') in new_node_ids:
+                    filtered[k] = cp
+                    stats['kept_partial'] += 1
+                else:
+                    stats['dropped_partial'] += 1
+            checkpoints = filtered
+            logger.info(f'Resume: graph changed — checkpoints {stats}')
+        else:
+            stats['kept_completed'] = sum(
+                1 for cp in checkpoints.values() if cp.get('completed'))
+            stats['kept_partial'] = (
+                len(checkpoints) - stats['kept_completed'])
+
+        completed = stats['kept_completed']
         attempts = (source.get('resume_attempts') or 0) + 1
 
         task_id = str(uuid.uuid4())
@@ -2377,7 +2477,7 @@ def register_routes(app):
             'progress': int(100 * completed / len(items)) if items else 0,
             'created_at': time.time(),
             'cancelled': False,
-            'workflow_name': source.get('workflow_name', 'Untitled'),
+            'workflow_name': workflow.get('name', 'Untitled'),
             'items': items,
             'total_items': len(items),
             'current_item_index': 0,
@@ -2390,9 +2490,12 @@ def register_routes(app):
             'dry_run': source.get('dry_run', False),
             'type': 'workflow',
             'workflow_snapshot': workflow,
+            'workflow_id': wf_id,
+            'workflow_signature': new_sig,
             'resumed_from': source_task_id,
             'resume_attempts': attempts,
             'checkpoints': checkpoints,
+            'graph_changed': graph_changed,
         })
 
         threading.Thread(
@@ -2402,8 +2505,10 @@ def register_routes(app):
             daemon=True,
         ).start()
 
-        logger.info(f'Workflow resumed: new={task_id} from={source_task_id} '
-                    f'items={len(items)} completed={completed} attempts={attempts}')
+        logger.info(
+            f'Workflow resumed: new={task_id} from={source_task_id} '
+            f'items={len(items)} completed={completed} attempts={attempts} '
+            f'graph_changed={graph_changed} source={latest_source}')
 
         return jsonify({
             'task_id': task_id,
@@ -2411,6 +2516,9 @@ def register_routes(app):
             'total_items': len(items),
             'completed_items': completed,
             'resume_attempts': attempts,
+            'graph_changed': graph_changed,
+            'latest_source': latest_source,
+            'checkpoint_stats': stats,
         })
 
     @app.route('/workflow/test_node', methods=['POST'])
