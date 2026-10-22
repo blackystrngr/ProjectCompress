@@ -21,6 +21,9 @@ Torrent lifecycle
 Every torrent session enables DHT, LSD, UPnP, NAT-PMP and adds public
 trackers. Metadata fetch has a hard 5-min timeout; download loop has a
 2-min stall detector. No more infinite hangs on dead magnets.
+
+2026-10-22: download_with_ytdlp now accepts title_based=False param.
+When True, the output filename uses %(title)s from yt-dlp.
 """
 
 import os
@@ -180,8 +183,8 @@ DHT_ROUTERS = [
     ("dht.transmissionbt.com", 6881),
 ]
 
-METADATA_TIMEOUT_SEC = 300     # max 5 min to fetch magnet metadata
-STALL_TIMEOUT_SEC = 120        # 2 min with 0 peers = give up and report
+METADATA_TIMEOUT_SEC = 300
+STALL_TIMEOUT_SEC = 120
 
 
 class DownloadCancelled(Exception):
@@ -192,11 +195,6 @@ class DownloadCancelled(Exception):
 # PLAYWRIGHT ORPHAN CLEANUP
 # ============================================================
 def _cleanup_playwright_processes(verbose=False):
-    """
-    Kill orphaned Playwright / Chromium / headless_shell processes.
-    Only targets processes whose command line clearly belongs to
-    Playwright, so a user's normal Chrome is not touched.
-    """
     killed = 0
 
     try:
@@ -1336,7 +1334,14 @@ def download_direct_file(url, task_id):
 # ============================================================
 # YT-DLP DOWNLOADER
 # ============================================================
-def download_with_ytdlp(url, task_id, quality='best'):
+def download_with_ytdlp(url, task_id, quality='best', title_based=False):
+    """
+    Download a single URL via yt-dlp.
+
+    When title_based=True, the output filename uses %(title)s from yt-dlp
+    so videos get meaningful names like "Rick Astley - Never Gonna Give You
+    Up.mp4" instead of "watch.mp4".
+    """
     task = load_task(task_id)
     if not task:
         raise Exception("Task not found")
@@ -1356,7 +1361,14 @@ def download_with_ytdlp(url, task_id, quality='best'):
         raise Exception("yt-dlp not installed")
 
     format_choice = QUALITY_MAP.get(quality, QUALITY_MAP['best'])
-    output_template = os.path.join(UPLOAD_FOLDER, f"{task_id}_dl.%(ext)s")
+
+    # ── Output template: title-based or ID-based ──
+    if title_based:
+        output_template = os.path.join(
+            UPLOAD_FOLDER, f"{task_id}_dl.%(title).150B.%(ext)s")
+    else:
+        output_template = os.path.join(
+            UPLOAD_FOLDER, f"{task_id}_dl.%(ext)s")
 
     cmd = [
         'yt-dlp',
@@ -1452,12 +1464,18 @@ def download_with_ytdlp(url, task_id, quality='best'):
         logger.error(f"yt-dlp failed (code {process.returncode}):\n{full_output[-3000:]}")
         raise Exception(f"yt-dlp failed: {full_output[-500:]}")
 
-    files = [f for f in os.listdir(UPLOAD_FOLDER) if f.startswith(f"{task_id}_dl.")]
-    if not files:
+    # ── Locate output file (filter merge fragments) ──
+    prefix = f"{task_id}_dl."
+    all_files = [f for f in os.listdir(UPLOAD_FOLDER) if f.startswith(prefix)]
+    if not all_files:
         raise Exception("No output file found.")
 
-    mp4_files = [f for f in files if f.endswith('.mp4')]
-    chosen = mp4_files[0] if mp4_files else files[0]
+    final_files = [f for f in all_files if not re.search(r'\.f\d+\.', f)]
+    if not final_files:
+        final_files = all_files
+
+    mp4_files = [f for f in final_files if f.endswith('.mp4')]
+    chosen = mp4_files[0] if mp4_files else final_files[0]
     src = os.path.join(UPLOAD_FOLDER, chosen)
 
     src_size = os.path.getsize(src)
@@ -1478,11 +1496,23 @@ def download_with_ytdlp(url, task_id, quality='best'):
             pass
         raise Exception("Downloaded file has no video stream.")
 
-    base_name = os.path.basename(urlparse(url).path.rstrip('/')) or 'video'
-    base_name = re.sub(r'[^\w\-]', '_', base_name)[:80]
-    base_name = re.sub(r'\.(js|css|map|json)$', '', base_name, flags=re.IGNORECASE)
-    if quality not in ('best', 'audio'):
-        base_name = f"{base_name}_{quality}"
+    # ── Choose final filename ──
+    if title_based:
+        raw_title = chosen[len(prefix):]
+        base_name = re.sub(r'\.mp4$', '', raw_title, flags=re.IGNORECASE)
+        base_name = re.sub(r'[/\\:*?"<>|]', '_', base_name)
+        if len(base_name.encode('utf-8')) > 200:
+            base_name = base_name.encode('utf-8')[:200].decode(
+                'utf-8', errors='ignore')
+        if not base_name.strip():
+            base_name = 'video'
+    else:
+        base_name = os.path.basename(urlparse(url).path.rstrip('/')) or 'video'
+        base_name = re.sub(r'[^\w\-]', '_', base_name)[:80]
+        base_name = re.sub(r'\.(js|css|map|json)$', '', base_name, flags=re.IGNORECASE)
+        if quality not in ('best', 'audio'):
+            base_name = f"{base_name}_{quality}"
+
     final_name = _get_unique_filename(f"{base_name}.mp4")
     dst = os.path.join(UPLOAD_FOLDER, final_name)
     os.rename(src, dst)
@@ -1831,7 +1861,6 @@ def process_url_download(task_id, url, quality='best', range_start=1, range_end=
 # TORRENT DOWNLOADER
 # ============================================================
 def _build_torrent_session():
-    """Create a libtorrent session with DHT/LSD/UPnP enabled and DHT routers set."""
     try:
         ses = lt.session({
             'listen_interfaces': '0.0.0.0:6881,[::]:6881',
@@ -1858,7 +1887,6 @@ def _build_torrent_session():
 
 
 def _append_public_trackers(magnet_uri):
-    """Add public trackers to a magnet URI that has none of its own."""
     if '&tr=' in magnet_uri or '?tr=' in magnet_uri:
         return magnet_uri
     sep = '&' if '?' in magnet_uri else '?'
@@ -1897,7 +1925,6 @@ def download_torrent(torrent_input, task_id, save_path):
         task['seeds'] = 0
         save_task(task_id, task)
 
-    # ---------- Wait for metadata (with timeout) ----------
     meta_deadline = time.time() + METADATA_TIMEOUT_SEC
     last_report = 0
 
@@ -1927,7 +1954,6 @@ def download_torrent(torrent_input, task_id, save_path):
             last_report = now
         time.sleep(1)
 
-    # ---------- Metadata ready ----------
     torrent_name = handle.name()
 
     try:
@@ -1950,7 +1976,6 @@ def download_torrent(torrent_input, task_id, save_path):
     logger.info(f"[Torrent {task_id}] metadata OK — '{torrent_name}', "
                 f"{num_files} file(s), {total_size/1024/1024:.1f} MB")
 
-    # ---------- Download loop with stall detection ----------
     last_done = 0
     last_done_time = time.time()
     last_report = 0
@@ -1994,7 +2019,6 @@ def download_torrent(torrent_input, task_id, save_path):
 
         time.sleep(1)
 
-    # ---------- Finalize ----------
     ses.remove_torrent(handle)
 
     video_exts = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv',
