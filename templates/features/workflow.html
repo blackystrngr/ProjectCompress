@@ -19,6 +19,10 @@
         <button id="wfStopBtn" class="danger" style="display: none;">
             <i class="fas fa-stop"></i> Stop
         </button>
+        <button id="wfResumeBtn" style="display: none;"
+                title="Resume the last failed run from where it stopped">
+            <i class="fas fa-redo"></i> Resume
+        </button>
         <button id="wfImportBtn" title="Import workflow JSON">
             <i class="fas fa-file-import"></i>
         </button>
@@ -313,6 +317,7 @@ let isDirty = false;
 let runningTaskId = null;
 let pollInterval = null;
 let nodeStatuses = {};
+let failedTaskId = null;
 
 let panX = 0, panY = 0, zoom = 1;
 
@@ -338,6 +343,7 @@ const wfLog = $('wfLog');
 const runBtn = $('wfRunBtn');
 const dryRunBtn = $('wfDryRunBtn');
 const stopBtn = $('wfStopBtn');
+const resumeBtn = $('wfResumeBtn');
 const saveBtn = $('wfSaveBtn');
 const exportBtn = $('wfExportBtn');
 const importBtn = $('wfImportBtn');
@@ -408,7 +414,6 @@ function portWorldPos(node, portName, direction) {
     const idx = ports.indexOf(portName);
     if (idx < 0) return null;
     const topPct = portTopPct(ports, portName);
-    // Node height varies — use a fixed approximation
     const nodeH = 90;
     return {
         x: direction === 'in' ? node.x : node.x + NODE_W,
@@ -615,7 +620,6 @@ function renderInspector() {
         html += `</div>`;
     }
 
-    // Comments field
     html += `<label class="wf-field" style="margin-top:0.7rem;">
         <span class="wf-field-label">📝 Comment (internal note)</span>
         <textarea data-field="_comment" rows="2"
@@ -623,7 +627,7 @@ function renderInspector() {
             style="min-height:40px;">${escapeHtml(node._comment || '')}</textarea>
     </label>`;
 
-    if (!node.type.startsWith('trigger.') && NODE_HANDLERS_AVAILABLE(node.type)) {
+    if (!node.type.startsWith('trigger.')) {
         html += `<button class="wf-test-node-btn" id="wfTestSelectedNode">
             <i class="fas fa-vial"></i> Test this node
         </button>`;
@@ -678,11 +682,6 @@ function renderInspector() {
 
     const testBtn = document.getElementById('wfTestSelectedNode');
     if (testBtn) testBtn.addEventListener('click', () => testSelectedNode());
-}
-
-function NODE_HANDLERS_AVAILABLE(type) {
-    // Any non-trigger type has a handler on the server
-    return !type.startsWith('trigger.');
 }
 
 function renderFields(node, fields, isAdvanced) {
@@ -983,7 +982,6 @@ async function testSelectedNode() {
         const data = await r.json();
         if (data.status === 'ok') {
             showToast(`Test OK — ports: ${(data.output_ports || []).join(', ')}`);
-            // Show logs in main log panel
             if (data.logs && data.logs.length) {
                 wfLog.innerHTML = '';
                 data.logs.forEach(appendLogEntry);
@@ -1030,8 +1028,58 @@ function updateToolbarState() {
     exportBtn.disabled = !currentWorkflowId;
 }
 
+function updateResumeButton() {
+    if (!resumeBtn) return;
+    if (failedTaskId && !runningTaskId) {
+        resumeBtn.style.display = '';
+        resumeBtn.disabled = false;
+    } else {
+        resumeBtn.style.display = 'none';
+        resumeBtn.disabled = true;
+    }
+}
+
+if (resumeBtn) {
+    resumeBtn.addEventListener('click', async () => {
+        if (!failedTaskId || runningTaskId) return;
+        resumeBtn.disabled = true;
+        resumeBtn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Resuming…';
+        try {
+            const r = await fetch(`/workflow/resume/${failedTaskId}`,
+                                   { method: 'POST' });
+            const data = await r.json();
+            if (!r.ok) throw new Error(data.error || 'Resume failed');
+
+            failedTaskId = null;
+            try { localStorage.removeItem('wf_failed_task_id'); } catch (e) {}
+
+            runningTaskId = data.task_id;
+            try { localStorage.setItem('wf_last_task_id', runningTaskId); } catch (e) {}
+
+            nodeStatuses = {};
+            wfLog.innerHTML = '';
+            runBtn.disabled = true;
+            dryRunBtn.disabled = true;
+            stopBtn.style.display = '';
+            updateResumeButton();
+            updateToolbarState();
+            renderAll();
+            startPolling(runningTaskId);
+
+            showToast(
+                `Resumed: ${data.completed_items}/${data.total_items} ` +
+                `already done (attempt ${data.resume_attempts})`);
+        } catch (e) {
+            showToast('Resume failed: ' + e.message, true);
+        } finally {
+            resumeBtn.innerHTML = '<i class="fas fa-redo"></i> Resume';
+            updateResumeButton();
+        }
+    });
+}
+
 // ============================================================
-// Save / Load / List
+// Save / Load
 // ============================================================
 async function loadWorkflowList() {
     try {
@@ -1148,6 +1196,9 @@ async function runWorkflow(dryRun) {
         runBtn.disabled = true;
         dryRunBtn.disabled = true;
         stopBtn.style.display = '';
+        failedTaskId = null;
+        try { localStorage.removeItem('wf_failed_task_id'); } catch (e) {}
+        updateResumeButton();
         updateToolbarState();
         renderAll();
         startPolling(runningTaskId);
@@ -1194,7 +1245,6 @@ function startPolling(taskId) {
                 lastLogCount = logs.length;
             }
 
-            // Awaiting input
             const awaiting = t.awaiting_input;
             if (JSON.stringify(awaiting) !== JSON.stringify(lastAwaiting)) {
                 lastAwaiting = awaiting;
@@ -1205,7 +1255,13 @@ function startPolling(taskId) {
                 const idx = (t.current_item_index || 0) + 1;
                 const total = t.total_items || 0;
                 const prefix = t.dry_run ? '[DRY] ' : '';
-                wfStatus.textContent = `${prefix}● Running · item ${idx}/${total}`;
+                const cps = t.checkpoints || {};
+                const done = Object.values(cps).filter(c => c && c.completed).length;
+                const doneStr = done > 0 ? ` · ${done} done` : '';
+                const resumeStr = (t.resume_attempts || 0) > 0
+                    ? ` (resume #${t.resume_attempts})` : '';
+                wfStatus.textContent =
+                    `${prefix}● Running · item ${idx}/${total}${doneStr}${resumeStr}`;
                 wfStatus.style.color = '#5f8fe0';
             } else if (t.status === 'done') {
                 wfStatus.textContent = (t.dry_run ? '[DRY] ' : '') + '✅ Complete';
@@ -1216,11 +1272,18 @@ function startPolling(taskId) {
                 try { localStorage.removeItem('wf_last_task_id'); } catch (e) {}
                 resetRunButtons();
             } else if (t.status === 'error') {
-                wfStatus.textContent = '❌ ' + (t.error_msg || 'Failed');
+                const item = (t.failed_item_index != null)
+                    ? ` at item ${t.failed_item_index + 1}/${t.total_items}`
+                    : '';
+                wfStatus.textContent = '❌ Failed' + item + ' · click Resume';
                 wfStatus.style.color = '#ff8a8a';
                 clearInterval(pollInterval);
                 runningTaskId = null;
                 hideAwaitingUI();
+
+                failedTaskId = taskId;
+                try { localStorage.setItem('wf_failed_task_id', taskId); } catch (e) {}
+
                 try { localStorage.removeItem('wf_last_task_id'); } catch (e) {}
                 resetRunButtons();
             } else if (t.status === 'cancelled') {
@@ -1277,6 +1340,7 @@ function resetRunButtons() {
     runBtn.disabled = false;
     dryRunBtn.disabled = false;
     stopBtn.style.display = 'none';
+    updateResumeButton();
     updateToolbarState();
 }
 
@@ -1310,6 +1374,15 @@ async function loadExistingRun(taskId) {
             dryRunBtn.disabled = true;
             stopBtn.style.display = '';
             startPolling(taskId);
+        } else if (t.status === 'error') {
+            failedTaskId = taskId;
+            try { localStorage.setItem('wf_failed_task_id', taskId); } catch (e) {}
+            const item = (t.failed_item_index != null)
+                ? ` at item ${t.failed_item_index + 1}/${t.total_items}`
+                : '';
+            wfStatus.textContent = '❌ Failed' + item + ' · click Resume';
+            wfStatus.style.color = '#ff8a8a';
+            updateResumeButton();
         }
     } catch (e) { console.error(e); }
 }
@@ -1391,13 +1464,11 @@ $('wfClearLogBtn').addEventListener('click', () => {
     wfLog.innerHTML = '<div class="empty-state">Cleared</div>';
 });
 
-// Export
 exportBtn.addEventListener('click', () => {
     if (!currentWorkflowId) return;
     window.open(`/workflow/export/${currentWorkflowId}`, '_blank');
 });
 
-// Import
 importBtn.addEventListener('click', () => importInput.click());
 importInput.addEventListener('change', async () => {
     const f = importInput.files[0];
@@ -1459,6 +1530,36 @@ $('wfZoomReset').addEventListener('click', () => {
     let lastTaskId = null;
     try { lastTaskId = localStorage.getItem('wf_last_task_id'); } catch (e) {}
     if (lastTaskId) await loadExistingRun(lastTaskId);
+
+    // Restore resume button if a failed task exists
+    let storedFailed = null;
+    try { storedFailed = localStorage.getItem('wf_failed_task_id'); } catch (e) {}
+    if (storedFailed && !runningTaskId) {
+        try {
+            const r = await fetch(`/workflow/resume/info/${storedFailed}`,
+                                   { cache: 'no-store' });
+            if (r.ok) {
+                const info = await r.json();
+                if (info.resumable && info.status === 'error') {
+                    failedTaskId = storedFailed;
+                    const item = (info.failed_item_index != null)
+                        ? ` at item ${info.failed_item_index + 1}/${info.total_items}`
+                        : '';
+                    wfStatus.textContent = '❌ Failed' + item +
+                        ` (${info.completed_items}/${info.total_items} done)` +
+                        ' · click Resume';
+                    wfStatus.style.color = '#ff8a8a';
+                } else {
+                    try { localStorage.removeItem('wf_failed_task_id'); } catch (e) {}
+                }
+            } else {
+                try { localStorage.removeItem('wf_failed_task_id'); } catch (e) {}
+            }
+        } catch (e) {
+            try { localStorage.removeItem('wf_failed_task_id'); } catch (e) {}
+        }
+        updateResumeButton();
+    }
 })();
 
 })();
