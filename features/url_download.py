@@ -22,8 +22,13 @@ Every torrent session enables DHT, LSD, UPnP, NAT-PMP and adds public
 trackers. Metadata fetch has a hard 5-min timeout; download loop has a
 2-min stall detector. No more infinite hangs on dead magnets.
 
-2026-10-22: download_with_ytdlp now accepts title_based=False param.
-When True, the output filename uses %(title)s from yt-dlp.
+yt-dlp robustness (2026-10-22)
+------------------------------
+  - Multi-client extractor fallback (android, web, tv_embedded, ios)
+  - --retries 20, --fragment-retries 20, --retry-sleep 5
+  - --socket-timeout 30, --http-chunk-size 10M
+  - Resumes via .part files (--continue, no --no-part)
+  - title_based=True uses %(title)s in the output filename
 """
 
 import os
@@ -1332,15 +1337,18 @@ def download_direct_file(url, task_id):
 
 
 # ============================================================
-# YT-DLP DOWNLOADER
+# YT-DLP DOWNLOADER — robust, resumable, title-aware
 # ============================================================
 def download_with_ytdlp(url, task_id, quality='best', title_based=False):
     """
     Download a single URL via yt-dlp.
 
-    When title_based=True, the output filename uses %(title)s from yt-dlp
-    so videos get meaningful names like "Rick Astley - Never Gonna Give You
-    Up.mp4" instead of "watch.mp4".
+    Args:
+        url:         Video URL
+        task_id:     Task identifier (for progress + cancellation)
+        quality:     best|2160p|1440p|1080p|720p|480p|360p|audio
+        title_based: If True, output filename uses %(title)s from yt-dlp
+                     instead of watch.mp4. Titles are sanitized and byte-truncated.
     """
     task = load_task(task_id)
     if not task:
@@ -1362,7 +1370,7 @@ def download_with_ytdlp(url, task_id, quality='best', title_based=False):
 
     format_choice = QUALITY_MAP.get(quality, QUALITY_MAP['best'])
 
-    # ── Output template: title-based or ID-based ──
+    # Output template: title-based (readable) or ID-based (safe fallback)
     if title_based:
         output_template = os.path.join(
             UPLOAD_FOLDER, f"{task_id}_dl.%(title).150B.%(ext)s")
@@ -1377,26 +1385,24 @@ def download_with_ytdlp(url, task_id, quality='best', title_based=False):
         '--merge-output-format', 'mp4',
         '--no-mtime', '--no-warnings', '--ignore-errors',
         '--impersonate', 'chrome',
-        # Multi-client fallback — mweb alone is unstable lately
+        # Multi-client fallback — mweb alone is unstable
         '--extractor-args',
         'youtube:player_client=android,web,tv_embedded,ios',
         '--extractor-args', 'generic:impersonate',
         '--ffmpeg-location', ffmpeg_path,
         '--newline', '--progress', '--no-colors',
         '--concurrent-fragments', '1',
-        # Much more patient with flaky connections
+        # Patient retry policy for flaky CDN connections
         '--retries', '20',
         '--fragment-retries', '20',
         '--retry-sleep', '5',
         '--socket-timeout', '30',
         '--http-chunk-size', '10M',
-        # Keep .part files so retries resume instead of restarting
+        # Resume .part files between retries
         '--continue',
         '--no-playlist',
     ]
-    
 
-  
     if os.path.exists(COOKIES_FILE):
         cmd += ['--cookies', COOKIES_FILE]
 
@@ -1473,7 +1479,11 @@ def download_with_ytdlp(url, task_id, quality='best', title_based=False):
     if process.returncode != 0:
         full_output = ''.join(output_lines)
         logger.error(f"yt-dlp failed (code {process.returncode}):\n{full_output[-3000:]}")
-        raise Exception(f"yt-dlp failed: {full_output[-500:]}")
+        # Extract the useful error line if present
+        err_lines = [l.strip() for l in full_output.splitlines()
+                     if 'ERROR' in l]
+        err_text = '\n'.join(err_lines) if err_lines else full_output[-500:]
+        raise Exception(f"yt-dlp failed: {err_text}")
 
     # ── Locate output file (filter merge fragments) ──
     prefix = f"{task_id}_dl."
@@ -1481,6 +1491,7 @@ def download_with_ytdlp(url, task_id, quality='best', title_based=False):
     if not all_files:
         raise Exception("No output file found.")
 
+    # Exclude intermediate fragments like <taskid>_dl.f137.mp4
     final_files = [f for f in all_files if not re.search(r'\.f\d+\.', f)]
     if not final_files:
         final_files = all_files
@@ -1507,11 +1518,14 @@ def download_with_ytdlp(url, task_id, quality='best', title_based=False):
             pass
         raise Exception("Downloaded file has no video stream.")
 
-    # ── Choose final filename ──
+    # ── Build final filename ──
     if title_based:
+        # Strip "<taskid>_dl." prefix to recover the raw title from yt-dlp
         raw_title = chosen[len(prefix):]
         base_name = re.sub(r'\.mp4$', '', raw_title, flags=re.IGNORECASE)
+        # Sanitize anything yt-dlp might have missed
         base_name = re.sub(r'[/\\:*?"<>|]', '_', base_name)
+        # Byte-safe truncation for extreme Unicode titles
         if len(base_name.encode('utf-8')) > 200:
             base_name = base_name.encode('utf-8')[:200].decode(
                 'utf-8', errors='ignore')
@@ -1543,7 +1557,7 @@ def download_with_ytdlp(url, task_id, quality='best', title_based=False):
 
 
 # ============================================================
-# PLAYLIST DOWNLOADER
+# PLAYLIST DOWNLOADER — robust, resumable
 # ============================================================
 def download_playlist(url, task_id, quality='best', range_start=1, range_end=0):
     task = load_task(task_id)
@@ -1605,6 +1619,7 @@ def download_playlist(url, task_id, quality='best', range_start=1, range_end=0):
         '--yes-playlist',
         '--download-archive', archive_file,
     ]
+
     if range_start > 1 or range_end > 0:
         items = f"{range_start}-{range_end}" if range_end > 0 else f"{range_start}-"
         cmd += ['--playlist-items', items]
