@@ -95,6 +95,8 @@ def get_active_tasks():
     visible = []
     with _task_cache_lock:
         for tid, task in _task_cache.items():
+            if task.get('_hidden'):            # ← NEW: filter internal sub-tasks
+                continue
             status = task.get('status')
             if status in _HIDDEN_STATUSES:
                 continue
