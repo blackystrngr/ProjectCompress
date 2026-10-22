@@ -13,15 +13,24 @@
         <button id="wfNewBtn" title="New workflow"><i class="fas fa-plus"></i></button>
         <button id="wfSaveBtn"><i class="fas fa-save"></i> Save</button>
         <button id="wfRunBtn" class="primary"><i class="fas fa-play"></i> Run</button>
+        <button id="wfDryRunBtn" title="Preview without side effects">
+            <i class="fas fa-flask"></i> Dry Run
+        </button>
         <button id="wfStopBtn" class="danger" style="display: none;">
             <i class="fas fa-stop"></i> Stop
         </button>
+        <button id="wfImportBtn" title="Import workflow JSON">
+            <i class="fas fa-file-import"></i>
+        </button>
+        <button id="wfExportBtn" title="Export as JSON" disabled>
+            <i class="fas fa-file-export"></i>
+        </button>
+        <input type="file" id="wfImportInput" accept=".json" style="display:none;">
         <span id="wfStatus" style="margin-left: auto; font-size: 0.8rem; color: #8a9bc0;"></span>
     </div>
     <div style="margin-top: 0.35rem; font-size: 0.72rem; color: #6b7a9c;">
         <i class="fas fa-info-circle"></i>
-        Drag nodes · Drag <b>●</b> port to <b>●</b> port to connect ·
-        Click wire to delete · Delete key removes selected node
+        Drag nodes · Connect <b>●</b> port → <b>●</b> port · Click wire to delete · Scroll to zoom · Delete removes selected
     </div>
 </div>
 
@@ -40,9 +49,9 @@
                 <div id="wfNodes" class="wf-nodes"></div>
             </div>
             <div class="wf-zoom-controls">
-                <button id="wfZoomIn" title="Zoom in"><i class="fas fa-plus"></i></button>
-                <button id="wfZoomOut" title="Zoom out"><i class="fas fa-minus"></i></button>
-                <button id="wfZoomReset" title="Reset view"><i class="fas fa-expand"></i></button>
+                <button id="wfZoomIn"><i class="fas fa-plus"></i></button>
+                <button id="wfZoomOut"><i class="fas fa-minus"></i></button>
+                <button id="wfZoomReset"><i class="fas fa-expand"></i></button>
             </div>
             <div id="wfHint" class="wf-hint">Add a trigger node to begin</div>
         </div>
@@ -58,6 +67,19 @@
     </div>
 </div>
 
+<div class="card" id="wfAwaitingCard" style="display:none; border: 1px solid #f59e0b;">
+    <h3 style="color:#f59e0b; font-size: 1rem; margin-bottom: 0.5rem;">
+        <i class="fas fa-user-check"></i> Awaiting Approval
+    </h3>
+    <div id="wfAwaitingMessage" style="margin-bottom: 0.7rem; font-size: 0.9rem;"></div>
+    <button id="wfApproveBtn" class="primary" style="margin-right: 0.5rem;">
+        <i class="fas fa-check"></i> Approve
+    </button>
+    <button id="wfRejectBtn" class="danger">
+        <i class="fas fa-times"></i> Reject
+    </button>
+</div>
+
 <div class="card">
     <h2 style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem;">
         <span><i class="fas fa-terminal"></i> Execution Log</span>
@@ -68,14 +90,24 @@
          background: rgba(10, 14, 24, 0.6); border-radius: 0.5rem; padding: 0.5rem;">
         <div class="empty-state">Not running</div>
     </div>
+    <div style="margin-top: 0.5rem;">
+        <button id="wfContextBtn" style="padding: 0.25rem 0.7rem; font-size: 0.7rem;">
+            <i class="fas fa-eye"></i> View Context
+        </button>
+        <div id="wfContextPanel" style="display:none; margin-top: 0.5rem;
+             background: rgba(10,14,24,0.8); border-radius: 0.5rem; padding: 0.6rem;
+             font-family: 'JetBrains Mono', monospace; font-size: 0.72rem;
+             max-height: 300px; overflow-y: auto; white-space: pre-wrap;">
+        </div>
+    </div>
 </div>
 
 <style>
 .wf-layout { display: grid; grid-template-columns: 220px 1fr 320px;
-             gap: 0.6rem; margin-bottom: 0.6rem; min-height: 680px; }
+             gap: 0.6rem; margin-bottom: 0.6rem; min-height: 700px; }
 .wf-panel { background: rgba(18, 22, 35, 0.8);
             border: 1px solid rgba(80, 100, 140, 0.3); border-radius: 1rem;
-            overflow: hidden; display: flex; flex-direction: column; max-height: 680px; }
+            overflow: hidden; display: flex; flex-direction: column; max-height: 700px; }
 .wf-panel-header { padding: 0.6rem 0.9rem; font-size: 0.78rem; font-weight: 600;
                    color: #b0c4ff; text-transform: uppercase;
                    letter-spacing: 0.04em;
@@ -88,7 +120,7 @@
 .wf-canvas-container { position: relative; border-radius: 1rem; overflow: hidden;
                        background: rgba(10, 14, 24, 0.9);
                        border: 1px solid rgba(80, 100, 140, 0.3); }
-.wf-viewport { position: relative; width: 100%; height: 100%; min-height: 680px;
+.wf-viewport { position: relative; width: 100%; height: 100%; min-height: 700px;
                overflow: hidden; cursor: grab;
                background-color: #0a0e18;
                background-image:
@@ -105,7 +137,7 @@
 .wf-nodes { position: absolute; top: 0; left: 0; width: 100%; height: 100%;
             pointer-events: none; }
 
-.wf-node { position: absolute; width: 240px; height: 90px;
+.wf-node { position: absolute; width: 240px; min-height: 90px;
            background: linear-gradient(135deg, rgba(25, 30, 45, 0.95), rgba(18, 22, 35, 0.95));
            border: 1px solid rgba(80, 100, 140, 0.5); border-left-width: 4px;
            border-radius: 0.7rem; padding: 0.6rem 0.8rem;
@@ -155,9 +187,13 @@
 .wf-port.drop-target { transform: translateY(-50%) scale(1.5);
                        background: #4ade80 !important;
                        box-shadow: 0 0 16px rgba(74, 222, 128, 1) !important; }
-.wf-port-label { position: absolute; font-size: 0.6rem; color: #8a9bc0;
-                 pointer-events: none; transform: translateY(-50%);
-                 font-family: 'JetBrains Mono', monospace; }
+.wf-port-label { position: absolute; right: 18px; font-size: 0.58rem;
+                 color: #8a9bc0; pointer-events: none;
+                 top: 50%; transform: translateY(-50%);
+                 font-family: 'JetBrains Mono', monospace;
+                 background: rgba(10, 14, 24, 0.85); padding: 1px 4px;
+                 border-radius: 3px; }
+.wf-port-in .wf-port-label { right: auto; left: 18px; }
 
 .wf-wire-hit { fill: none; stroke: transparent; stroke-width: 18;
                pointer-events: stroke; cursor: pointer; }
@@ -214,13 +250,18 @@
 .wf-advanced-fields { display: none; padding-top: 0.3rem;
                       border-top: 1px solid rgba(80, 100, 140, 0.2); }
 .wf-advanced-fields.open { display: block; }
-.wf-delete-node-btn { width: 100%; padding: 0.45rem; margin-top: 0.5rem;
-                      background: rgba(180, 40, 40, 0.25);
-                      border: 1px solid rgba(239, 68, 68, 0.4);
-                      border-radius: 0.4rem; color: #ff8a8a;
+.wf-delete-node-btn, .wf-test-node-btn { width: 100%; padding: 0.45rem;
+                      margin-top: 0.5rem; border-radius: 0.4rem;
                       font-size: 0.75rem; font-family: inherit;
                       cursor: pointer; transition: all 0.15s; }
+.wf-delete-node-btn { background: rgba(180, 40, 40, 0.25);
+                      border: 1px solid rgba(239, 68, 68, 0.4);
+                      color: #ff8a8a; }
 .wf-delete-node-btn:hover { background: rgba(200, 50, 50, 0.4); border-color: #ef4444; }
+.wf-test-node-btn { background: rgba(95, 143, 224, 0.2);
+                    border: 1px solid rgba(95, 143, 224, 0.4);
+                    color: #b0c4ff; }
+.wf-test-node-btn:hover { background: rgba(95, 143, 224, 0.35); border-color: #5f8fe0; }
 
 .wf-zoom-controls { position: absolute; bottom: 0.8rem; right: 0.8rem;
                     display: flex; gap: 0.3rem; z-index: 100; }
@@ -261,7 +302,6 @@
 'use strict';
 
 const NODE_W = 240;
-const NODE_H = 90;
 const MIN_ZOOM = 0.3, MAX_ZOOM = 2.5;
 const DRAG_THRESHOLD = 3;
 
@@ -296,8 +336,12 @@ const wfStatus = $('wfStatus');
 const wfHint = $('wfHint');
 const wfLog = $('wfLog');
 const runBtn = $('wfRunBtn');
+const dryRunBtn = $('wfDryRunBtn');
 const stopBtn = $('wfStopBtn');
 const saveBtn = $('wfSaveBtn');
+const exportBtn = $('wfExportBtn');
+const importBtn = $('wfImportBtn');
+const importInput = $('wfImportInput');
 
 // ============================================================
 // Utils
@@ -327,7 +371,7 @@ function worldCenterOfViewport() {
     const r = viewport.getBoundingClientRect();
     return {
         x: (r.width / 2 - panX) / zoom - NODE_W / 2,
-        y: (r.height / 2 - panY) / zoom - NODE_H / 2,
+        y: (r.height / 2 - panY) / zoom - 90,
     };
 }
 function zoomAt(factor, clientX, clientY) {
@@ -344,26 +388,31 @@ function zoomAt(factor, clientX, clientY) {
 }
 
 // ============================================================
-// Node port helpers
+// Port helpers
 // ============================================================
 function nodePorts(node) {
     const meta = NODE_TYPES[node.type];
     if (!meta || !meta.ports) return { in: ['in'], out: ['out'] };
-    return {
-        in: meta.ports.in || [],
-        out: meta.ports.out || [],
-    };
+    return { in: meta.ports.in || [], out: meta.ports.out || [] };
+}
+
+function portTopPct(portList, portName) {
+    const idx = portList.indexOf(portName);
+    if (idx < 0) return 50;
+    if (portList.length === 1) return 50;
+    return (idx + 1) * 100 / (portList.length + 1);
 }
 
 function portWorldPos(node, portName, direction) {
     const ports = direction === 'in' ? nodePorts(node).in : nodePorts(node).out;
     const idx = ports.indexOf(portName);
     if (idx < 0) return null;
-    const total = ports.length;
-    const topPct = total === 1 ? 50 : (idx + 1) * 100 / (total + 1);
+    const topPct = portTopPct(ports, portName);
+    // Node height varies — use a fixed approximation
+    const nodeH = 90;
     return {
         x: direction === 'in' ? node.x : node.x + NODE_W,
-        y: node.y + (NODE_H * topPct / 100),
+        y: node.y + (nodeH * topPct / 100),
     };
 }
 
@@ -413,16 +462,25 @@ function nodeSummary(type, config) {
     if (type === 'action.download_file') return 'direct file';
     if (type === 'action.telegram_send') return config.chat_link || 'no chat';
     if (type === 'action.drive_upload') return 'account: ' + (config.account || 'default');
-    if (type === 'action.compress') return `${config.codec || 'x265'} · ${config.resolution || 720}p · crf ${config.crf || 27}`;
+    if (type === 'action.compress') return `${config.codec || 'x265'} · ${config.resolution || 720}p`;
     if (type === 'action.delete_local') return 'delete file';
     if (type === 'action.delete_drive') return 'delete from Drive';
-    if (type === 'action.wait') return `${config.seconds || 5}s${config.jitter ? '+' + config.jitter + 's' : ''}`;
+    if (type === 'action.wait') return `${config.seconds || 5}s`;
     if (type === 'action.webhook') return config.url ? config.url.slice(0, 40) : 'no url';
-    if (type === 'action.extract_metadata') return 'ffprobe metadata';
-    if (type === 'logic.condition') return (config.expression || '').slice(0, 40);
+    if (type === 'action.extract_metadata') return 'ffprobe';
+    if (type === 'action.sub_workflow') return '→ ' + (config.workflow_id || '?');
+    if (type === 'action.user_input') return (config.message || 'Approve?').slice(0, 30);
+    if (type === 'action.json_parse') return `${config.source || '?'} → vars.${config.into_var || '?'}`;
+    if (type === 'action.string_ops') return `${config.operation || 'lower'} → ${config.target || '?'}`;
+    if (type === 'action.assert') return (config.expression || '?').slice(0, 30);
+    if (type === 'action.http_fetch') return (config.url || '?').slice(0, 35);
+    if (type === 'action.log') return `[${config.level || 'info'}] ${(config.message || '').slice(0, 25)}`;
+    if (type === 'logic.condition') return (config.expression || '').slice(0, 30);
     if (type === 'logic.switch') return `${config.expression || '?'} → ${(config.cases || '').split(',').length} case(s)`;
     if (type === 'logic.merge') return config.mode || 'all';
-    if (type === 'data.transform') return `${config.target || '?'} = ${(config.expression || '').slice(0, 30)}`;
+    if (type === 'logic.fork') return '3 parallel branches';
+    if (type === 'logic.delay_until') return config.target_time || '?';
+    if (type === 'data.transform') return `${config.target || '?'} = ${(config.expression || '').slice(0, 25)}`;
     if (type === 'data.set_variable') return `vars[${config.name || '?'}]`;
     return '';
 }
@@ -448,21 +506,26 @@ function renderNodes() {
 
         let portsHtml = '';
         ports.in.forEach((port, i) => {
-            const topPct = ports.in.length === 1 ? 50 : (i + 1) * 100 / (ports.in.length + 1);
+            const topPct = portTopPct(ports.in, port);
             portsHtml += `<div class="wf-port wf-port-in"
                 data-node-id="${node.id}" data-port="${port}" data-direction="in"
-                style="top:${topPct}%;" title="input: ${port}"></div>`;
+                style="top:${topPct}%;" title="input: ${port}">
+                ${ports.in.length > 1 ? `<span class="wf-port-label">${escapeHtml(port)}</span>` : ''}
+            </div>`;
         });
         ports.out.forEach((port, i) => {
-            const topPct = ports.out.length === 1 ? 50 : (i + 1) * 100 / (ports.out.length + 1);
+            const topPct = portTopPct(ports.out, port);
             let color = '#5f8fe0';
-            if (port === 'true') color = '#4ade80';
-            else if (port === 'false') color = '#ef4444';
-            else if (port === 'default') color = '#8a9bc0';
+            if (port === 'true' || port === 'approved') color = '#4ade80';
+            else if (port === 'false' || port === 'rejected') color = '#ef4444';
+            else if (port === 'default' || port === 'timeout') color = '#8a9bc0';
+            else if (port === 'a' || port === 'b' || port === 'c') color = '#a78bfa';
             portsHtml += `<div class="wf-port wf-port-out"
                 data-node-id="${node.id}" data-port="${port}" data-direction="out"
                 style="top:${topPct}%; border-color:${color};"
-                title="output: ${port}"></div>`;
+                title="output: ${port}">
+                ${ports.out.length > 1 ? `<span class="wf-port-label">${escapeHtml(port)}</span>` : ''}
+            </div>`;
         });
 
         html += `<div class="wf-node ${status} ${selectedNodeId === node.id ? 'selected' : ''}"
@@ -493,9 +556,10 @@ function renderWires() {
         if (!p1 || !p2) return;
 
         let color = NODE_TYPES[from.type]?.color || '#5f8fe0';
-        if (fromPort === 'true') color = '#4ade80';
-        else if (fromPort === 'false') color = '#ef4444';
-        else if (fromPort === 'default') color = '#8a9bc0';
+        if (fromPort === 'true' || fromPort === 'approved') color = '#4ade80';
+        else if (fromPort === 'false' || fromPort === 'rejected') color = '#ef4444';
+        else if (fromPort === 'default' || fromPort === 'timeout') color = '#8a9bc0';
+        else if (['a', 'b', 'c'].includes(fromPort)) color = '#a78bfa';
 
         const d = wirePath(p1.x, p1.y, p2.x, p2.y);
         html += `<g class="wf-wire-group" data-edge-idx="${idx}">
@@ -540,19 +604,30 @@ function renderInspector() {
     </div>`;
     html += `<div class="wf-inspector-desc">${escapeHtml(meta.description || '')}</div>`;
 
-    // Basic fields
     html += renderFields(node, meta.fields || [], false);
 
-    // Advanced fields
     if (meta.advanced_fields && meta.advanced_fields.length) {
         html += `<div class="wf-advanced-toggle" id="wfAdvToggle">
-            <i class="fas fa-chevron-right"></i> Advanced (retry, errors)
+            <i class="fas fa-chevron-right"></i> Advanced
         </div>
         <div class="wf-advanced-fields" id="wfAdvFields">`;
         html += renderFields(node, meta.advanced_fields, true);
         html += `</div>`;
     }
 
+    // Comments field
+    html += `<label class="wf-field" style="margin-top:0.7rem;">
+        <span class="wf-field-label">📝 Comment (internal note)</span>
+        <textarea data-field="_comment" rows="2"
+            placeholder="Optional note, not used in execution"
+            style="min-height:40px;">${escapeHtml(node._comment || '')}</textarea>
+    </label>`;
+
+    if (!node.type.startsWith('trigger.') && NODE_HANDLERS_AVAILABLE(node.type)) {
+        html += `<button class="wf-test-node-btn" id="wfTestSelectedNode">
+            <i class="fas fa-vial"></i> Test this node
+        </button>`;
+    }
     html += `<button class="wf-delete-node-btn" id="wfDeleteSelectedNode">
         <i class="fas fa-trash-alt"></i> Delete node
     </button>`;
@@ -561,14 +636,27 @@ function renderInspector() {
 
     inspectorEl.querySelectorAll('[data-field]').forEach(el => {
         el.addEventListener('input', () => {
-            if (!node.config) node.config = {};
+            const field = el.dataset.field;
             if (el.type === 'checkbox') {
-                node.config[el.dataset.field] = el.checked;
+                if (field === '_comment') node._comment = el.checked;
+                else {
+                    if (!node.config) node.config = {};
+                    node.config[field] = el.checked;
+                }
             } else if (el.type === 'number') {
                 const n = parseFloat(el.value);
-                node.config[el.dataset.field] = isNaN(n) ? el.value : n;
+                const v = isNaN(n) ? el.value : n;
+                if (field === '_comment') node._comment = v;
+                else {
+                    if (!node.config) node.config = {};
+                    node.config[field] = v;
+                }
             } else {
-                node.config[el.dataset.field] = el.value;
+                if (field === '_comment') node._comment = el.value;
+                else {
+                    if (!node.config) node.config = {};
+                    node.config[field] = el.value;
+                }
             }
             markDirty();
             renderNodes();
@@ -587,6 +675,14 @@ function renderInspector() {
 
     const delBtn = document.getElementById('wfDeleteSelectedNode');
     if (delBtn) delBtn.addEventListener('click', () => deleteNode(selectedNodeId));
+
+    const testBtn = document.getElementById('wfTestSelectedNode');
+    if (testBtn) testBtn.addEventListener('click', () => testSelectedNode());
+}
+
+function NODE_HANDLERS_AVAILABLE(type) {
+    // Any non-trigger type has a handler on the server
+    return !type.startsWith('trigger.');
 }
 
 function renderFields(node, fields, isAdvanced) {
@@ -643,6 +739,7 @@ function renderAll() {
     renderNodes();
     renderWires();
     renderInspector();
+    exportBtn.disabled = !currentWorkflowId;
 }
 
 // ============================================================
@@ -683,16 +780,12 @@ function attachNodeEvents() {
             const portName = port.dataset.port;
             const node = nodeById(nodeId);
             if (!node) return;
-
             const pos = portWorldPos(node, portName, 'out');
             if (!pos) return;
-
             wireSource = { nodeId, port: portName, x: pos.x, y: pos.y };
             mode = 'dragging-wire';
             viewport.classList.add('wire-mode');
-
             nodesEl.querySelectorAll('.wf-port-in').forEach(p => p.classList.add('drop-target'));
-
             wireTempEl = document.createElementNS('http://www.w3.org/2000/svg', 'path');
             wireTempEl.setAttribute('class', 'wf-wire-temp');
             wiresEl.appendChild(wireTempEl);
@@ -803,9 +896,7 @@ function portUnderCursor(clientX, clientY) {
 }
 
 function createEdge(fromId, fromPort, toId) {
-    // Remove existing edges from same source port (1 out per port)
     edges = edges.filter(e => !(e.from === fromId && (e.from_port || 'out') === fromPort));
-    // For non-merge targets, remove existing incoming edges
     const toNode = nodeById(toId);
     if (toNode && toNode.type !== 'logic.merge') {
         edges = edges.filter(e => e.to !== toId);
@@ -846,7 +937,6 @@ function addNodeFromPalette(type) {
     nodes.push(node);
     selectedNodeId = node.id;
 
-    // Auto-connect if only one existing node and it's a trigger
     if (nodes.length >= 2 && !type.startsWith('trigger.')) {
         const trigger = nodes.find(n => n.type.startsWith('trigger.'));
         if (trigger && !edges.some(e => e.from === trigger.id) && nodes.length === 2) {
@@ -868,6 +958,53 @@ function deleteNode(nodeId) {
     renderAll();
 }
 
+async function testSelectedNode() {
+    const node = nodeById(selectedNodeId);
+    if (!node) return;
+    if (node.type.startsWith('trigger.')) {
+        showToast('Cannot test a trigger node', true);
+        return;
+    }
+    const testBtn = document.getElementById('wfTestSelectedNode');
+    if (testBtn) {
+        testBtn.disabled = true;
+        testBtn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Testing…';
+    }
+    try {
+        const r = await fetch('/workflow/test_node', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                type: node.type,
+                config: node.config || {},
+                dry_run: true,
+            })
+        });
+        const data = await r.json();
+        if (data.status === 'ok') {
+            showToast(`Test OK — ports: ${(data.output_ports || []).join(', ')}`);
+            // Show logs in main log panel
+            if (data.logs && data.logs.length) {
+                wfLog.innerHTML = '';
+                data.logs.forEach(appendLogEntry);
+            }
+        } else {
+            showToast('Test failed: ' + (data.error || 'unknown'), true);
+            if (data.logs && data.logs.length) {
+                wfLog.innerHTML = '';
+                data.logs.forEach(appendLogEntry);
+            }
+        }
+    } catch (e) {
+        showToast('Test error: ' + e.message, true);
+    } finally {
+        if (testBtn) {
+            testBtn.disabled = false;
+            testBtn.innerHTML = '<i class="fas fa-vial"></i> Test this node';
+        }
+    }
+}
+
 document.addEventListener('keydown', (e) => {
     const tag = document.activeElement.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
@@ -879,7 +1016,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 // ============================================================
-// Dirty state
+// Dirty / status
 // ============================================================
 function markDirty() { isDirty = true; updateToolbarState(); }
 function updateToolbarState() {
@@ -890,10 +1027,11 @@ function updateToolbarState() {
     else if (currentWorkflowId) s = '● Saved';
     wfStatus.textContent = nameStr + (s ? '  ·  ' + s : '');
     wfStatus.style.color = runningTaskId ? '#5f8fe0' : isDirty ? '#f59e0b' : '#8a9bc0';
+    exportBtn.disabled = !currentWorkflowId;
 }
 
 // ============================================================
-// Save / Load
+// Save / Load / List
 // ============================================================
 async function loadWorkflowList() {
     try {
@@ -936,10 +1074,14 @@ async function saveWorkflow() {
     const payload = {
         id: currentWorkflowId || undefined,
         name: wfName.value || 'Untitled',
-        nodes: nodes.map(n => ({
-            id: n.id, type: n.type, config: n.config || {},
-            x: Math.round(n.x), y: Math.round(n.y),
-        })),
+        nodes: nodes.map(n => {
+            const out = {
+                id: n.id, type: n.type, config: n.config || {},
+                x: Math.round(n.x), y: Math.round(n.y),
+            };
+            if (n._comment) out._comment = n._comment;
+            return out;
+        }),
         edges: edges.map(e => ({ from: e.from, from_port: e.from_port || 'out', to: e.to })),
     };
     saveBtn.disabled = true;
@@ -967,9 +1109,9 @@ async function saveWorkflow() {
 }
 
 // ============================================================
-// Run / Stop / Poll
+// Run / Stop / Dry Run
 // ============================================================
-async function runWorkflow() {
+async function runWorkflow(dryRun) {
     if (runningTaskId) return;
     if (!nodes.length) { showToast('Empty workflow', true); return; }
     if (!nodes.some(n => n.type.startsWith('trigger.'))) {
@@ -979,11 +1121,16 @@ async function runWorkflow() {
 
     const payload = {
         name: wfName.value || 'Untitled',
-        nodes: nodes.map(n => ({
-            id: n.id, type: n.type, config: n.config || {},
-            x: Math.round(n.x), y: Math.round(n.y),
-        })),
+        nodes: nodes.map(n => {
+            const out = {
+                id: n.id, type: n.type, config: n.config || {},
+                x: Math.round(n.x), y: Math.round(n.y),
+            };
+            if (n._comment) out._comment = n._comment;
+            return out;
+        }),
         edges: edges.map(e => ({ from: e.from, from_port: e.from_port || 'out', to: e.to })),
+        dry_run: !!dryRun,
     };
 
     try {
@@ -999,6 +1146,7 @@ async function runWorkflow() {
         nodeStatuses = {};
         wfLog.innerHTML = '';
         runBtn.disabled = true;
+        dryRunBtn.disabled = true;
         stopBtn.style.display = '';
         updateToolbarState();
         renderAll();
@@ -1020,6 +1168,7 @@ function startPolling(taskId) {
     if (pollInterval) clearInterval(pollInterval);
     let lastLogCount = 0;
     let lastStatusesJSON = '';
+    let lastAwaiting = null;
 
     const tick = async () => {
         try {
@@ -1045,16 +1194,25 @@ function startPolling(taskId) {
                 lastLogCount = logs.length;
             }
 
+            // Awaiting input
+            const awaiting = t.awaiting_input;
+            if (JSON.stringify(awaiting) !== JSON.stringify(lastAwaiting)) {
+                lastAwaiting = awaiting;
+                updateAwaitingUI(taskId, awaiting);
+            }
+
             if (t.status === 'running') {
                 const idx = (t.current_item_index || 0) + 1;
                 const total = t.total_items || 0;
-                wfStatus.textContent = `● Running · item ${idx}/${total}`;
+                const prefix = t.dry_run ? '[DRY] ' : '';
+                wfStatus.textContent = `${prefix}● Running · item ${idx}/${total}`;
                 wfStatus.style.color = '#5f8fe0';
             } else if (t.status === 'done') {
-                wfStatus.textContent = '✅ Complete';
+                wfStatus.textContent = (t.dry_run ? '[DRY] ' : '') + '✅ Complete';
                 wfStatus.style.color = '#4ade80';
                 clearInterval(pollInterval);
                 runningTaskId = null;
+                hideAwaitingUI();
                 try { localStorage.removeItem('wf_last_task_id'); } catch (e) {}
                 resetRunButtons();
             } else if (t.status === 'error') {
@@ -1062,6 +1220,7 @@ function startPolling(taskId) {
                 wfStatus.style.color = '#ff8a8a';
                 clearInterval(pollInterval);
                 runningTaskId = null;
+                hideAwaitingUI();
                 try { localStorage.removeItem('wf_last_task_id'); } catch (e) {}
                 resetRunButtons();
             } else if (t.status === 'cancelled') {
@@ -1069,6 +1228,7 @@ function startPolling(taskId) {
                 wfStatus.style.color = '#f59e0b';
                 clearInterval(pollInterval);
                 runningTaskId = null;
+                hideAwaitingUI();
                 try { localStorage.removeItem('wf_last_task_id'); } catch (e) {}
                 resetRunButtons();
             }
@@ -1078,8 +1238,44 @@ function startPolling(taskId) {
     pollInterval = setInterval(tick, 1000);
 }
 
+function updateAwaitingUI(taskId, awaiting) {
+    const card = document.getElementById('wfAwaitingCard');
+    const msg = document.getElementById('wfAwaitingMessage');
+    if (!awaiting) { hideAwaitingUI(); return; }
+    card.style.display = 'block';
+    msg.textContent = awaiting.message || 'Approve?';
+    card.dataset.taskId = taskId;
+}
+
+function hideAwaitingUI() {
+    document.getElementById('wfAwaitingCard').style.display = 'none';
+}
+
+document.getElementById('wfApproveBtn').addEventListener('click', () => {
+    respondToInput('approve');
+});
+document.getElementById('wfRejectBtn').addEventListener('click', () => {
+    respondToInput('reject');
+});
+async function respondToInput(response) {
+    const card = document.getElementById('wfAwaitingCard');
+    const taskId = card.dataset.taskId;
+    if (!taskId) return;
+    try {
+        await fetch(`/workflow/input/${taskId}`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ response })
+        });
+        showToast(response === 'approve' ? 'Approved' : 'Rejected');
+    } catch (e) {
+        showToast('Failed: ' + e.message, true);
+    }
+}
+
 function resetRunButtons() {
     runBtn.disabled = false;
+    dryRunBtn.disabled = false;
     stopBtn.style.display = 'none';
     updateToolbarState();
 }
@@ -1107,14 +1303,40 @@ async function loadExistingRun(taskId) {
         (t.logs || []).forEach(appendLogEntry);
         wfLog.scrollTop = wfLog.scrollHeight;
         renderNodes();
+        if (t.awaiting_input) updateAwaitingUI(taskId, t.awaiting_input);
         if (t.status === 'running') {
             runningTaskId = taskId;
             runBtn.disabled = true;
+            dryRunBtn.disabled = true;
             stopBtn.style.display = '';
             startPolling(taskId);
         }
     } catch (e) { console.error(e); }
 }
+
+// ============================================================
+// Context inspector
+// ============================================================
+document.getElementById('wfContextBtn').addEventListener('click', async () => {
+    const panel = document.getElementById('wfContextPanel');
+    if (panel.style.display === 'block') {
+        panel.style.display = 'none';
+        return;
+    }
+    if (!runningTaskId) {
+        panel.style.display = 'block';
+        panel.textContent = 'No active workflow';
+        return;
+    }
+    try {
+        const r = await fetch(`/workflow/context/${runningTaskId}`);
+        const data = await r.json();
+        panel.style.display = 'block';
+        panel.textContent = JSON.stringify(data, null, 2);
+    } catch (e) {
+        panel.textContent = 'Error: ' + e.message;
+    }
+});
 
 // ============================================================
 // Toolbar wiring
@@ -1162,10 +1384,42 @@ $('wfNewBtn').addEventListener('click', () => {
 });
 
 saveBtn.addEventListener('click', saveWorkflow);
-runBtn.addEventListener('click', runWorkflow);
+runBtn.addEventListener('click', () => runWorkflow(false));
+dryRunBtn.addEventListener('click', () => runWorkflow(true));
 stopBtn.addEventListener('click', stopWorkflow);
 $('wfClearLogBtn').addEventListener('click', () => {
     wfLog.innerHTML = '<div class="empty-state">Cleared</div>';
+});
+
+// Export
+exportBtn.addEventListener('click', () => {
+    if (!currentWorkflowId) return;
+    window.open(`/workflow/export/${currentWorkflowId}`, '_blank');
+});
+
+// Import
+importBtn.addEventListener('click', () => importInput.click());
+importInput.addEventListener('change', async () => {
+    const f = importInput.files[0];
+    if (!f) return;
+    try {
+        const text = await f.text();
+        const data = JSON.parse(text);
+        const r = await fetch('/workflow/import', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(data),
+        });
+        const result = await r.json();
+        if (!r.ok) throw new Error(result.error || 'Import failed');
+        showToast(`Imported: ${result.name}`);
+        await loadWorkflowList();
+        await loadWorkflow(result.id);
+    } catch (e) {
+        showToast('Import failed: ' + e.message, true);
+    } finally {
+        importInput.value = '';
+    }
 });
 
 $('wfZoomIn').addEventListener('click', () => {
