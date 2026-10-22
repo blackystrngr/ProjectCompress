@@ -314,7 +314,7 @@ async def send_file_to_telegram_async(task_id, chat_link, file_path, original_fi
         await client.send_file(
             entity, file_path,
             progress_callback=progress_cb,
-            caption=f"📁 {original_filename}",
+            caption=caption or f"📁 {original_filename}",
             force_document=True,
         )
 
