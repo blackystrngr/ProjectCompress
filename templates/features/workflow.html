@@ -35,6 +35,9 @@
     <div style="margin-top: 0.35rem; font-size: 0.72rem; color: #6b7a9c;">
         <i class="fas fa-info-circle"></i>
         Drag nodes · Connect <b>●</b> port → <b>●</b> port · Click wire to delete · Scroll to zoom · Delete removes selected
+        <span style="margin-left: 0.5rem; color: #22d3ee;">
+            💾 Auto-saves after 1.5s
+        </span>
     </div>
 </div>
 
@@ -308,12 +311,15 @@
 const NODE_W = 240;
 const MIN_ZOOM = 0.3, MAX_ZOOM = 2.5;
 const DRAG_THRESHOLD = 3;
+const AUTOSAVE_DELAY_MS = 1500;
 
 let NODE_TYPES = {};
 let nodes = [], edges = [];
 let selectedNodeId = null;
 let currentWorkflowId = null;
 let isDirty = false;
+let isSaving = false;
+let autosaveTimer = null;
 let runningTaskId = null;
 let pollInterval = null;
 let nodeStatuses = {};
@@ -738,7 +744,7 @@ function renderAll() {
     renderNodes();
     renderWires();
     renderInspector();
-    exportBtn.disabled = !currentWorkflowId;
+    if (exportBtn) exportBtn.disabled = !currentWorkflowId;
 }
 
 // ============================================================
@@ -1014,18 +1020,45 @@ document.addEventListener('keydown', (e) => {
 });
 
 // ============================================================
-// Dirty / status
+// Dirty / autosave / toolbar
 // ============================================================
-function markDirty() { isDirty = true; updateToolbarState(); }
+function markDirty() {
+    isDirty = true;
+    updateToolbarState();
+    scheduleAutosave();
+}
+
+function scheduleAutosave() {
+    if (autosaveTimer) clearTimeout(autosaveTimer);
+    autosaveTimer = setTimeout(async () => {
+        if (!isDirty || isSaving || runningTaskId) return;
+        if (!nodes.length) return;
+        if (!nodes.some(n => n.type.startsWith('trigger.'))) return;
+        await saveWorkflow(true);  // silent
+    }, AUTOSAVE_DELAY_MS);
+}
+
+function cancelAutosave() {
+    if (autosaveTimer) {
+        clearTimeout(autosaveTimer);
+        autosaveTimer = null;
+    }
+}
+
 function updateToolbarState() {
+    if (!wfStatus) return;
     const nameStr = wfName.value || '(unnamed)';
     let s = '';
     if (runningTaskId) s = '● Running';
+    else if (isSaving) s = '● Saving…';
     else if (isDirty) s = '● Unsaved';
     else if (currentWorkflowId) s = '● Saved';
     wfStatus.textContent = nameStr + (s ? '  ·  ' + s : '');
-    wfStatus.style.color = runningTaskId ? '#5f8fe0' : isDirty ? '#f59e0b' : '#8a9bc0';
-    exportBtn.disabled = !currentWorkflowId;
+    wfStatus.style.color = runningTaskId ? '#5f8fe0'
+                        : isSaving ? '#22d3ee'
+                        : isDirty ? '#f59e0b'
+                        : '#8a9bc0';
+    if (exportBtn) exportBtn.disabled = !currentWorkflowId;
 }
 
 function updateResumeButton() {
@@ -1042,6 +1075,15 @@ function updateResumeButton() {
 if (resumeBtn) {
     resumeBtn.addEventListener('click', async () => {
         if (!failedTaskId || runningTaskId) return;
+
+        if (isDirty && currentWorkflowId) {
+            const ok = await saveWorkflow(true);
+            if (!ok) {
+                showToast('Cannot resume: save failed', true);
+                return;
+            }
+        }
+
         resumeBtn.disabled = true;
         resumeBtn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Resuming…';
         try {
@@ -1066,9 +1108,15 @@ if (resumeBtn) {
             renderAll();
             startPolling(runningTaskId);
 
-            showToast(
+            let msg =
                 `Resumed: ${data.completed_items}/${data.total_items} ` +
-                `already done (attempt ${data.resume_attempts})`);
+                `already done (attempt ${data.resume_attempts})`;
+            if (data.graph_changed) {
+                const stats = data.checkpoint_stats || {};
+                msg += ` — workflow changed ` +
+                       `(${stats.dropped_partial || 0} partial checkpoint(s) dropped)`;
+            }
+            showToast(msg);
         } catch (e) {
             showToast('Resume failed: ' + e.message, true);
         } finally {
@@ -1107,6 +1155,7 @@ async function loadWorkflow(id) {
         selectedNodeId = null;
         nodeStatuses = {};
         isDirty = false;
+        cancelAutosave();
         try { localStorage.setItem('wf_last_id', wf.id); } catch (e) {}
         panX = 0; panY = 0; zoom = 1;
         applyTransform();
@@ -1117,8 +1166,17 @@ async function loadWorkflow(id) {
     }
 }
 
-async function saveWorkflow() {
-    if (!nodes.length) { showToast('Add nodes before saving', true); return; }
+async function saveWorkflow(silent = false) {
+    if (!nodes.length) {
+        if (!silent) showToast('Add nodes before saving', true);
+        return false;
+    }
+    // Auto-generate a name for autosaved workflows
+    if (!wfName.value.trim()) {
+        wfName.value =
+            'Workflow ' + new Date().toLocaleTimeString().replace(/:/g, '');
+    }
+
     const payload = {
         id: currentWorkflowId || undefined,
         name: wfName.value || 'Untitled',
@@ -1130,10 +1188,16 @@ async function saveWorkflow() {
             if (n._comment) out._comment = n._comment;
             return out;
         }),
-        edges: edges.map(e => ({ from: e.from, from_port: e.from_port || 'out', to: e.to })),
+        edges: edges.map(e => ({
+            from: e.from, from_port: e.from_port || 'out', to: e.to,
+        })),
     };
+
     saveBtn.disabled = true;
     saveBtn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i>';
+    isSaving = true;
+    updateToolbarState();
+
     try {
         const r = await fetch('/workflow/save', {
             method: 'POST',
@@ -1142,14 +1206,34 @@ async function saveWorkflow() {
         });
         const data = await r.json();
         if (!r.ok) throw new Error(data.error || 'Save failed');
+
         currentWorkflowId = data.id;
         try { localStorage.setItem('wf_last_id', data.id); } catch (e) {}
         isDirty = false;
+        isSaving = false;
         updateToolbarState();
         await loadWorkflowList();
-        showToast('Workflow saved');
+
+        if (silent) {
+            wfStatus.textContent =
+                (wfName.value || 'Untitled') + '  ·  ✓ Saved';
+            wfStatus.style.color = '#4ade80';
+            setTimeout(() => { if (!isDirty) updateToolbarState(); }, 1500);
+        } else {
+            showToast('Workflow saved');
+        }
+        return true;
     } catch (e) {
-        showToast(e.message, true);
+        isSaving = false;
+        updateToolbarState();
+        if (!silent) {
+            showToast(e.message, true);
+        } else {
+            wfStatus.textContent =
+                (wfName.value || 'Untitled') + '  ·  ⚠️ Save failed';
+            wfStatus.style.color = '#ff8a8a';
+        }
+        return false;
     } finally {
         saveBtn.disabled = false;
         saveBtn.innerHTML = '<i class="fas fa-save"></i> Save';
@@ -1167,7 +1251,33 @@ async function runWorkflow(dryRun) {
     }
     if (nodes.length < 2) { showToast('Add at least one action', true); return; }
 
+    const needsFile = new Set(['action.telegram_send', 'action.drive_upload',
+                               'action.compress', 'action.delete_local',
+                               'action.extract_metadata']);
+    const producesFile = new Set(['action.download', 'action.download_file']);
+    const hasConsumer = nodes.some(n => needsFile.has(n.type));
+    const hasProducer = nodes.some(n => producesFile.has(n.type));
+    if (hasConsumer && !hasProducer) {
+        const consumers = nodes.filter(n => needsFile.has(n.type))
+                               .map(n => NODE_TYPES[n.type]?.label || n.type);
+        if (!confirm(
+            `This workflow has ${consumers.join(', ')} but no Download node.\n\n` +
+            `Those nodes will fail with "no file".\n\nRun anyway?`)) {
+            return;
+        }
+    }
+
+    // Force-save so the run uses the latest saved graph
+    if (isDirty || !currentWorkflowId) {
+        const ok = await saveWorkflow(true);
+        if (!ok) {
+            showToast('Cannot run: save failed', true);
+            return;
+        }
+    }
+
     const payload = {
+        id: currentWorkflowId || undefined,
         name: wfName.value || 'Untitled',
         nodes: nodes.map(n => {
             const out = {
@@ -1177,7 +1287,9 @@ async function runWorkflow(dryRun) {
             if (n._comment) out._comment = n._comment;
             return out;
         }),
-        edges: edges.map(e => ({ from: e.from, from_port: e.from_port || 'out', to: e.to })),
+        edges: edges.map(e => ({
+            from: e.from, from_port: e.from_port || 'out', to: e.to,
+        })),
         dry_run: !!dryRun,
     };
 
@@ -1419,6 +1531,7 @@ wfSelect.addEventListener('change', () => {
         wfSelect.value = currentWorkflowId || '';
         return;
     }
+    cancelAutosave();
     const id = wfSelect.value;
     if (!id) {
         currentWorkflowId = null;
@@ -1447,6 +1560,7 @@ $('wfNewBtn').addEventListener('click', () => {
     selectedNodeId = null;
     nodeStatuses = {};
     isDirty = false;
+    cancelAutosave();
     panX = 0; panY = 0; zoom = 1;
     applyTransform();
     try { localStorage.removeItem('wf_last_id'); } catch (e) {}
@@ -1456,7 +1570,7 @@ $('wfNewBtn').addEventListener('click', () => {
     updateToolbarState();
 });
 
-saveBtn.addEventListener('click', saveWorkflow);
+saveBtn.addEventListener('click', () => saveWorkflow(false));
 runBtn.addEventListener('click', () => runWorkflow(false));
 dryRunBtn.addEventListener('click', () => runWorkflow(true));
 stopBtn.addEventListener('click', stopWorkflow);
@@ -1531,7 +1645,6 @@ $('wfZoomReset').addEventListener('click', () => {
     try { lastTaskId = localStorage.getItem('wf_last_task_id'); } catch (e) {}
     if (lastTaskId) await loadExistingRun(lastTaskId);
 
-    // Restore resume button if a failed task exists
     let storedFailed = null;
     try { storedFailed = localStorage.getItem('wf_failed_task_id'); } catch (e) {}
     if (storedFailed && !runningTaskId) {
