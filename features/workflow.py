@@ -1,7 +1,8 @@
 # features/workflow.py
 """
 Advanced node-based workflow engine with:
-  • Server-Sent Events for live updates (no polling)
+  • Server-Sent Events for live updates (throttled — no stream growth)
+  • Polling fallback via /workflow/progress_lite with ?since= dedup
   • Autosave support
   • Resume with graph validation
   • Checkpointing after every successful node
@@ -45,7 +46,7 @@ class _TimedOut(Exception):
 
 
 # ============================================================
-# Node type registry — unchanged structure, condensed here
+# Common advanced fields
 # ============================================================
 COMMON_ADVANCED = [
     {'name': 'retry_max',   'type': 'number', 'label': 'Retries on failure',
@@ -63,7 +64,11 @@ COMMON_ADVANCED = [
 ]
 
 
+# ============================================================
+# Node type registry
+# ============================================================
 NODE_TYPES = {
+    # ---------- Triggers ----------
     'trigger.url_list': {
         'label': 'URL List', 'category': 'trigger',
         'icon': 'fa-list', 'color': '#4ade80',
@@ -397,7 +402,7 @@ NODE_TYPES = {
 
 
 # ============================================================
-# Safe eval + ctx helpers
+# Safe expression evaluation
 # ============================================================
 _SAFE_BUILTINS = {
     'abs': abs, 'bool': bool, 'float': float, 'int': int,
@@ -518,29 +523,45 @@ def _workflow_signature(workflow):
 
 
 # ============================================================
-# Live-update payloads (SSE)
+# Live-update helpers (SSE)
 # ============================================================
 def _task_version(task):
-    """Compact fingerprint — changes only when meaningful data changes."""
+    """
+    Compact fingerprint — changes only when meaningful data changes.
+
+    Progress is coarsened to 10% bands so we don't push a new SSE event
+    for every 0.5s progress tick (which was causing the stream to grow
+    very fast in DevTools).
+    """
     logs = task.get('logs') or []
     last_log_ts = logs[-1].get('ts', 0) if logs else 0
+
+    node_statuses = task.get('node_statuses') or {}
+    coarse_nodes = {}
+    for nid, s in node_statuses.items():
+        if isinstance(s, dict):
+            coarse_nodes[nid] = {
+                's': s.get('status', ''),
+                'p': int(s.get('progress', 0) or 0) // 10,
+            }
+
     parts = [
         str(task.get('status', '')),
-        str(task.get('progress', 0)),
+        str(int(task.get('progress', 0) or 0) // 10),
         str(task.get('current_item_index', 0)),
         str(task.get('current_node_id', '') or ''),
         str(task.get('failed_item_index', '') or ''),
         str(task.get('resume_attempts', 0)),
         str(last_log_ts),
         str(len(logs)),
-        json.dumps(task.get('node_statuses') or {}, sort_keys=True),
+        json.dumps(coarse_nodes, sort_keys=True),
         json.dumps(task.get('awaiting_input') or None, sort_keys=True),
     ]
     return hashlib.md5('|'.join(parts).encode('utf-8')).hexdigest()
 
 
 def _lite_payload(task):
-    """~2–5 KB payload for the SSE stream."""
+    """~2–5 KB payload for SSE + polling."""
     cps = task.get('checkpoints') or {}
     completed_count = sum(
         1 for cp in cps.values()
@@ -666,7 +687,7 @@ def _build_initial_worklist_from_checkpoint(trigger, edges, node_map,
 
 
 # ============================================================
-# Progress / logging helpers (unchanged)
+# Progress / logging helpers
 # ============================================================
 _last_save = {}
 _last_save_lock = threading.Lock()
@@ -2210,7 +2231,7 @@ def _run_workflow(task_id, workflow, dry_run=False, items_override=None):
 # ============================================================
 def register_routes(app):
 
-    # ---------- SSE stream (replaces polling) ----------
+    # ---------- SSE stream (throttled, no buffering) ----------
     @app.route('/workflow/stream/<task_id>')
     def workflow_stream(task_id):
         def event_gen():
@@ -2223,24 +2244,22 @@ def register_routes(app):
                            f'data: {json.dumps({"error": "Task not found"})}\n\n')
                     return
 
-                last_version = None
-                payload = _lite_payload(task)
+                # Send the first payload immediately
                 last_version = _task_version(task)
-                yield f'data: {json.dumps(payload)}\n\n'
+                first_payload = _lite_payload(task)
+                yield f'data: {json.dumps(first_payload)}\n\n'
 
                 if task.get('status') in ('done', 'error', 'cancelled'):
-                    yield (f'event: close\ndata: {json.dumps(payload)}\n\n')
+                    yield (f'event: close\ndata: {json.dumps(first_payload)}\n\n')
                     return
 
-                heartbeat_counter = 0
+                last_push_ts = time.time()
+                MIN_PUSH_INTERVAL = 1.0
 
                 while True:
                     try:
-                        # Wait for a broadcast from save_task()
                         raw = q.get(timeout=SSE_HEARTBEAT_SEC)
-                        heartbeat_counter = 0
 
-                        # Find our specific task in the broadcast
                         our_task = None
                         try:
                             tasks_data = json.loads(raw)
@@ -2255,28 +2274,35 @@ def register_routes(app):
                         except Exception:
                             pass
 
-                        # Fallback: read from disk
                         if our_task is None:
                             our_task = load_task(task_id)
+
                         if not our_task:
-                            yield ('event: error\n'
-                                   f'data: {json.dumps({"error": "Task removed"})}\n\n')
+                            yield (': heartbeat\n\n')
                             return
 
                         version = _task_version(our_task)
-                        if version != last_version:
-                            last_version = version
-                            payload = _lite_payload(our_task)
-                            yield f'data: {json.dumps(payload)}\n\n'
+                        if version == last_version:
+                            continue
 
-                            if our_task.get('status') in ('done', 'error', 'cancelled'):
-                                yield (f'event: close\n'
-                                       f'data: {json.dumps(payload)}\n\n')
-                                return
+                        status = our_task.get('status', '')
+                        terminal = status in ('done', 'error', 'cancelled')
+
+                        now = time.time()
+                        if not terminal and (now - last_push_ts) < MIN_PUSH_INTERVAL:
+                            continue
+
+                        last_version = version
+                        last_push_ts = now
+                        payload = _lite_payload(our_task)
+                        yield f'data: {json.dumps(payload)}\n\n'
+
+                        if terminal:
+                            yield (f'event: close\n'
+                                   f'data: {json.dumps(payload)}\n\n')
+                            return
 
                     except queue.Empty:
-                        heartbeat_counter += 1
-                        # Verify task still exists every heartbeat
                         current = load_task(task_id)
                         if not current:
                             yield (': heartbeat\n\n')
@@ -2300,7 +2326,7 @@ def register_routes(app):
             },
         )
 
-    # ---------- Lite JSON (fallback if SSE fails) ----------
+    # ---------- Lite JSON (polling fallback) ----------
     @app.route('/workflow/progress_lite/<task_id>')
     def workflow_progress_lite(task_id):
         try:
@@ -2310,12 +2336,20 @@ def register_routes(app):
             if task.get('type') != 'workflow':
                 return jsonify({k: v for k, v in task.items()
                                 if k != 'process_pid'})
-            return jsonify(_lite_payload(task))
+
+            since_ts = request.args.get('since', type=float)
+            payload = _lite_payload(task)
+            if since_ts:
+                payload['logs'] = [
+                    e for e in (task.get('logs') or [])
+                    if (e.get('ts') or 0) > since_ts
+                ]
+            return jsonify(payload)
         except Exception as e:
             logger.error(f'progress_lite failed for {task_id}: {e}')
             return jsonify({'error': str(e)}), 500
 
-    # ---------- Rest of routes (unchanged) ----------
+    # ---------- Node types ----------
     @app.route('/workflow/node-types')
     def workflow_node_types():
         return jsonify(NODE_TYPES)
