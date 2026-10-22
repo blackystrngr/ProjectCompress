@@ -1,10 +1,15 @@
 # features/workflow.py
 """
-Node-based workflow automation.
+Node-based workflow automation with drag-and-drop canvas + wire connections.
 
-Each workflow is a linear chain: [Trigger] → [Action] → [Action] → ...
-The trigger provides a list of items (URLs). Each downstream action runs
-once per item.
+Storage format (v2):
+    {
+      "id": "...",
+      "name": "...",
+      "nodes": [{"id", "type", "config", "x", "y"}, ...],
+      "edges": [{"from": node_id, "to": node_id}, ...]
+    }
+Execution order is derived by topological sort of the edges from the trigger.
 """
 
 import os
@@ -54,33 +59,23 @@ NODE_TYPES = {
     },
     'action.download': {
         'label': 'Download Video',
-        'category': 'action',
-        'icon': 'fa-download',
-        'color': '#5f8fe0',
-        'description': 'Downloads the current URL with yt-dlp. Handles '
-                       'YouTube, Vimeo, Twitter, TikTok, and thousands more.',
+        'category': 'action', 'icon': 'fa-download', 'color': '#5f8fe0',
+        'description': 'Downloads the current URL with yt-dlp.',
         'fields': [],
     },
     'action.download_file': {
         'label': 'Download File',
-        'category': 'action',
-        'icon': 'fa-file-arrow-down',
-        'color': '#5f8fe0',
-        'description': 'Downloads the current URL as a raw file. Use for '
-                       'PDFs, ZIPs, images, APKs.',
+        'category': 'action', 'icon': 'fa-file-arrow-down', 'color': '#5f8fe0',
+        'description': 'Downloads the URL as a raw file (PDF, ZIP, etc).',
         'fields': [],
     },
     'action.telegram_send': {
         'label': 'Send to Telegram',
-        'category': 'action',
-        'icon': 'fa-paper-plane',
-        'color': '#22d3ee',
-        'description': 'Sends the current file to a Telegram chat as a '
-                       'document (no compression).',
+        'category': 'action', 'icon': 'fa-paper-plane', 'color': '#22d3ee',
+        'description': 'Sends the current file to a Telegram chat.',
         'fields': [
             {'name': 'chat_link', 'type': 'text', 'label': 'Chat link',
-             'required': True,
-             'placeholder': '@channel or https://t.me/...'},
+             'required': True, 'placeholder': '@channel or https://t.me/...'},
             {'name': 'caption', 'type': 'text', 'label': 'Caption',
              'default': '📁 {filename}',
              'help': 'Placeholders: {filename}, {url}, {index}, {total}'},
@@ -88,11 +83,8 @@ NODE_TYPES = {
     },
     'action.drive_upload': {
         'label': 'Upload to Drive',
-        'category': 'action',
-        'icon': 'fa-cloud-upload-alt',
-        'color': '#a78bfa',
-        'description': 'Uploads the current file to Google Drive '
-                       '(Colab_Processing folder).',
+        'category': 'action', 'icon': 'fa-cloud-upload-alt', 'color': '#a78bfa',
+        'description': 'Uploads the current file to Google Drive.',
         'fields': [
             {'name': 'account', 'type': 'text', 'label': 'Drive account',
              'default': 'default',
@@ -101,40 +93,29 @@ NODE_TYPES = {
     },
     'action.compress': {
         'label': 'Compress Video',
-        'category': 'action',
-        'icon': 'fa-compress',
-        'color': '#f59e0b',
-        'description': 'Re-encodes the current video with H.265 or AV1. '
-                       'Slower but much smaller.',
+        'category': 'action', 'icon': 'fa-compress', 'color': '#f59e0b',
+        'description': 'Re-encodes the current video with H.265 or AV1.',
         'fields': [
             {'name': 'codec', 'type': 'select', 'label': 'Codec',
              'options': ['x265', 'av1'], 'default': 'x265'},
             {'name': 'resolution', 'type': 'select', 'label': 'Resolution',
              'options': ['360', '480', '720', '1080'], 'default': '720'},
-            {'name': 'crf', 'type': 'number', 'label': 'CRF',
-             'default': 27,
-             'help': 'Lower = better quality, bigger file. x265: 24-30, AV1: 28-35'},
+            {'name': 'crf', 'type': 'number', 'label': 'CRF', 'default': 27,
+             'help': 'Lower = better quality. x265: 24-30, AV1: 28-35'},
             {'name': 'preset', 'type': 'text', 'label': 'Preset',
-             'default': 'veryfast',
-             'help': 'x265: ultrafast…medium · AV1: 8 (best) … 13 (fastest)'},
+             'default': 'veryfast'},
         ],
     },
     'action.delete_local': {
         'label': 'Delete Local File',
-        'category': 'action',
-        'icon': 'fa-trash-alt',
-        'color': '#ef4444',
-        'description': 'Deletes the current file from local disk. Useful '
-                       'as the last step after uploading.',
+        'category': 'action', 'icon': 'fa-trash-alt', 'color': '#ef4444',
+        'description': 'Deletes the current file from local disk.',
         'fields': [],
     },
     'action.delete_drive': {
         'label': 'Delete Drive File',
-        'category': 'action',
-        'icon': 'fa-trash-alt',
-        'color': '#ef4444',
-        'description': 'Deletes the file from Drive (requires Upload to '
-                       'Drive earlier in the chain).',
+        'category': 'action', 'icon': 'fa-trash-alt', 'color': '#ef4444',
+        'description': 'Deletes the file from Drive (upload first).',
         'fields': [
             {'name': 'account', 'type': 'text', 'label': 'Drive account',
              'default': 'default'},
@@ -142,11 +123,8 @@ NODE_TYPES = {
     },
     'action.wait': {
         'label': 'Wait',
-        'category': 'action',
-        'icon': 'fa-clock',
-        'color': '#8a9bc0',
-        'description': 'Pauses the workflow for N seconds. Useful between '
-                       'requests to avoid rate limits.',
+        'category': 'action', 'icon': 'fa-clock', 'color': '#8a9bc0',
+        'description': 'Pauses the workflow for N seconds.',
         'fields': [
             {'name': 'seconds', 'type': 'number', 'label': 'Seconds',
              'default': 5},
@@ -154,23 +132,74 @@ NODE_TYPES = {
     },
     'action.webhook': {
         'label': 'Webhook',
-        'category': 'action',
-        'icon': 'fa-globe',
-        'color': '#4ade80',
-        'description': 'Sends an HTTP request. Useful for Slack/Discord '
-                       'notifications or triggering external tools.',
+        'category': 'action', 'icon': 'fa-globe', 'color': '#4ade80',
+        'description': 'Sends an HTTP request.',
         'fields': [
             {'name': 'url', 'type': 'text', 'label': 'URL',
-             'required': True,
-             'placeholder': 'https://hooks.slack.com/services/...'},
+             'required': True, 'placeholder': 'https://hooks.slack.com/...'},
             {'name': 'method', 'type': 'select', 'label': 'Method',
              'options': ['POST', 'GET'], 'default': 'POST'},
             {'name': 'body', 'type': 'textarea', 'label': 'Body',
-             'default': '{"text": "Downloaded {filename} ({size}) from {url}"}',
+             'default': '{"text": "Downloaded {filename} from {url}"}',
              'help': 'Placeholders: {filename}, {url}, {size}, {index}, {total}'},
         ],
     },
 }
+
+
+# ============================================================
+# Graph helpers
+# ============================================================
+def _topological_order(nodes, edges):
+    """Return nodes in execution order (Kahn's algorithm). None if cycle."""
+    ids = {n['id'] for n in nodes}
+    adj = {nid: [] for nid in ids}
+    indeg = {nid: 0 for nid in ids}
+
+    for e in edges:
+        f, t = e.get('from'), e.get('to')
+        if f in ids and t in ids:
+            adj[f].append(t)
+            indeg[t] += 1
+
+    queue = [nid for nid, d in indeg.items() if d == 0]
+    order = []
+    while queue:
+        nid = queue.pop(0)
+        order.append(nid)
+        for nxt in adj[nid]:
+            indeg[nxt] -= 1
+            if indeg[nxt] == 0:
+                queue.append(nxt)
+
+    if len(order) != len(nodes):
+        return None
+
+    node_map = {n['id']: n for n in nodes}
+    return [node_map[nid] for nid in order]
+
+
+def _migrate_workflow(wf):
+    """Auto-convert old (no edges / no positions) to new format."""
+    if not isinstance(wf, dict):
+        return wf
+    nodes = wf.get('nodes') or []
+    if not nodes:
+        return wf
+
+    for i, node in enumerate(nodes):
+        if 'x' not in node or not isinstance(node.get('x'), (int, float)):
+            node['x'] = 80 + i * 280
+        if 'y' not in node or not isinstance(node.get('y'), (int, float)):
+            node['y'] = 200
+
+    if 'edges' not in wf or not isinstance(wf.get('edges'), list):
+        edges = []
+        for i in range(len(nodes) - 1):
+            edges.append({'from': nodes[i]['id'], 'to': nodes[i + 1]['id']})
+        wf['edges'] = edges
+
+    return wf
 
 
 # ============================================================
@@ -181,13 +210,11 @@ _last_save_lock = threading.Lock()
 
 
 def _update_node_progress(task_id, node_id, progress, status=None):
-    """Update a node's progress with 0.5s throttling."""
     with _last_save_lock:
         now = time.time()
         if now - _last_save.get(task_id, 0) < 0.5 and (progress or 0) < 100:
             return
         _last_save[task_id] = now
-
     task = load_task(task_id)
     if not task:
         return
@@ -201,17 +228,12 @@ def _update_node_progress(task_id, node_id, progress, status=None):
 
 
 def _log(task_id, node_id, level, msg):
-    """Append a log entry to the task."""
     task = load_task(task_id)
     if not task:
         return
     logs = task.get('logs', [])
-    logs.append({
-        'ts': time.time(),
-        'node_id': node_id,
-        'level': level,
-        'msg': str(msg),
-    })
+    logs.append({'ts': time.time(), 'node_id': node_id,
+                 'level': level, 'msg': str(msg)})
     task['logs'] = logs[-500:]
     save_task(task_id, task)
 
@@ -265,7 +287,6 @@ def _format_size(n):
 
 
 def _expand_template(text, ctx):
-    """Replace {key} placeholders in a template string."""
     if not text:
         return ''
     values = {
@@ -277,14 +298,11 @@ def _expand_template(text, ctx):
         'total':    str(ctx.get('total', '')),
         'ext':      os.path.splitext(ctx.get('filename', ''))[1].lstrip('.'),
     }
-    def replace(match):
-        key = match.group(1)
-        return values.get(key, match.group(0))
-    return re.sub(r'\{(\w+)\}', replace, text)
+    return re.sub(r'\{(\w+)\}', lambda m: values.get(m.group(1), m.group(0)), text)
 
 
 # ============================================================
-# Action handlers
+# Node action handlers
 # ============================================================
 def _handle_download(task_id, node_id, config, ctx):
     url = ctx.get('url')
@@ -302,27 +320,21 @@ def _handle_download(task_id, node_id, config, ctx):
     out_path = os.path.join(UPLOAD_FOLDER, out_name)
     template = os.path.join(UPLOAD_FOLDER, f"_wf_{task_id}_{node_id}.%(ext)s")
 
-    cmd = [
-        'yt-dlp', '-o', template,
-        '-f', format_choice,
-        '--merge-output-format', 'mp4',
-        '--no-part', '--no-mtime', '--no-warnings', '--ignore-errors',
-        '--no-playlist',
-        '--impersonate', 'chrome',
-        '--extractor-args', 'youtube:player_client=mweb',
-        '--newline', '--no-colors',
-        '--retries', '3',
-    ]
+    cmd = ['yt-dlp', '-o', template, '-f', format_choice,
+           '--merge-output-format', 'mp4', '--no-part', '--no-mtime',
+           '--no-warnings', '--ignore-errors', '--no-playlist',
+           '--impersonate', 'chrome',
+           '--extractor-args', 'youtube:player_client=mweb',
+           '--newline', '--no-colors', '--retries', '3']
     if os.path.exists(COOKIES_FILE):
         cmd += ['--cookies', COOKIES_FILE]
     cmd.append(url)
 
     _log(task_id, node_id, 'info', f'yt-dlp: {url[:80]}')
 
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, preexec_fn=os.setsid,
-    )
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1,
+                            preexec_fn=os.setsid)
     try:
         from features.url_download import register_process, unregister_process, kill_process
         register_process(task_id, proc)
@@ -349,7 +361,6 @@ def _handle_download(task_id, node_id, config, ctx):
     if proc.returncode != 0:
         raise Exception(f'yt-dlp exited with code {proc.returncode}')
 
-    # Find output file
     prefix = f"_wf_{task_id}_{node_id}."
     candidates = [f for f in os.listdir(UPLOAD_FOLDER) if f.startswith(prefix)]
     if not candidates:
@@ -369,9 +380,9 @@ def _handle_download(task_id, node_id, config, ctx):
     ctx['filename'] = os.path.basename(final_path)
     ctx['basename'] = os.path.splitext(ctx['filename'])[0]
     ctx['size'] = size
-
     _update_node_progress(task_id, node_id, 100, 'done')
-    _log(task_id, node_id, 'success', f'Downloaded {ctx["filename"]} ({_format_size(size)})')
+    _log(task_id, node_id, 'success',
+         f'Downloaded {ctx["filename"]} ({_format_size(size)})')
     return ctx
 
 
@@ -380,16 +391,11 @@ def _handle_download_file(task_id, node_id, config, ctx):
     url = ctx.get('url')
     if not url:
         raise Exception('No URL in context')
-
-    name = _filename_from_url(url)
-    if not name:
-        name = f'file_{uuid.uuid4().hex[:8]}'
+    name = _filename_from_url(url) or f'file_{uuid.uuid4().hex[:8]}'
     out_name = _unique_filename(name)
     out_path = os.path.join(UPLOAD_FOLDER, out_name)
     tmp_path = out_path + '.part'
-
     _log(task_id, node_id, 'info', f'GET {url[:80]}')
-
     try:
         with requests.get(url, stream=True, timeout=(15, 120)) as r:
             r.raise_for_status()
@@ -414,16 +420,15 @@ def _handle_download_file(task_id, node_id, config, ctx):
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         raise
-
     os.rename(tmp_path, out_path)
     size = os.path.getsize(out_path)
     ctx['file_path'] = out_path
     ctx['filename'] = out_name
     ctx['basename'] = os.path.splitext(out_name)[0]
     ctx['size'] = size
-
     _update_node_progress(task_id, node_id, 100, 'done')
-    _log(task_id, node_id, 'success', f'Downloaded {out_name} ({_format_size(size)})')
+    _log(task_id, node_id, 'success',
+         f'Downloaded {out_name} ({_format_size(size)})')
     return ctx
 
 
@@ -431,11 +436,9 @@ def _handle_telegram_send(task_id, node_id, config, ctx):
     file_path = ctx.get('file_path')
     if not file_path or not os.path.exists(file_path):
         raise Exception('No file in context — add a Download node first')
-
     chat_link = (config.get('chat_link') or '').strip()
     if not chat_link:
         raise Exception('Chat link is required')
-
     caption = _expand_template(config.get('caption') or '', ctx) or None
 
     from features.telegram import (
@@ -445,22 +448,15 @@ def _handle_telegram_send(task_id, node_id, config, ctx):
 
     sub_id = str(uuid.uuid4())
     save_task(sub_id, {
-        'task_id': sub_id,
-        'status': 'queued',
-        'upload_progress': 0,
-        'created_at': time.time(),
-        'cancelled': False,
-        '_hidden': True,
-        'parent_workflow': task_id,
+        'task_id': sub_id, 'status': 'queued', 'upload_progress': 0,
+        'created_at': time.time(), 'cancelled': False,
+        '_hidden': True, 'parent_workflow': task_id,
     })
 
     def _run():
         try:
-            _run_telegram_job(
-                send_file_to_telegram_async,
-                sub_id, chat_link, file_path,
-                os.path.basename(file_path), caption,
-            )
+            _run_telegram_job(send_file_to_telegram_async, sub_id, chat_link,
+                              file_path, os.path.basename(file_path), caption)
         except Exception as e:
             t = load_task(sub_id)
             if t:
@@ -480,27 +476,21 @@ def _handle_telegram_send(task_id, node_id, config, ctx):
                 pass
             delete_task(sub_id)
             raise _Cancelled()
-
         sub = load_task(sub_id)
         if not sub:
             time.sleep(0.3)
             continue
-
         if sub.get('status') == 'done':
             _update_node_progress(task_id, node_id, 100, 'done')
-            _log(task_id, node_id, 'success',
-                 f'Sent to {chat_link}')
+            _log(task_id, node_id, 'success', f'Sent to {chat_link}')
             delete_task(sub_id)
             return ctx
-
         if sub.get('status') == 'error':
             err = sub.get('error_msg', 'Telegram send failed')
             delete_task(sub_id)
             raise Exception(err)
-
         _update_node_progress(task_id, node_id, sub.get('upload_progress', 0))
         time.sleep(0.5)
-
     delete_task(sub_id)
     raise Exception('Telegram send timed out (1 hour)')
 
@@ -509,7 +499,6 @@ def _handle_drive_upload(task_id, node_id, config, ctx):
     file_path = ctx.get('file_path')
     if not file_path or not os.path.exists(file_path):
         raise Exception('No file in context — add a Download node first')
-
     account = (config.get('account') or 'default').strip()
 
     from features.google_drive import get_drive_service, get_colab_folder_id
@@ -524,18 +513,15 @@ def _handle_drive_upload(task_id, node_id, config, ctx):
     media = MediaFileUpload(file_path, resumable=True, chunksize=10 * 1024 * 1024)
     req = service.files().create(
         body={'name': filename, 'parents': [folder_id]},
-        media_body=media,
-        fields='id, name, webViewLink',
+        media_body=media, fields='id, name, webViewLink',
     )
-
     response = None
     while response is None:
         if _is_cancelled(task_id):
             raise _Cancelled()
         status, response = req.next_chunk()
         if status:
-            _update_node_progress(task_id, node_id,
-                                  int(status.progress() * 100))
+            _update_node_progress(task_id, node_id, int(status.progress() * 100))
 
     ctx['drive_file_id'] = response['id']
     ctx['drive_link'] = response.get('webViewLink')
@@ -549,7 +535,6 @@ def _handle_compress(task_id, node_id, config, ctx):
     file_path = ctx.get('file_path')
     if not file_path or not os.path.exists(file_path):
         raise Exception('No file to compress')
-
     codec = (config.get('codec') or 'x265').lower()
     resolution = str(config.get('resolution') or '720')
     try:
@@ -570,7 +555,6 @@ def _handle_compress(task_id, node_id, config, ctx):
         vcodec = ['-c:v', 'libsvtav1', '-preset', str(preset), '-crf', str(crf),
                   '-pix_fmt', 'yuv420p10le']
 
-    # Get source duration for progress
     duration = 0
     try:
         ffprobe = shutil.which('ffprobe') or 'ffprobe'
@@ -583,24 +567,17 @@ def _handle_compress(task_id, node_id, config, ctx):
     except Exception:
         pass
 
-    cmd = [
-        'ffmpeg', '-y',
-        '-progress', 'pipe:2', '-stats_period', '0.5',
-        '-i', file_path,
-        '-vf', vf, *vcodec,
-        '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
-        '-af', 'aresample=async=1:first_pts=0',
-        '-movflags', '+faststart',
-        out_path,
-    ]
+    cmd = ['ffmpeg', '-y', '-progress', 'pipe:2', '-stats_period', '0.5',
+           '-i', file_path, '-vf', vf, *vcodec,
+           '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
+           '-af', 'aresample=async=1:first_pts=0',
+           '-movflags', '+faststart', out_path]
 
     _log(task_id, node_id, 'info',
          f'Compressing ({codec} {resolution}p crf={crf} preset={preset})')
 
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        text=True, bufsize=1, preexec_fn=os.setsid,
-    )
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                            text=True, bufsize=1, preexec_fn=os.setsid)
     try:
         from features.url_download import register_process, unregister_process, kill_process
         register_process(task_id, proc)
@@ -632,13 +609,11 @@ def _handle_compress(task_id, node_id, config, ctx):
     orig_size = os.path.getsize(file_path)
     new_size = os.path.getsize(out_path)
     savings = (1 - new_size / orig_size) * 100 if orig_size else 0
-
     ctx['original_file_path'] = file_path
     ctx['file_path'] = out_path
     ctx['filename'] = out_name
     ctx['basename'] = os.path.splitext(out_name)[0]
     ctx['size'] = new_size
-
     _update_node_progress(task_id, node_id, 100, 'done')
     _log(task_id, node_id, 'success',
          f'Compressed: {_format_size(orig_size)} → {_format_size(new_size)} '
@@ -652,7 +627,6 @@ def _handle_delete_local(task_id, node_id, config, ctx):
         _log(task_id, node_id, 'warning', 'No file in context — skipping')
         _update_node_progress(task_id, node_id, 100, 'done')
         return ctx
-
     if os.path.exists(file_path):
         try:
             os.remove(file_path)
@@ -662,8 +636,6 @@ def _handle_delete_local(task_id, node_id, config, ctx):
             raise Exception(f'Delete failed: {e}')
     else:
         _log(task_id, node_id, 'warning', 'File already missing')
-
-    # Also delete original if compress produced one and user asked
     orig = ctx.get('original_file_path')
     if orig and orig != file_path and os.path.exists(orig):
         try:
@@ -672,13 +644,8 @@ def _handle_delete_local(task_id, node_id, config, ctx):
                  f'Also deleted original {os.path.basename(orig)}')
         except Exception:
             pass
-
-    ctx.pop('file_path', None)
-    ctx.pop('filename', None)
-    ctx.pop('basename', None)
-    ctx.pop('size', None)
-    ctx.pop('original_file_path', None)
-
+    for k in ('file_path', 'filename', 'basename', 'size', 'original_file_path'):
+        ctx.pop(k, None)
     _update_node_progress(task_id, node_id, 100, 'done')
     return ctx
 
@@ -689,7 +656,6 @@ def _handle_delete_drive(task_id, node_id, config, ctx):
         _log(task_id, node_id, 'warning', 'No Drive file in context — skipping')
         _update_node_progress(task_id, node_id, 100, 'done')
         return ctx
-
     account = (config.get('account') or 'default').strip()
     from features.google_drive import get_drive_service
     service = get_drive_service(account)
@@ -698,7 +664,6 @@ def _handle_delete_drive(task_id, node_id, config, ctx):
         _log(task_id, node_id, 'success', f'Deleted Drive file ({account})')
     except Exception as e:
         _log(task_id, node_id, 'warning', f'Drive delete failed: {e}')
-
     ctx.pop('drive_file_id', None)
     ctx.pop('drive_link', None)
     _update_node_progress(task_id, node_id, 100, 'done')
@@ -726,11 +691,8 @@ def _handle_webhook(task_id, node_id, config, ctx):
     url = (config.get('url') or '').strip()
     if not url:
         raise Exception('Webhook URL required')
-
     method = (config.get('method') or 'POST').upper()
-    body_template = config.get('body') or ''
-    body = _expand_template(body_template, ctx)
-
+    body = _expand_template(config.get('body') or '', ctx)
     _log(task_id, node_id, 'info', f'{method} {url[:80]}')
     try:
         if method == 'GET':
@@ -774,7 +736,8 @@ def _load_workflow(wf_id):
         return None
     try:
         with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            data = json.load(f)
+        return _migrate_workflow(data)
     except Exception as e:
         logger.error(f'Failed to load workflow {wf_id}: {e}')
         return None
@@ -827,7 +790,11 @@ def _validate_workflow(workflow):
     nodes = workflow.get('nodes')
     if not isinstance(nodes, list) or not nodes:
         return 'Workflow must have at least one node'
+    edges = workflow.get('edges', [])
+    if not isinstance(edges, list):
+        return 'Edges must be a list'
 
+    # Node validation
     for i, node in enumerate(nodes):
         if not isinstance(node, dict):
             return f'Node {i} must be an object'
@@ -836,15 +803,52 @@ def _validate_workflow(workflow):
         ntype = node.get('type')
         if ntype not in NODE_TYPES:
             return f'Node {i} has unknown type: {ntype}'
-        if i == 0 and not ntype.startswith('trigger.'):
-            return 'First node must be a trigger'
-        if i > 0 and ntype.startswith('trigger.'):
-            return 'Only the first node can be a trigger'
-
         config = node.get('config') or {}
         for field in NODE_TYPES[ntype].get('fields', []):
             if field.get('required') and not str(config.get(field['name'], '')).strip():
                 return f'{NODE_TYPES[ntype]["label"]}: {field["label"]} is required'
+
+    # Edge validation
+    ids = {n['id'] for n in nodes}
+    indeg = {nid: 0 for nid in ids}
+    outdeg = {nid: 0 for nid in ids}
+    for i, e in enumerate(edges):
+        if not isinstance(e, dict):
+            return f'Edge {i} must be an object'
+        f, t = e.get('from'), e.get('to')
+        if f not in ids or t not in ids:
+            return f'Edge {i} references unknown node'
+        if f == t:
+            return f'Edge {i} is a self-loop'
+        outdeg[f] += 1
+        indeg[t] += 1
+
+    triggers = [n for n in nodes if n['type'].startswith('trigger.')]
+    if not triggers:
+        return 'Need at least one trigger node'
+    if len(triggers) > 1:
+        return 'Only one trigger allowed per workflow'
+    trigger = triggers[0]
+
+    if indeg[trigger['id']] > 0:
+        return 'Trigger cannot have incoming connections'
+    if outdeg[trigger['id']] > 1:
+        return 'Trigger can only connect to one node'
+
+    for n in nodes:
+        if n['id'] == trigger['id']:
+            continue
+        if indeg[n['id']] != 1:
+            return (f'{NODE_TYPES[n["type"]]["label"]}: must have exactly '
+                    f'1 incoming connection (has {indeg[n["id"]]})')
+        if outdeg[n['id']] > 1:
+            return f'{NODE_TYPES[n["type"]]["label"]}: at most 1 outgoing connection'
+
+    order = _topological_order(nodes, edges)
+    if order is None:
+        return 'Workflow contains a cycle'
+    if order[0]['id'] != trigger['id']:
+        return 'Trigger must be the starting node'
 
     return None
 
@@ -854,8 +858,15 @@ def _validate_workflow(workflow):
 # ============================================================
 def _run_workflow(task_id, workflow):
     nodes = workflow['nodes']
-    trigger = nodes[0]
-    action_nodes = nodes[1:]
+    edges = workflow.get('edges', [])
+
+    ordered = _topological_order(nodes, edges)
+    if not ordered:
+        _log(task_id, None, 'error', 'Cannot determine execution order')
+        raise Exception('Invalid workflow graph')
+
+    trigger = ordered[0]
+    action_nodes = ordered[1:]
 
     try:
         trigger_config = trigger.get('config') or {}
@@ -873,7 +884,7 @@ def _run_workflow(task_id, workflow):
         save_task(task_id, task)
 
         _log(task_id, None, 'info',
-             f'Starting workflow "{workflow.get("name", "Untitled")}" — '
+             f'Starting "{workflow.get("name", "Untitled")}" — '
              f'{len(items)} item(s), {len(action_nodes)} action(s)')
 
         for idx, item in enumerate(items):
@@ -891,10 +902,8 @@ def _run_workflow(task_id, workflow):
                  f'▶ Item {idx + 1}/{len(items)}: {item[:100]}')
 
             ctx = {
-                'item': item,
-                'url': item,
-                'index': idx + 1,
-                'total': len(items),
+                'item': item, 'url': item,
+                'index': idx + 1, 'total': len(items),
                 'quality': trigger_config.get('quality', 'best'),
             }
 
@@ -935,7 +944,6 @@ def _run_workflow(task_id, workflow):
             task['status'] = 'done'
             task['progress'] = 100
             save_task(task_id, task)
-
         _log(task_id, None, 'success',
              f'✅ All {len(items)} item(s) processed successfully')
 
@@ -1003,34 +1011,20 @@ def register_routes(app):
         err = _validate_workflow(data)
         if err:
             return jsonify({'error': err}), 400
-
-        nodes = data['nodes']
-        # Quick sanity: at least one action node
-        if len(nodes) < 2:
+        if len(data['nodes']) < 2:
             return jsonify({'error': 'Add at least one action node'}), 400
 
         task_id = str(uuid.uuid4())
         save_task(task_id, {
-            'task_id': task_id,
-            'status': 'running',
-            'progress': 0,
-            'created_at': time.time(),
-            'cancelled': False,
+            'task_id': task_id, 'status': 'running', 'progress': 0,
+            'created_at': time.time(), 'cancelled': False,
             'workflow_name': data.get('name', 'Untitled Workflow'),
-            'items': [],
-            'total_items': 0,
-            'current_item_index': 0,
-            'current_item': '',
-            'current_node_id': None,
-            'node_statuses': {},
-            'logs': [],
+            'items': [], 'total_items': 0,
+            'current_item_index': 0, 'current_item': '',
+            'current_node_id': None, 'node_statuses': {}, 'logs': [],
             'type': 'workflow',
         })
 
-        threading.Thread(
-            target=_run_workflow,
-            args=(task_id, data),
-            daemon=True,
-        ).start()
-
+        threading.Thread(target=_run_workflow, args=(task_id, data),
+                         daemon=True).start()
         return jsonify({'task_id': task_id})
