@@ -1,15 +1,19 @@
 # features/workflow.py
 """
-Node-based workflow automation with drag-and-drop canvas + wire connections.
+Smart node-based workflow engine.
 
-Storage format (v2):
+Execution model: token-based traversal with multi-output-port branching.
+
+Storage (v3):
     {
-      "id": "...",
-      "name": "...",
-      "nodes": [{"id", "type", "config", "x", "y"}, ...],
-      "edges": [{"from": node_id, "to": node_id}, ...]
+      "id", "name",
+      "nodes": [{"id","type","config","x","y"}, ...],
+      "edges": [{"from","from_port","to"}, ...]
     }
-Execution order is derived by topological sort of the edges from the trigger.
+
+Edges without `from_port` default to "out" (v2 compat).
+Execution is per-item: a "token" starts at the trigger and flows
+through nodes, activating output ports, until no more tokens are active.
 """
 
 import os
@@ -37,16 +41,35 @@ class _Cancelled(Exception):
 
 
 # ============================================================
-# Node types
+# Node types — fields, ports, retry/error config
 # ============================================================
+# Common per-node advanced fields (rendered under "Advanced" in inspector):
+COMMON_ADVANCED = [
+    {'name': 'retry_max',   'type': 'number', 'label': 'Retries on failure',
+     'default': 0, 'help': '0 = no retry. Failed attempts sleep then retry.'},
+    {'name': 'retry_delay', 'type': 'number', 'label': 'Retry delay (s)',
+     'default': 3},
+    {'name': 'on_error',    'type': 'select', 'label': 'On error',
+     'options': ['stop', 'continue'],
+     'default': 'stop',
+     'help': '"stop" cancels the whole item. "continue" skips the node '
+             'and moves on (context is left unchanged).'},
+    {'name': 'skip_if',     'type': 'text', 'label': 'Skip if (Python expr)',
+     'default': '',
+     'help': 'If this evaluates to True, the node is skipped. '
+             'Example: size < 1000  ·  "sample" in filename'},
+]
+
 NODE_TYPES = {
+    # ---------------- Triggers ----------------
     'trigger.url_list': {
         'label': 'URL List',
         'category': 'trigger',
         'icon': 'fa-list',
         'color': '#4ade80',
-        'description': 'Provides a list of URLs. Each downstream action '
-                       'runs once per URL.',
+        'description': 'Provides a list of URLs. Each downstream action runs '
+                       'once per URL.',
+        'ports': {'in': [], 'out': ['out']},
         'fields': [
             {'name': 'urls', 'type': 'textarea', 'label': 'URLs (one per line)',
              'required': True,
@@ -55,85 +78,133 @@ NODE_TYPES = {
             {'name': 'quality', 'type': 'select', 'label': 'Download quality',
              'options': ['best', '2160p', '1440p', '1080p', '720p', '480p', 'audio'],
              'default': '1080p'},
+            {'name': 'expand_playlists', 'type': 'checkbox',
+             'label': 'Expand playlists into individual videos',
+             'default': True,
+             'help': 'Each playlist URL becomes N videos — one per video. '
+                     'Each flows through the whole chain independently.'},
+            {'name': 'max_items', 'type': 'number',
+             'label': 'Max videos per playlist (0 = all)', 'default': 0},
         ],
+        'advanced_fields': [],
     },
+    'trigger.file_glob': {
+        'label': 'File Glob',
+        'category': 'trigger',
+        'icon': 'fa-folder-open',
+        'color': '#4ade80',
+        'description': 'Provides a list of files matching a glob pattern '
+                       'inside the downloads folder.',
+        'ports': {'in': [], 'out': ['out']},
+        'fields': [
+            {'name': 'pattern', 'type': 'text', 'label': 'Glob pattern',
+             'required': True, 'default': '**/*.mp4',
+             'help': 'Relative to downloads/. Examples: *.mp4, playlist_*/*.mp4'},
+            {'name': 'max_items', 'type': 'number',
+             'label': 'Max files (0 = all)', 'default': 0},
+        ],
+        'advanced_fields': [],
+    },
+
+    # ---------------- Actions ----------------
     'action.download': {
         'label': 'Download Video',
         'category': 'action', 'icon': 'fa-download', 'color': '#5f8fe0',
         'description': 'Downloads the current URL with yt-dlp.',
+        'ports': {'in': ['in'], 'out': ['out']},
         'fields': [],
+        'advanced_fields': COMMON_ADVANCED,
     },
     'action.download_file': {
         'label': 'Download File',
         'category': 'action', 'icon': 'fa-file-arrow-down', 'color': '#5f8fe0',
-        'description': 'Downloads the URL as a raw file (PDF, ZIP, etc).',
+        'description': 'Downloads the URL as a raw file.',
+        'ports': {'in': ['in'], 'out': ['out']},
         'fields': [],
+        'advanced_fields': COMMON_ADVANCED,
     },
     'action.telegram_send': {
         'label': 'Send to Telegram',
         'category': 'action', 'icon': 'fa-paper-plane', 'color': '#22d3ee',
         'description': 'Sends the current file to a Telegram chat.',
+        'ports': {'in': ['in'], 'out': ['out']},
         'fields': [
             {'name': 'chat_link', 'type': 'text', 'label': 'Chat link',
              'required': True, 'placeholder': '@channel or https://t.me/...'},
             {'name': 'caption', 'type': 'text', 'label': 'Caption',
              'default': '📁 {filename}',
-             'help': 'Placeholders: {filename}, {url}, {index}, {total}'},
+             'help': 'Placeholders: {filename}, {url}, {index}, {total}, '
+                     '{size}, {basename}, {ext}'},
         ],
+        'advanced_fields': COMMON_ADVANCED,
     },
     'action.drive_upload': {
         'label': 'Upload to Drive',
         'category': 'action', 'icon': 'fa-cloud-upload-alt', 'color': '#a78bfa',
         'description': 'Uploads the current file to Google Drive.',
+        'ports': {'in': ['in'], 'out': ['out']},
         'fields': [
             {'name': 'account', 'type': 'text', 'label': 'Drive account',
-             'default': 'default',
-             'help': 'Match token_<name>.json — "default" uses token.json'},
+             'default': 'default'},
         ],
+        'advanced_fields': COMMON_ADVANCED,
     },
     'action.compress': {
         'label': 'Compress Video',
         'category': 'action', 'icon': 'fa-compress', 'color': '#f59e0b',
         'description': 'Re-encodes the current video with H.265 or AV1.',
+        'ports': {'in': ['in'], 'out': ['out']},
         'fields': [
             {'name': 'codec', 'type': 'select', 'label': 'Codec',
              'options': ['x265', 'av1'], 'default': 'x265'},
             {'name': 'resolution', 'type': 'select', 'label': 'Resolution',
              'options': ['360', '480', '720', '1080'], 'default': '720'},
             {'name': 'crf', 'type': 'number', 'label': 'CRF', 'default': 27,
-             'help': 'Lower = better quality. x265: 24-30, AV1: 28-35'},
+             'help': 'x265: 24-30 · AV1: 28-35'},
             {'name': 'preset', 'type': 'text', 'label': 'Preset',
              'default': 'veryfast'},
         ],
+        'advanced_fields': COMMON_ADVANCED,
     },
     'action.delete_local': {
         'label': 'Delete Local File',
         'category': 'action', 'icon': 'fa-trash-alt', 'color': '#ef4444',
         'description': 'Deletes the current file from local disk.',
+        'ports': {'in': ['in'], 'out': ['out']},
         'fields': [],
+        'advanced_fields': COMMON_ADVANCED,
     },
     'action.delete_drive': {
         'label': 'Delete Drive File',
         'category': 'action', 'icon': 'fa-trash-alt', 'color': '#ef4444',
         'description': 'Deletes the file from Drive (upload first).',
+        'ports': {'in': ['in'], 'out': ['out']},
         'fields': [
             {'name': 'account', 'type': 'text', 'label': 'Drive account',
              'default': 'default'},
         ],
+        'advanced_fields': COMMON_ADVANCED,
     },
     'action.wait': {
         'label': 'Wait',
         'category': 'action', 'icon': 'fa-clock', 'color': '#8a9bc0',
         'description': 'Pauses the workflow for N seconds.',
+        'ports': {'in': ['in'], 'out': ['out']},
         'fields': [
             {'name': 'seconds', 'type': 'number', 'label': 'Seconds',
              'default': 5},
+            {'name': 'jitter', 'type': 'number', 'label': 'Random jitter (s)',
+             'default': 0,
+             'help': 'Adds 0..jitter seconds randomly. Avoids thundering-herd '
+                     'when processing large playlists.'},
         ],
+        'advanced_fields': COMMON_ADVANCED,
     },
     'action.webhook': {
         'label': 'Webhook',
         'category': 'action', 'icon': 'fa-globe', 'color': '#4ade80',
         'description': 'Sends an HTTP request.',
+        'ports': {'in': ['in'], 'out': ['out']},
         'fields': [
             {'name': 'url', 'type': 'text', 'label': 'URL',
              'required': True, 'placeholder': 'https://hooks.slack.com/...'},
@@ -143,21 +214,186 @@ NODE_TYPES = {
              'default': '{"text": "Downloaded {filename} from {url}"}',
              'help': 'Placeholders: {filename}, {url}, {size}, {index}, {total}'},
         ],
+        'advanced_fields': COMMON_ADVANCED,
+    },
+    'action.extract_metadata': {
+        'label': 'Extract Metadata',
+        'category': 'action', 'icon': 'fa-info-circle', 'color': '#22d3ee',
+        'description': 'Extracts video metadata (duration, resolution, codecs) '
+                       'into the context as {duration}, {width}, {height}, '
+                       '{vcodec}, {acodec}.',
+        'ports': {'in': ['in'], 'out': ['out']},
+        'fields': [],
+        'advanced_fields': COMMON_ADVANCED,
+    },
+
+    # ---------------- Logic ----------------
+    'logic.condition': {
+        'label': 'Condition',
+        'category': 'logic', 'icon': 'fa-code-branch', 'color': '#a78bfa',
+        'description': 'Evaluates an expression. Routes to "true" or "false" '
+                       'port based on the result.',
+        'ports': {'in': ['in'], 'out': ['true', 'false']},
+        'fields': [
+            {'name': 'expression', 'type': 'text', 'label': 'Expression',
+             'required': True, 'default': 'size > 1000000',
+             'help': 'Python expression. Available: filename, basename, ext, '
+                     'url, size, index, total, duration, width, height, '
+                     'vcodec, acodec, vars (dict), re (module). '
+                     'Example: "mp4" in filename and size > 10_000_000'},
+        ],
+        'advanced_fields': [],
+    },
+    'logic.switch': {
+        'label': 'Switch',
+        'category': 'logic', 'icon': 'fa-sitemap', 'color': '#a78bfa',
+        'description': 'Evaluates an expression and routes to the matching '
+                       'case port, or "default".',
+        'ports': {'in': ['in'],
+                  'out': ['1', '2', '3', 'default']},  # rendered per config
+        'fields': [
+            {'name': 'expression', 'type': 'text', 'label': 'Expression',
+             'required': True, 'default': 'ext',
+             'help': 'Python expression. Result is compared to each case key. '
+                     'Example: ext  →  cases "mp4", "mkv", "webm"'},
+            {'name': 'cases', 'type': 'text', 'label': 'Cases (comma-separated)',
+             'default': 'mp4,mkv,webm',
+             'help': 'If expression matches a case, that port fires. '
+                     'Otherwise the "default" port fires.'},
+        ],
+        'advanced_fields': [],
+    },
+    'logic.merge': {
+        'label': 'Merge',
+        'category': 'logic', 'icon': 'fa-code-merge', 'color': '#a78bfa',
+        'description': 'Joins multiple branches back into one path.',
+        'ports': {'in': ['in'], 'out': ['out']},
+        'fields': [
+            {'name': 'mode', 'type': 'select', 'label': 'Mode',
+             'options': ['all', 'any'], 'default': 'all',
+             'help': '"all" waits for every input branch to arrive. '
+                     '"any" fires on the first incoming wire.'},
+        ],
+        'advanced_fields': [],
+    },
+
+    # ---------------- Data ----------------
+    'data.transform': {
+        'label': 'Transform',
+        'category': 'data', 'icon': 'fa-wand-magic-sparkles', 'color': '#4ade80',
+        'description': 'Modifies a context value using a Python expression, '
+                       'or sets a variable from a template.',
+        'ports': {'in': ['in'], 'out': ['out']},
+        'fields': [
+            {'name': 'target', 'type': 'text', 'label': 'Target key',
+             'required': True, 'default': 'filename',
+             'help': 'Which context key to write. Use "vars.<name>" to set '
+                     'a custom variable.'},
+            {'name': 'expression', 'type': 'text', 'label': 'Value expression',
+             'required': True, 'default': 'filename.lower()',
+             'help': 'Python expression or template. If it looks like a '
+                     'template ({filename}), placeholders are expanded. '
+                     'Otherwise it is evaluated as Python.'},
+        ],
+        'advanced_fields': COMMON_ADVANCED,
+    },
+    'data.set_variable': {
+        'label': 'Set Variable',
+        'category': 'data', 'icon': 'fa-tag', 'color': '#4ade80',
+        'description': 'Sets a custom variable you can reference later as '
+                       '{vars.name} or in expressions as vars["name"].',
+        'ports': {'in': ['in'], 'out': ['out']},
+        'fields': [
+            {'name': 'name', 'type': 'text', 'label': 'Variable name',
+             'required': True, 'default': 'my_var'},
+            {'name': 'value', 'type': 'text', 'label': 'Value',
+             'default': '{url}',
+             'help': 'Template — {url}, {filename}, {index}, etc. are expanded.'},
+        ],
+        'advanced_fields': COMMON_ADVANCED,
     },
 }
 
 
 # ============================================================
+# Safe expression evaluation
+# ============================================================
+_SAFE_BUILTINS = {
+    'abs': abs, 'bool': bool, 'float': float, 'int': int,
+    'len': len, 'max': max, 'min': min, 'str': str, 'round': round,
+    'True': True, 'False': False, 'None': None,
+    'any': any, 'all': all,
+}
+
+
+def _safe_eval(expr, ctx_dict):
+    """Evaluate a Python expression in a locked namespace."""
+    if not expr or not str(expr).strip():
+        return None
+    ns = dict(_SAFE_BUILTINS)
+    ns.update(ctx_dict)
+    ns['re'] = re
+    try:
+        return eval(str(expr), {'__builtins__': {}}, ns)
+    except Exception as e:
+        raise Exception(f"Expression error: {e}")
+
+
+def _ctx_to_dict(ctx):
+    """Flatten context into an eval namespace."""
+    d = {
+        'url':      ctx.get('url', ''),
+        'filename': ctx.get('filename', ''),
+        'basename': ctx.get('basename', ''),
+        'ext':      os.path.splitext(ctx.get('filename', ''))[1].lstrip('.'),
+        'size':     ctx.get('size', 0),
+        'index':    ctx.get('index', 0),
+        'total':    ctx.get('total', 0),
+        'quality':  ctx.get('quality', 'best'),
+        'duration': ctx.get('duration', 0),
+        'width':    ctx.get('width', 0),
+        'height':   ctx.get('height', 0),
+        'vcodec':   ctx.get('vcodec', ''),
+        'acodec':   ctx.get('acodec', ''),
+        'vars':     ctx.get('vars', {}),
+    }
+    return d
+
+
+# ============================================================
 # Graph helpers
 # ============================================================
+def _norm_edge(e):
+    """Ensure edge has a from_port. v2 edges lack it."""
+    if 'from_port' not in e or not e.get('from_port'):
+        e['from_port'] = 'out'
+    return e
+
+
+def _node_ports(node_type):
+    return NODE_TYPES.get(node_type, {}).get('ports', {'in': ['in'], 'out': ['out']})
+
+
+def _in_edges(node_id, edges):
+    return [e for e in edges if e.get('to') == node_id]
+
+
+def _out_edges(node_id, edges, port=None):
+    out = [e for e in edges if e.get('from') == node_id]
+    if port is not None:
+        out = [e for e in out if _norm_edge(e)['from_port'] == port]
+    return out
+
+
 def _topological_order(nodes, edges):
-    """Return nodes in execution order (Kahn's algorithm). None if cycle."""
+    """Kahn's algorithm — returns list of node dicts or None if cycle."""
     ids = {n['id'] for n in nodes}
     adj = {nid: [] for nid in ids}
     indeg = {nid: 0 for nid in ids}
 
     for e in edges:
-        f, t = e.get('from'), e.get('to')
+        f = e.get('from')
+        t = e.get('to')
         if f in ids and t in ids:
             adj[f].append(t)
             indeg[t] += 1
@@ -180,30 +416,31 @@ def _topological_order(nodes, edges):
 
 
 def _migrate_workflow(wf):
-    """Auto-convert old (no edges / no positions) to new format."""
+    """Migrate v2 (no positions, no ports) to v3."""
     if not isinstance(wf, dict):
         return wf
     nodes = wf.get('nodes') or []
     if not nodes:
         return wf
 
+    # Add positions if missing
     for i, node in enumerate(nodes):
         if 'x' not in node or not isinstance(node.get('x'), (int, float)):
             node['x'] = 80 + i * 280
         if 'y' not in node or not isinstance(node.get('y'), (int, float)):
             node['y'] = 200
 
-    if 'edges' not in wf or not isinstance(wf.get('edges'), list):
-        edges = []
-        for i in range(len(nodes) - 1):
-            edges.append({'from': nodes[i]['id'], 'to': nodes[i + 1]['id']})
-        wf['edges'] = edges
+    # Normalize edges
+    edges = wf.get('edges') or []
+    for e in edges:
+        _norm_edge(e)
+    wf['edges'] = edges
 
     return wf
 
 
 # ============================================================
-# Throttled task updates
+# Progress throttling
 # ============================================================
 _last_save = {}
 _last_save_lock = threading.Lock()
@@ -287,24 +524,52 @@ def _format_size(n):
 
 
 def _expand_template(text, ctx):
+    """Replace {key} placeholders."""
     if not text:
         return ''
-    values = {
-        'url':      ctx.get('url', ''),
-        'filename': ctx.get('filename', ''),
-        'basename': ctx.get('basename', ''),
-        'size':     _format_size(ctx.get('size', 0)),
-        'index':    str(ctx.get('index', '')),
-        'total':    str(ctx.get('total', '')),
-        'ext':      os.path.splitext(ctx.get('filename', ''))[1].lstrip('.'),
-    }
-    return re.sub(r'\{(\w+)\}', lambda m: values.get(m.group(1), m.group(0)), text)
+    d = _ctx_to_dict(ctx)
+    d['vars'] = ctx.get('vars', {})
+    def repl(m):
+        key = m.group(1)
+        # vars.name form
+        if key.startswith('vars.'):
+            return str(d['vars'].get(key[5:], ''))
+        return str(d.get(key, m.group(0)))
+    return re.sub(r'\{([\w.]+)\}', repl, text)
 
 
 # ============================================================
-# Node action handlers
+# Playlist expansion
 # ============================================================
-def _handle_download(task_id, node_id, config, ctx):
+def _expand_playlist(url, max_items=0):
+    from features.url_download import COOKIES_FILE
+    cmd = ['yt-dlp', '--flat-playlist', '--print', '%(webpage_url)s',
+           '--no-warnings', '--ignore-errors', '--no-color']
+    if max_items and max_items > 0:
+        cmd += ['--playlist-end', str(max_items)]
+    if os.path.exists(COOKIES_FILE):
+        cmd += ['--cookies', COOKIES_FILE]
+    cmd.append(url)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except Exception as e:
+        logger.warning(f'Playlist expansion failed: {e}')
+        return []
+    if r.returncode != 0:
+        return []
+    urls, seen = [], set()
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line and line.startswith(('http://', 'https://')) and line not in seen:
+            seen.add(line)
+            urls.append(line)
+    return urls
+
+
+# ============================================================
+# Node handlers — return list of output ports to fire
+# ============================================================
+def _h_download(task_id, node_id, config, ctx):
     url = ctx.get('url')
     if not url:
         raise Exception('No URL in context')
@@ -380,13 +645,12 @@ def _handle_download(task_id, node_id, config, ctx):
     ctx['filename'] = os.path.basename(final_path)
     ctx['basename'] = os.path.splitext(ctx['filename'])[0]
     ctx['size'] = size
-    _update_node_progress(task_id, node_id, 100, 'done')
     _log(task_id, node_id, 'success',
          f'Downloaded {ctx["filename"]} ({_format_size(size)})')
-    return ctx
+    return ['out']
 
 
-def _handle_download_file(task_id, node_id, config, ctx):
+def _h_download_file(task_id, node_id, config, ctx):
     import requests
     url = ctx.get('url')
     if not url:
@@ -426,19 +690,18 @@ def _handle_download_file(task_id, node_id, config, ctx):
     ctx['filename'] = out_name
     ctx['basename'] = os.path.splitext(out_name)[0]
     ctx['size'] = size
-    _update_node_progress(task_id, node_id, 100, 'done')
     _log(task_id, node_id, 'success',
          f'Downloaded {out_name} ({_format_size(size)})')
-    return ctx
+    return ['out']
 
 
-def _handle_telegram_send(task_id, node_id, config, ctx):
+def _h_telegram_send(task_id, node_id, config, ctx):
     file_path = ctx.get('file_path')
     if not file_path or not os.path.exists(file_path):
-        raise Exception('No file in context — add a Download node first')
+        raise Exception('No file in context')
     chat_link = (config.get('chat_link') or '').strip()
     if not chat_link:
-        raise Exception('Chat link is required')
+        raise Exception('Chat link required')
     caption = _expand_template(config.get('caption') or '', ctx) or None
 
     from features.telegram import (
@@ -481,10 +744,9 @@ def _handle_telegram_send(task_id, node_id, config, ctx):
             time.sleep(0.3)
             continue
         if sub.get('status') == 'done':
-            _update_node_progress(task_id, node_id, 100, 'done')
             _log(task_id, node_id, 'success', f'Sent to {chat_link}')
             delete_task(sub_id)
-            return ctx
+            return ['out']
         if sub.get('status') == 'error':
             err = sub.get('error_msg', 'Telegram send failed')
             delete_task(sub_id)
@@ -492,13 +754,13 @@ def _handle_telegram_send(task_id, node_id, config, ctx):
         _update_node_progress(task_id, node_id, sub.get('upload_progress', 0))
         time.sleep(0.5)
     delete_task(sub_id)
-    raise Exception('Telegram send timed out (1 hour)')
+    raise Exception('Telegram send timed out')
 
 
-def _handle_drive_upload(task_id, node_id, config, ctx):
+def _h_drive_upload(task_id, node_id, config, ctx):
     file_path = ctx.get('file_path')
     if not file_path or not os.path.exists(file_path):
-        raise Exception('No file in context — add a Download node first')
+        raise Exception('No file in context')
     account = (config.get('account') or 'default').strip()
 
     from features.google_drive import get_drive_service, get_colab_folder_id
@@ -525,13 +787,12 @@ def _handle_drive_upload(task_id, node_id, config, ctx):
 
     ctx['drive_file_id'] = response['id']
     ctx['drive_link'] = response.get('webViewLink')
-    _update_node_progress(task_id, node_id, 100, 'done')
     _log(task_id, node_id, 'success',
          f'Uploaded to Drive ({account}): {filename}')
-    return ctx
+    return ['out']
 
 
-def _handle_compress(task_id, node_id, config, ctx):
+def _h_compress(task_id, node_id, config, ctx):
     file_path = ctx.get('file_path')
     if not file_path or not os.path.exists(file_path):
         raise Exception('No file to compress')
@@ -614,19 +875,17 @@ def _handle_compress(task_id, node_id, config, ctx):
     ctx['filename'] = out_name
     ctx['basename'] = os.path.splitext(out_name)[0]
     ctx['size'] = new_size
-    _update_node_progress(task_id, node_id, 100, 'done')
     _log(task_id, node_id, 'success',
          f'Compressed: {_format_size(orig_size)} → {_format_size(new_size)} '
          f'({savings:.0f}% smaller)')
-    return ctx
+    return ['out']
 
 
-def _handle_delete_local(task_id, node_id, config, ctx):
+def _h_delete_local(task_id, node_id, config, ctx):
     file_path = ctx.get('file_path')
     if not file_path:
         _log(task_id, node_id, 'warning', 'No file in context — skipping')
-        _update_node_progress(task_id, node_id, 100, 'done')
-        return ctx
+        return ['out']
     if os.path.exists(file_path):
         try:
             os.remove(file_path)
@@ -634,28 +893,22 @@ def _handle_delete_local(task_id, node_id, config, ctx):
                  f'Deleted {os.path.basename(file_path)}')
         except Exception as e:
             raise Exception(f'Delete failed: {e}')
-    else:
-        _log(task_id, node_id, 'warning', 'File already missing')
     orig = ctx.get('original_file_path')
     if orig and orig != file_path and os.path.exists(orig):
         try:
             os.remove(orig)
-            _log(task_id, node_id, 'info',
-                 f'Also deleted original {os.path.basename(orig)}')
         except Exception:
             pass
     for k in ('file_path', 'filename', 'basename', 'size', 'original_file_path'):
         ctx.pop(k, None)
-    _update_node_progress(task_id, node_id, 100, 'done')
-    return ctx
+    return ['out']
 
 
-def _handle_delete_drive(task_id, node_id, config, ctx):
+def _h_delete_drive(task_id, node_id, config, ctx):
     file_id = ctx.get('drive_file_id')
     if not file_id:
         _log(task_id, node_id, 'warning', 'No Drive file in context — skipping')
-        _update_node_progress(task_id, node_id, 100, 'done')
-        return ctx
+        return ['out']
     account = (config.get('account') or 'default').strip()
     from features.google_drive import get_drive_service
     service = get_drive_service(account)
@@ -666,27 +919,32 @@ def _handle_delete_drive(task_id, node_id, config, ctx):
         _log(task_id, node_id, 'warning', f'Drive delete failed: {e}')
     ctx.pop('drive_file_id', None)
     ctx.pop('drive_link', None)
-    _update_node_progress(task_id, node_id, 100, 'done')
-    return ctx
+    return ['out']
 
 
-def _handle_wait(task_id, node_id, config, ctx):
+def _h_wait(task_id, node_id, config, ctx):
+    import random
     try:
         seconds = float(config.get('seconds') or 5)
     except (TypeError, ValueError):
         seconds = 5
-    seconds = max(0, min(seconds, 600))
-    _log(task_id, node_id, 'info', f'Waiting {seconds}s')
+    try:
+        jitter = float(config.get('jitter') or 0)
+    except (TypeError, ValueError):
+        jitter = 0
+    if jitter > 0:
+        seconds += random.uniform(0, jitter)
+    seconds = max(0, min(seconds, 3600))
+    _log(task_id, node_id, 'info', f'Waiting {seconds:.1f}s')
     end = time.time() + seconds
     while time.time() < end:
         if _is_cancelled(task_id):
             raise _Cancelled()
         time.sleep(0.2)
-    _update_node_progress(task_id, node_id, 100, 'done')
-    return ctx
+    return ['out']
 
 
-def _handle_webhook(task_id, node_id, config, ctx):
+def _h_webhook(task_id, node_id, config, ctx):
     import requests
     url = (config.get('url') or '').strip()
     if not url:
@@ -700,31 +958,144 @@ def _handle_webhook(task_id, node_id, config, ctx):
         else:
             r = requests.post(url, data=body, timeout=30,
                               headers={'Content-Type': 'application/json'})
-        _update_node_progress(task_id, node_id, 100, 'done')
         if 200 <= r.status_code < 300:
             _log(task_id, node_id, 'success', f'HTTP {r.status_code}')
         else:
-            _log(task_id, node_id, 'warning', f'HTTP {r.status_code}')
-        return ctx
+            raise Exception(f'Webhook returned HTTP {r.status_code}')
+        return ['out']
     except Exception as e:
         raise Exception(f'Webhook failed: {e}')
 
 
+def _h_extract_metadata(task_id, node_id, config, ctx):
+    file_path = ctx.get('file_path')
+    if not file_path or not os.path.exists(file_path):
+        raise Exception('No file in context')
+    ffprobe = shutil.which('ffprobe') or 'ffprobe'
+    try:
+        r = subprocess.run(
+            [ffprobe, '-v', 'error', '-print_format', 'json',
+             '-show_format', '-show_streams', file_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            raise Exception('ffprobe failed')
+        data = json.loads(r.stdout or '{}')
+    except Exception as e:
+        raise Exception(f'Metadata extraction failed: {e}')
+
+    fmt = data.get('format', {})
+    streams = data.get('streams', [])
+    v = next((s for s in streams if s.get('codec_type') == 'video'), {})
+    a = next((s for s in streams if s.get('codec_type') == 'audio'), {})
+
+    try:
+        ctx['duration'] = float(fmt.get('duration', 0) or 0)
+    except (TypeError, ValueError):
+        ctx['duration'] = 0
+    ctx['width'] = int(v.get('width', 0) or 0)
+    ctx['height'] = int(v.get('height', 0) or 0)
+    ctx['vcodec'] = v.get('codec_name', '')
+    ctx['acodec'] = a.get('codec_name', '')
+
+    _log(task_id, node_id, 'success',
+         f'Metadata: {ctx["width"]}x{ctx["height"]} · {ctx["duration"]:.1f}s · '
+         f'{ctx["vcodec"] or "?"}/{ctx["acodec"] or "?"}')
+    return ['out']
+
+
+def _h_condition(task_id, node_id, config, ctx):
+    expr = (config.get('expression') or '').strip()
+    if not expr:
+        raise Exception('Condition expression is empty')
+    result = _safe_eval(expr, _ctx_to_dict(ctx))
+    fired = 'true' if bool(result) else 'false'
+    _log(task_id, node_id, 'info', f'Condition → {fired} ({expr[:60]})')
+    return [fired]
+
+
+def _h_switch(task_id, node_id, config, ctx):
+    expr = (config.get('expression') or '').strip()
+    if not expr:
+        raise Exception('Switch expression is empty')
+    raw_cases = (config.get('cases') or '').strip()
+    cases = [c.strip() for c in raw_cases.split(',') if c.strip()]
+
+    result = _safe_eval(expr, _ctx_to_dict(ctx))
+    result_str = str(result) if result is not None else ''
+
+    if result_str in cases:
+        _log(task_id, node_id, 'info', f'Switch → "{result_str}"')
+        return [result_str]
+    _log(task_id, node_id, 'info', f'Switch → "default" ({result_str!r})')
+    return ['default']
+
+
+def _h_merge(task_id, node_id, config, ctx):
+    # Runtime already checked readiness before calling us
+    mode = (config.get('mode') or 'all').lower()
+    _log(task_id, node_id, 'info', f'Merge ({mode})')
+    return ['out']
+
+
+def _h_transform(task_id, node_id, config, ctx):
+    target = (config.get('target') or '').strip()
+    if not target:
+        raise Exception('Target key required')
+    expr = (config.get('expression') or '').strip()
+
+    # If it looks like a template with {placeholders}, expand.
+    if '{' in expr and '}' in expr:
+        value = _expand_template(expr, ctx)
+    else:
+        value = _safe_eval(expr, _ctx_to_dict(ctx))
+
+    if target.startswith('vars.'):
+        var_name = target[5:]
+        if 'vars' not in ctx or not isinstance(ctx['vars'], dict):
+            ctx['vars'] = {}
+        ctx['vars'][var_name] = value
+    else:
+        ctx[target] = value
+    _log(task_id, node_id, 'success',
+         f'{target} = {str(value)[:80]}')
+    return ['out']
+
+
+def _h_set_variable(task_id, node_id, config, ctx):
+    name = (config.get('name') or '').strip()
+    if not name:
+        raise Exception('Variable name required')
+    template = config.get('value') or ''
+    value = _expand_template(template, ctx)
+    if 'vars' not in ctx or not isinstance(ctx['vars'], dict):
+        ctx['vars'] = {}
+    ctx['vars'][name] = value
+    _log(task_id, node_id, 'success', f'vars["{name}"] = {value[:80]}')
+    return ['out']
+
+
 NODE_HANDLERS = {
-    'action.download':      _handle_download,
-    'action.download_file': _handle_download_file,
-    'action.telegram_send': _handle_telegram_send,
-    'action.drive_upload':  _handle_drive_upload,
-    'action.compress':      _handle_compress,
-    'action.delete_local':  _handle_delete_local,
-    'action.delete_drive':  _handle_delete_drive,
-    'action.wait':          _handle_wait,
-    'action.webhook':       _handle_webhook,
+    'action.download':          _h_download,
+    'action.download_file':     _h_download_file,
+    'action.telegram_send':     _h_telegram_send,
+    'action.drive_upload':      _h_drive_upload,
+    'action.compress':          _h_compress,
+    'action.delete_local':      _h_delete_local,
+    'action.delete_drive':      _h_delete_drive,
+    'action.wait':              _h_wait,
+    'action.webhook':           _h_webhook,
+    'action.extract_metadata':  _h_extract_metadata,
+    'logic.condition':          _h_condition,
+    'logic.switch':             _h_switch,
+    'logic.merge':              _h_merge,
+    'data.transform':           _h_transform,
+    'data.set_variable':        _h_set_variable,
 }
 
 
 # ============================================================
-# Workflow storage
+# Storage
 # ============================================================
 def _wf_path(wf_id):
     return os.path.join(WORKFLOWS_DIR, f'{wf_id}.json')
@@ -794,61 +1165,82 @@ def _validate_workflow(workflow):
     if not isinstance(edges, list):
         return 'Edges must be a list'
 
-    # Node validation
+    node_map = {}
     for i, node in enumerate(nodes):
         if not isinstance(node, dict):
             return f'Node {i} must be an object'
         if not node.get('id') or not isinstance(node['id'], str):
             return f'Node {i} missing id'
+        if node['id'] in node_map:
+            return f'Duplicate node id: {node["id"]}'
         ntype = node.get('type')
         if ntype not in NODE_TYPES:
             return f'Node {i} has unknown type: {ntype}'
+        node_map[node['id']] = node
+
         config = node.get('config') or {}
         for field in NODE_TYPES[ntype].get('fields', []):
-            if field.get('required') and not str(config.get(field['name'], '')).strip():
-                return f'{NODE_TYPES[ntype]["label"]}: {field["label"]} is required'
+            if field.get('required'):
+                val = str(config.get(field['name'], '')).strip()
+                if not val:
+                    return f'{NODE_TYPES[ntype]["label"]}: {field["label"]} is required'
 
     # Edge validation
-    ids = {n['id'] for n in nodes}
-    indeg = {nid: 0 for nid in ids}
-    outdeg = {nid: 0 for nid in ids}
     for i, e in enumerate(edges):
         if not isinstance(e, dict):
             return f'Edge {i} must be an object'
         f, t = e.get('from'), e.get('to')
-        if f not in ids or t not in ids:
+        if f not in node_map or t not in node_map:
             return f'Edge {i} references unknown node'
         if f == t:
             return f'Edge {i} is a self-loop'
-        outdeg[f] += 1
-        indeg[t] += 1
+        from_port = e.get('from_port') or 'out'
+        from_ports = _node_ports(node_map[f]['type'])['out']
+        if from_port not in from_ports:
+            return (f'Edge {i}: node {f[:8]} has no output port "{from_port}" '
+                    f'(available: {", ".join(from_ports)})')
 
+    # Trigger validation
     triggers = [n for n in nodes if n['type'].startswith('trigger.')]
     if not triggers:
         return 'Need at least one trigger node'
     if len(triggers) > 1:
-        return 'Only one trigger allowed per workflow'
+        return 'Only one trigger allowed'
     trigger = triggers[0]
 
-    if indeg[trigger['id']] > 0:
+    if _in_edges(trigger['id'], edges):
         return 'Trigger cannot have incoming connections'
-    if outdeg[trigger['id']] > 1:
-        return 'Trigger can only connect to one node'
 
-    for n in nodes:
-        if n['id'] == trigger['id']:
+    # Incoming edge count per non-trigger node
+    for node in nodes:
+        if node['id'] == trigger['id']:
             continue
-        if indeg[n['id']] != 1:
-            return (f'{NODE_TYPES[n["type"]]["label"]}: must have exactly '
-                    f'1 incoming connection (has {indeg[n["id"]]})')
-        if outdeg[n['id']] > 1:
-            return f'{NODE_TYPES[n["type"]]["label"]}: at most 1 outgoing connection'
+        ins = _in_edges(node['id'], edges)
+        if node['type'] == 'logic.merge':
+            if len(ins) < 2:
+                return f'{NODE_TYPES[node["type"]]["label"]} needs at least 2 incoming connections'
+        else:
+            if len(ins) != 1:
+                return (f'{NODE_TYPES[node["type"]]["label"]}: must have exactly '
+                        f'1 incoming connection (has {len(ins)})')
 
-    order = _topological_order(nodes, edges)
-    if order is None:
+    # Cycle detection
+    if _topological_order(nodes, edges) is None:
         return 'Workflow contains a cycle'
-    if order[0]['id'] != trigger['id']:
-        return 'Trigger must be the starting node'
+
+    # Reachability check
+    reachable = {trigger['id']}
+    changed = True
+    while changed:
+        changed = False
+        for e in edges:
+            if e.get('from') in reachable and e.get('to') not in reachable:
+                reachable.add(e['to'])
+                changed = True
+    unreachable = [n['id'] for n in nodes if n['id'] not in reachable]
+    if unreachable:
+        return (f'{len(unreachable)} node(s) unreachable from trigger. '
+                f'Connect them or delete them.')
 
     return None
 
@@ -856,36 +1248,149 @@ def _validate_workflow(workflow):
 # ============================================================
 # Executor
 # ============================================================
+def _execute_node(task_id, node, node_config, ctx):
+    """Run a single node with retry/error handling."""
+    handler = NODE_HANDLERS.get(node['type'])
+    if not handler:
+        raise Exception(f'No handler for {node["type"]}')
+
+    # Skip condition
+    skip_expr = (node_config.get('skip_if') or '').strip()
+    if skip_expr:
+        try:
+            if _safe_eval(skip_expr, _ctx_to_dict(ctx)):
+                _log(task_id, node['id'], 'info', f'Skipped ({skip_expr})')
+                return ['out']  # pass through
+        except Exception as e:
+            _log(task_id, node['id'], 'warning',
+                 f'skip_if error: {e} — running anyway')
+
+    retry_max = int(node_config.get('retry_max') or 0)
+    retry_delay = float(node_config.get('retry_delay') or 3)
+    on_error = (node_config.get('on_error') or 'stop').lower()
+
+    attempt = 0
+    last_err = None
+    while attempt <= retry_max:
+        if _is_cancelled(task_id):
+            raise _Cancelled()
+        try:
+            ports = handler(task_id, node['id'], node_config, ctx)
+            _update_node_progress(task_id, node['id'], 100, 'done')
+            return ports or ['out']
+        except _Cancelled:
+            raise
+        except Exception as e:
+            last_err = e
+            attempt += 1
+            if attempt <= retry_max:
+                _log(task_id, node['id'], 'warning',
+                     f'Attempt {attempt}/{retry_max + 1} failed: {e}. '
+                     f'Retrying in {retry_delay}s…')
+                end = time.time() + retry_delay
+                while time.time() < end:
+                    if _is_cancelled(task_id):
+                        raise _Cancelled()
+                    time.sleep(0.2)
+
+    # All retries exhausted
+    if on_error == 'continue':
+        _log(task_id, node['id'], 'error',
+             f'Failed (continuing): {last_err}')
+        _update_node_progress(task_id, node['id'], 100, 'error')
+        return ['out']  # pass through anyway
+    else:
+        _update_node_progress(task_id, node['id'], 100, 'error')
+        raise last_err
+
+
+def _prepare_items(task_id, trigger, edges):
+    """Expand trigger config into a list of items."""
+    cfg = trigger.get('config') or {}
+
+    if trigger['type'] == 'trigger.url_list':
+        urls_raw = str(cfg.get('urls', '')).strip()
+        raw = [ln.strip() for ln in urls_raw.split('\n')
+               if ln.strip() and not ln.strip().startswith('#')]
+        if not raw:
+            raise Exception('URL list is empty')
+
+        if cfg.get('expand_playlists', True):
+            from features.url_download import is_playlist_url
+            try:
+                max_items = int(cfg.get('max_items', 0) or 0)
+            except (TypeError, ValueError):
+                max_items = 0
+            _log(task_id, trigger['id'], 'info',
+                 f'Checking {len(raw)} URL(s) for playlists…')
+            expanded = []
+            for u in raw:
+                if _is_cancelled(task_id):
+                    raise _Cancelled()
+                if is_playlist_url(u):
+                    _log(task_id, trigger['id'], 'info',
+                         f'Expanding: {u[:80]}')
+                    vids = _expand_playlist(u, max_items)
+                    if vids:
+                        _log(task_id, trigger['id'], 'success',
+                             f'Playlist → {len(vids)} video(s)')
+                        expanded.extend(vids)
+                    else:
+                        expanded.append(u)
+                else:
+                    expanded.append(u)
+            return expanded
+        return raw
+
+    if trigger['type'] == 'trigger.file_glob':
+        import glob
+        pattern = cfg.get('pattern') or '*.mp4'
+        try:
+            max_items = int(cfg.get('max_items', 0) or 0)
+        except (TypeError, ValueError):
+            max_items = 0
+        matches = sorted(glob.glob(os.path.join(UPLOAD_FOLDER, pattern),
+                                   recursive=True))
+        if not matches:
+            raise Exception(f'No files matched: {pattern}')
+        files = []
+        for m in matches:
+            if os.path.isfile(m):
+                files.append(m)
+                if max_items > 0 and len(files) >= max_items:
+                    break
+        return files
+
+    raise Exception(f'Unknown trigger type: {trigger["type"]}')
+
+
 def _run_workflow(task_id, workflow):
     nodes = workflow['nodes']
     edges = workflow.get('edges', [])
+    node_map = {n['id']: n for n in nodes}
 
-    ordered = _topological_order(nodes, edges)
-    if not ordered:
-        _log(task_id, None, 'error', 'Cannot determine execution order')
+    order = _topological_order(nodes, edges)
+    if not order:
+        _log(task_id, None, 'error', 'Cycle detected — cannot run')
         raise Exception('Invalid workflow graph')
 
-    trigger = ordered[0]
-    action_nodes = ordered[1:]
+    trigger = next((n for n in nodes if n['type'].startswith('trigger.')), None)
+    if not trigger:
+        raise Exception('No trigger node')
 
     try:
-        trigger_config = trigger.get('config') or {}
-        urls_raw = str(trigger_config.get('urls', '')).strip()
-        items = [
-            ln.strip() for ln in urls_raw.split('\n')
-            if ln.strip() and not ln.strip().startswith('#')
-        ]
+        items = _prepare_items(task_id, trigger, edges)
         if not items:
-            raise Exception('URL list is empty')
+            raise Exception('Trigger produced no items')
 
         task = load_task(task_id)
-        task['items'] = items
+        task['items'] = [str(x)[:200] for x in items]  # truncate for storage
         task['total_items'] = len(items)
         save_task(task_id, task)
 
         _log(task_id, None, 'info',
              f'Starting "{workflow.get("name", "Untitled")}" — '
-             f'{len(items)} item(s), {len(action_nodes)} action(s)')
+             f'{len(items)} item(s), {len(nodes) - 1} node(s)')
 
         for idx, item in enumerate(items):
             if _is_cancelled(task_id):
@@ -893,51 +1398,83 @@ def _run_workflow(task_id, workflow):
 
             task = load_task(task_id)
             task['current_item_index'] = idx
-            task['current_item'] = item
+            task['current_item'] = str(item)[:200]
             task['progress'] = int(100 * idx / len(items))
             task['node_statuses'] = {}
             save_task(task_id, task)
 
             _log(task_id, None, 'info',
-                 f'▶ Item {idx + 1}/{len(items)}: {item[:100]}')
+                 f'▶ Item {idx + 1}/{len(items)}: {str(item)[:100]}')
 
             ctx = {
-                'item': item, 'url': item,
-                'index': idx + 1, 'total': len(items),
-                'quality': trigger_config.get('quality', 'best'),
+                'item': item,
+                'url': str(item),
+                'index': idx + 1,
+                'total': len(items),
+                'quality': (trigger.get('config') or {}).get('quality', 'best'),
+                'vars': {},
             }
 
-            for node in action_nodes:
+            # ---- Token-based traversal ----
+            incoming_count = {nid: 0 for nid in node_map}
+            expected_count = {nid: len(_in_edges(nid, edges)) for nid in node_map}
+            completed = set()
+            worklist = [trigger['id']]
+
+            while worklist:
                 if _is_cancelled(task_id):
                     raise _Cancelled()
 
-                node_id = node['id']
-                node_type = node['type']
-                node_config = node.get('config') or {}
-                meta = NODE_TYPES[node_type]
+                node_id = worklist.pop(0)
+                if node_id in completed:
+                    continue
 
+                node = node_map[node_id]
+                node_cfg = node.get('config') or {}
+
+                # Readiness check for merge nodes
+                in_count = incoming_count[node_id]
+                exp = expected_count[node_id]
+                if exp > 0 and in_count < exp:
+                    if node['type'] == 'logic.merge' and \
+                       (node_cfg.get('mode') or 'all').lower() == 'any':
+                        pass  # 'any' mode: fire now
+                    else:
+                        continue  # wait for more inputs
+
+                # Mark running
                 task = load_task(task_id)
                 task['current_node_id'] = node_id
                 task['node_statuses'][node_id] = {'status': 'running', 'progress': 0}
                 save_task(task_id, task)
-
-                _log(task_id, node_id, 'info', f'Starting {meta["label"]}')
-
-                handler = NODE_HANDLERS.get(node_type)
-                if not handler:
-                    raise Exception(f'No handler for {node_type}')
+                _log(task_id, node_id, 'info',
+                     f'Running {NODE_TYPES[node["type"]]["label"]}')
 
                 try:
-                    result = handler(task_id, node_id, node_config, ctx)
-                    if result:
-                        ctx = result
+                    fired_ports = _execute_node(task_id, node, node_cfg, ctx)
                 except _Cancelled:
                     raise
                 except Exception as e:
-                    logger.exception(f'Node {node_id} ({node_type}) failed')
-                    raise Exception(f'{meta["label"]}: {e}')
+                    logger.exception(f'Node {node_id} failed')
+                    raise Exception(
+                        f'{NODE_TYPES[node["type"]]["label"]}: {e}')
 
-                _update_node_progress(task_id, node_id, 100, 'done')
+                completed.add(node_id)
+
+                # Fire output ports
+                for port in fired_ports:
+                    for edge in _out_edges(node_id, edges, port):
+                        to_id = edge['to']
+                        if to_id in completed:
+                            continue
+                        incoming_count[to_id] = incoming_count.get(to_id, 0) + 1
+                        exp_to = expected_count.get(to_id, 0)
+                        if exp_to == 0 or incoming_count[to_id] >= exp_to:
+                            worklist.append(to_id)
+                        elif (node_map[to_id]['type'] == 'logic.merge' and
+                              (node_map[to_id].get('config') or {}).get('mode', 'all').lower() == 'any'):
+                            # 'any' merge fires on first incoming
+                            worklist.append(to_id)
 
         task = load_task(task_id)
         if task:
@@ -945,7 +1482,7 @@ def _run_workflow(task_id, workflow):
             task['progress'] = 100
             save_task(task_id, task)
         _log(task_id, None, 'success',
-             f'✅ All {len(items)} item(s) processed successfully')
+             f'✅ All {len(items)} item(s) processed')
 
     except _Cancelled:
         task = load_task(task_id)
@@ -991,7 +1528,7 @@ def register_routes(app):
             return jsonify({'error': err}), 400
         wf_id = _save_workflow(data)
         if not wf_id:
-            return jsonify({'error': 'Failed to save workflow'}), 500
+            return jsonify({'error': 'Failed to save'}), 500
         return jsonify({'id': wf_id})
 
     @app.route('/workflow/delete/<wf_id>', methods=['DELETE'])
@@ -1018,7 +1555,7 @@ def register_routes(app):
         save_task(task_id, {
             'task_id': task_id, 'status': 'running', 'progress': 0,
             'created_at': time.time(), 'cancelled': False,
-            'workflow_name': data.get('name', 'Untitled Workflow'),
+            'workflow_name': data.get('name', 'Untitled'),
             'items': [], 'total_items': 0,
             'current_item_index': 0, 'current_item': '',
             'current_node_id': None, 'node_statuses': {}, 'logs': [],
