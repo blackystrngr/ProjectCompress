@@ -26,8 +26,8 @@ COLAB_OUTPUT_SUBFOLDER = "Processed"
 # ============================================================
 # Settings (shared settings.json, key: coordinator_enabled)
 # ============================================================
+from config import SETTINGS_FILE
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SETTINGS_FILE = os.path.join(PROJECT_ROOT, 'settings.json')
 _settings_lock = threading.Lock()
 
 
