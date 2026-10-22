@@ -1,7 +1,7 @@
 <div class="card">
-    <h2><i class="fas fa-cut"></i> Video Clipper, Summarizer, Frame Extractor, Trim & Face Swap</h2>
+    <h2><i class="fas fa-cut"></i> Video Clipper, Summarizer, Frame Extractor &amp; Trim</h2>
 
-    <!-- ========== Random Clips + Compress (unified) ========== -->
+    <!-- ========== Random Clips + Compress ========== -->
     <div style="margin-bottom: 2rem; padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
         <h3><i class="fas fa-film"></i> Random Clips</h3>
         <p>Divides video into segments, picks a random clip from each, and merges them.
@@ -144,7 +144,7 @@
     </div>
 
     <!-- ========== Trim / Crop by Timestamp ========== -->
-    <div style="margin-bottom: 2rem; padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
+    <div style="padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
         <h3><i class="fas fa-scissors"></i> Crop / Trim by Timestamp</h3>
         <p>Cut an exact segment from the video by entering a start and end time.
            Accepts <code>HH:MM:SS</code>, <code>MM:SS</code>, or plain seconds.</p>
@@ -186,23 +186,6 @@
             Select a video, enter start and end times, then click Trim.
         </div>
     </div>
-
-    <!-- ========== Face Swap ========== -->
-    <div style="padding: 1rem; background: rgba(25,30,45,0.4); border-radius: 1.5rem;">
-        <h3><i class="fas fa-exchange-alt"></i> Face Swap – Photo to Video</h3>
-        <p>Select a video and upload a face photo. The face will be swapped onto the video.</p>
-        <div class="input-group" style="flex-wrap: wrap;">
-            <div style="flex:2; min-width:150px;"><div style="font-size:0.7rem; color:#aaa;">Video file</div>
-                <select id="faceSwapVideoSelect" style="width:100%;"><option>Loading videos...</option></select>
-            </div>
-            <input type="file" id="photoInput" accept="image/jpeg,image/png,image/jpg" style="display: none;">
-            <button id="selectPhotoBtn" class="primary"><i class="fas fa-image"></i> Select Photo</button>
-            <span id="photoName" style="margin-left: 0.5rem; color: #aaa;">No photo chosen</span>
-            <div><button id="startSwapBtn" class="primary"><i class="fas fa-play"></i> Start Face Swap</button></div>
-        </div>
-        <div id="swapStatus" class="help-text"></div>
-        <div id="swapResult" class="empty-state">Select a video, choose a photo, then click Start.</div>
-    </div>
 </div>
 
 <script>
@@ -227,8 +210,7 @@ async function loadAllVideos() {
         const resp = await fetch('/clipper/list_videos');
         const videos = await resp.json();
         const selects = ['clipsVideoSelect', 'summaryVideoSelect',
-                         'faceSwapVideoSelect', 'frameVideoSelect',
-                         'trimVideoSelect'];
+                         'frameVideoSelect', 'trimVideoSelect'];
         selects.forEach(id => {
             const sel = document.getElementById(id);
             if (!sel) return;
@@ -284,7 +266,6 @@ loadAllVideos();
         const isAV1 = codecSel.value === 'av1';
         presetX265.style.display = isAV1 ? 'none' : 'block';
         presetAV1.style.display = isAV1 ? 'block' : 'none';
-        // Set sensible CRF default when switching codec
         const current = parseInt(crfInput.value) || 0;
         if (isAV1 && current <= 30) crfInput.value = 32;
         else if (!isAV1 && current > 30) crfInput.value = 27;
@@ -612,67 +593,4 @@ document.getElementById('extractFramesBtn').onclick = async () => {
         } catch (e) { console.error(e); }
     }
 })();
-
-// ========== Face Swap ==========
-let swapTaskId = null, swapTimer = null;
-const startSwapBtn = document.getElementById('startSwapBtn');
-const faceSwapVideoSelect = document.getElementById('faceSwapVideoSelect');
-const photoInput = document.getElementById('photoInput');
-const selectPhotoBtn = document.getElementById('selectPhotoBtn');
-const photoNameSpan = document.getElementById('photoName');
-const swapStatus = document.getElementById('swapStatus');
-const swapResult = document.getElementById('swapResult');
-let selectedPhoto = null;
-
-selectPhotoBtn.onclick = () => photoInput.click();
-photoInput.onchange = () => {
-    if (photoInput.files.length > 0) {
-        selectedPhoto = photoInput.files[0];
-        photoNameSpan.textContent = selectedPhoto.name;
-    } else {
-        selectedPhoto = null;
-        photoNameSpan.textContent = 'No photo chosen';
-    }
-};
-
-startSwapBtn.onclick = async () => {
-    const video = faceSwapVideoSelect.value;
-    if (!video) { showToast('Select a video', true); return; }
-    if (!selectedPhoto) { showToast('Select a photo', true); return; }
-    const formData = new FormData();
-    formData.append('video_path', video);
-    formData.append('photo', selectedPhoto);
-    try {
-        const resp = await fetch('/face_swap/start', { method: 'POST', body: formData });
-        const data = await resp.json();
-        if (data.error) throw new Error(data.error);
-        swapTaskId = data.task_id;
-        if (typeof storeTaskId === 'function') {
-            storeTaskId('face_swap', swapTaskId);
-        } else {
-            localStorage.setItem('face_swap_task_id', swapTaskId);
-        }
-        swapStatus.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Face swap started...';
-        swapResult.innerHTML = '<div class="empty-state">Processing...</div>';
-        if (swapTimer) clearInterval(swapTimer);
-        swapTimer = setInterval(async () => {
-            const prog = await fetch(`/progress/${swapTaskId}`);
-            const t = await prog.json();
-            if (t.status === 'done') {
-                clearInterval(swapTimer);
-                swapStatus.innerHTML = `✅ Done! <a href="/download/${t.output_file}" target="_blank">Download swapped video</a>`;
-                swapResult.innerHTML = `<div class="empty-state">✅ Result ready: <a href="/download/${t.output_file}">${t.output_file}</a></div>`;
-                localStorage.removeItem('face_swap_task_id');
-            } else if (t.status === 'error') {
-                clearInterval(swapTimer);
-                swapStatus.innerHTML = `❌ Error: ${t.error_msg}`;
-                swapResult.innerHTML = '<div class="empty-state">Face swap failed.</div>';
-                localStorage.removeItem('face_swap_task_id');
-            } else {
-                swapStatus.innerHTML = `<i class="fas fa-spinner fa-pulse"></i> ${t.status} (${t.progress || 0}%)`;
-                swapResult.innerHTML = `<div class="empty-state">Processing (${t.progress || 0}%)...</div>`;
-            }
-        }, 2000);
-    } catch (err) { showToast(err.message, true); }
-};
 </script>
