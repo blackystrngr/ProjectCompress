@@ -108,16 +108,12 @@
 </div>
 
 <style>
-/* ─────────────────────────────────────────────────────────
-   Workflow canvas — GPU-friendly styles
-   ───────────────────────────────────────────────────────── */
 .wf-layout { display: grid; grid-template-columns: 220px 1fr 320px;
              gap: 0.6rem; margin-bottom: 0.6rem; min-height: 700px; }
 .wf-panel { background: rgba(18, 22, 35, 0.8);
             border: 1px solid rgba(80, 100, 140, 0.3); border-radius: 1rem;
             overflow: hidden; display: flex; flex-direction: column;
-            max-height: 700px;
-            contain: layout style; }
+            max-height: 700px; contain: layout style; }
 .wf-panel-header { padding: 0.6rem 0.9rem; font-size: 0.78rem; font-weight: 600;
                    color: #b0c4ff; text-transform: uppercase;
                    letter-spacing: 0.04em;
@@ -133,7 +129,7 @@
 
 .wf-viewport { position: relative; width: 100%; height: 100%; min-height: 700px;
                overflow: hidden; cursor: grab;
-               contain: strict;                 /* isolate layout + paint */
+               contain: strict;
                background-color: #0a0e18;
                background-image:
                    linear-gradient(rgba(95, 143, 224, 0.08) 1px, transparent 1px),
@@ -153,9 +149,7 @@
 .wf-nodes { position: absolute; top: 0; left: 0; width: 100%; height: 100%;
             pointer-events: none; }
 
-/* ── Nodes: transform-based positioning, CSS containment ── */
-.wf-node { position: absolute;
-           top: 0; left: 0;                  /* base — moved via transform */
+.wf-node { position: absolute; top: 0; left: 0;
            width: 240px; min-height: 90px;
            background: linear-gradient(135deg, rgba(25, 30, 45, 0.95), rgba(18, 22, 35, 0.95));
            border: 1px solid rgba(80, 100, 140, 0.5); border-left-width: 4px;
@@ -163,11 +157,10 @@
            box-shadow: 0 8px 24px -10px rgba(0, 0, 0, 0.6);
            cursor: move; pointer-events: auto; user-select: none;
            display: flex; flex-direction: column; gap: 0.3rem;
-           contain: layout style;            /* isolate layout to this node */
+           contain: layout style;
            transition: border-color 0.15s; }
 .wf-node:hover { border-color: #5f8fe0; }
-.wf-node.selected { box-shadow: 0 0 0 2px #5f8fe0;
-                    z-index: 10; }
+.wf-node.selected { box-shadow: 0 0 0 2px #5f8fe0; z-index: 10; }
 .wf-node.dragging { will-change: transform; z-index: 100; }
 .wf-node.running { animation: wfNodePulse 1.4s ease-in-out infinite; }
 .wf-node.done { border-left-color: #4ade80 !important; }
@@ -191,7 +184,6 @@
                         background: linear-gradient(90deg, #5f8fe0, #a5c0ff);
                         transition: width 0.4s; }
 
-/* ── Ports ── */
 .wf-port { position: absolute; width: 14px; height: 14px; border-radius: 50%;
            background: #1e2438; border: 2px solid #5f8fe0;
            transform: translateY(-50%); cursor: crosshair;
@@ -211,7 +203,6 @@
                  border-radius: 3px; }
 .wf-port-in .wf-port-label { right: auto; left: 18px; }
 
-/* ── Wires: no drop-shadow, GPU-friendly ── */
 .wf-wire-hit { fill: none; stroke: transparent; stroke-width: 18;
                pointer-events: stroke; cursor: pointer; }
 .wf-wire-visible { fill: none; stroke: #5f8fe0; stroke-width: 2.5;
@@ -223,7 +214,6 @@
                 animation: wfWireDash 0.6s linear infinite; }
 @keyframes wfWireDash { to { stroke-dashoffset: -12; } }
 
-/* ── Palette ── */
 .wf-palette-item { padding: 0.5rem 0.6rem; background: rgba(25, 30, 45, 0.8);
                    border: 1px solid rgba(80, 100, 140, 0.35); border-radius: 0.5rem;
                    cursor: pointer; margin-bottom: 0.35rem;
@@ -240,7 +230,6 @@
                   margin: 0.5rem 0 0.3rem; padding-left: 0.2rem; }
 .wf-palette-cat:first-child { margin-top: 0; }
 
-/* ── Inspector fields ── */
 .wf-field { display: block; margin-bottom: 0.7rem; }
 .wf-field-label { display: block; font-size: 0.7rem; color: #b0c4ff;
                   margin-bottom: 0.25rem; font-weight: 500; }
@@ -282,7 +271,6 @@
                     color: #b0c4ff; }
 .wf-test-node-btn:hover { background: rgba(95, 143, 224, 0.35); border-color: #5f8fe0; }
 
-/* ── Zoom controls ── */
 .wf-zoom-controls { position: absolute; bottom: 0.8rem; right: 0.8rem;
                     display: flex; gap: 0.3rem; z-index: 100; }
 .wf-zoom-controls button { width: 32px; height: 32px; padding: 0;
@@ -299,7 +287,6 @@
            padding: 0.35rem 0.7rem; border-radius: 0.4rem;
            border: 1px solid rgba(80, 100, 140, 0.3); pointer-events: none; z-index: 100; }
 
-/* ── Log ── */
 .wf-log-line { padding: 0.15rem 0; font-family: 'JetBrains Mono', monospace;
                font-size: 0.72rem; border-bottom: 1px solid rgba(255, 255, 255, 0.03);
                line-height: 1.4; }
@@ -327,6 +314,7 @@ const NODE_W = 240;
 const MIN_ZOOM = 0.3, MAX_ZOOM = 2.5;
 const DRAG_THRESHOLD = 3;
 const AUTOSAVE_DELAY_MS = 3500;
+const POLL_INTERVAL_MS = 3000;
 
 // ── State ──
 let NODE_TYPES = {};
@@ -336,13 +324,11 @@ let currentWorkflowId = null;
 let isDirty = false;
 let isSaving = false;
 let autosaveTimer = null;
-let streamSource = null;
 let pollInterval = null;
 let runningTaskId = null;
 let nodeStatuses = {};
 let failedTaskId = null;
 
-// nodeId -> Set of edge indices (for incremental wire updates)
 let nodeEdgeIndices = new Map();
 
 let panX = 0, panY = 0, zoom = 1;
@@ -452,16 +438,6 @@ function scheduleRenderNodes() {
     requestAnimationFrame(() => {
         _renderNodesScheduled = false;
         renderNodes();
-    });
-}
-
-let _renderWiresScheduled = false;
-function scheduleRenderWires() {
-    if (_renderWiresScheduled) return;
-    _renderWiresScheduled = true;
-    requestAnimationFrame(() => {
-        _renderWiresScheduled = false;
-        renderWires();
     });
 }
 
@@ -624,7 +600,7 @@ function renderNodes() {
     attachNodeEvents();
 }
 
-// ── Render wires (full rebuild — only on structural change) ──
+// ── Render wires ──
 function renderWires() {
     let html = '';
     edges.forEach((edge, idx) => {
@@ -877,15 +853,12 @@ document.addEventListener('mousemove', (e) => {
         node.x = dragStart.nodeStartX + dx;
         node.y = dragStart.nodeStartY + dy;
 
-        // Compositor-only transform update (no layout)
         if (draggedNodeEl) {
             draggedNodeEl.style.transform =
                 `translate3d(${node.x}px, ${node.y}px, 0)`;
         }
 
-        // Only update wires connected to this node
         updateConnectedWires(node.id);
-
         dragOffset = { x: dx, y: dy };
     }
 
@@ -1272,26 +1245,20 @@ async function stopWorkflow() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// SSE — the modern replacement for polling
+// Live updates — polling only (no SSE, no EventSource)
 // ═══════════════════════════════════════════════════════════
 function stopStream() {
-    if (streamSource) {
-        try { streamSource.close(); } catch (e) {}
-        streamSource = null;
-    }
+    if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
 }
 
 function startStream(taskId) {
     stopStream();
-    if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
 
     let lastLogTs = 0;
     let lastStatusesJSON = '';
     let lastAwaitingJSON = '';
-    let consecutiveErrors = 0;
 
     function handleUpdate(t) {
-        // Node statuses
         const statusesJSON = JSON.stringify(t.node_statuses || {});
         if (statusesJSON !== lastStatusesJSON) {
             lastStatusesJSON = statusesJSON;
@@ -1299,9 +1266,7 @@ function startStream(taskId) {
             scheduleRenderNodes();
         }
 
-        // Logs — append only newer entries
-        const logs = t.logs || [];
-        for (const entry of logs) {
+        for (const entry of (t.logs || [])) {
             const ts = entry.ts || 0;
             if (ts > lastLogTs) {
                 appendLogEntry(entry);
@@ -1309,14 +1274,12 @@ function startStream(taskId) {
             }
         }
 
-        // Awaiting input
         const awaitingJSON = JSON.stringify(t.awaiting_input || null);
         if (awaitingJSON !== lastAwaitingJSON) {
             lastAwaitingJSON = awaitingJSON;
             updateAwaitingUI(taskId, t.awaiting_input);
         }
 
-        // Status line
         if (t.status === 'running') {
             const idx = (t.current_item_index || 0) + 1;
             const total = t.total_items || 0;
@@ -1335,10 +1298,10 @@ function startStream(taskId) {
             hideAwaitingUI();
             try { localStorage.removeItem('wf_last_task_id'); } catch (e) {}
             resetRunButtons();
+            stopStream();
         } else if (t.status === 'error') {
             const item = (t.failed_item_index != null)
-                ? ` at item ${t.failed_item_index + 1}/${t.total_items}`
-                : '';
+                ? ` at item ${t.failed_item_index + 1}/${t.total_items}` : '';
             wfStatus.textContent = '❌ Failed' + item + ' · click Resume';
             wfStatus.style.color = '#ff8a8a';
             runningTaskId = null;
@@ -1347,6 +1310,7 @@ function startStream(taskId) {
             try { localStorage.setItem('wf_failed_task_id', taskId); } catch (e) {}
             try { localStorage.removeItem('wf_last_task_id'); } catch (e) {}
             resetRunButtons();
+            stopStream();
         } else if (t.status === 'cancelled') {
             wfStatus.textContent = '⛔ Cancelled';
             wfStatus.style.color = '#f59e0b';
@@ -1354,111 +1318,32 @@ function startStream(taskId) {
             hideAwaitingUI();
             try { localStorage.removeItem('wf_last_task_id'); } catch (e) {}
             resetRunButtons();
-        }
-    }
-
-    function connect() {
-        try {
-            streamSource = new EventSource(`/workflow/stream/${taskId}`);
-        } catch (e) {
-            console.error('EventSource construct failed:', e);
-            startPollingFallback(taskId);
-            return;
-        }
-
-        streamSource.onopen = () => { consecutiveErrors = 0; };
-
-        streamSource.onmessage = (ev) => {
-            try {
-                const t = JSON.parse(ev.data);
-                handleUpdate(t);
-            } catch (e) {
-                console.error('SSE parse error', e);
-            }
-        };
-
-        streamSource.addEventListener('close', (ev) => {
-            try {
-                if (ev.data) {
-                    const t = JSON.parse(ev.data);
-                    handleUpdate(t);
-                }
-            } catch (e) {}
             stopStream();
-        });
-
-        streamSource.addEventListener('error', () => {
-            consecutiveErrors++;
-            if (consecutiveErrors >= 2) {
-                console.warn('SSE failed, falling back to polling');
-                stopStream();
-                startPollingFallback(taskId);
-            }
-        });
+        }
     }
 
-    connect();
-}
-
-// ═══════════════════════════════════════════════════════════
-// Polling fallback (only used if SSE is blocked by a proxy)
-// ═══════════════════════════════════════════════════════════
-function startPollingFallback(taskId) {
-    if (pollInterval) clearInterval(pollInterval);
-    let lastLogTs = 0;
-    let lastStatusesJSON = '';
-    let lastAwaitingJSON = '';
-
-    const tick = async () => {
+    async function tick() {
         try {
             const r = await fetch(`/workflow/progress_lite/${taskId}`,
                                    { cache: 'no-store' });
             if (r.status === 404) {
-                clearInterval(pollInterval);
+                stopStream();
                 runningTaskId = null;
                 resetRunButtons();
                 return;
             }
             const t = await r.json();
-            const statusesJSON = JSON.stringify(t.node_statuses || {});
-            if (statusesJSON !== lastStatusesJSON) {
-                lastStatusesJSON = statusesJSON;
-                nodeStatuses = t.node_statuses || {};
-                scheduleRenderNodes();
-            }
-            for (const entry of (t.logs || [])) {
-                if ((entry.ts || 0) > lastLogTs) {
-                    appendLogEntry(entry);
-                    lastLogTs = entry.ts;
-                }
-            }
-            const awaitingJSON = JSON.stringify(t.awaiting_input || null);
-            if (awaitingJSON !== lastAwaitingJSON) {
-                lastAwaitingJSON = awaitingJSON;
-                updateAwaitingUI(taskId, t.awaiting_input);
-            }
-            if (t.status === 'running') {
-                const idx = (t.current_item_index || 0) + 1;
-                const total = t.total_items || 0;
-                wfStatus.textContent = `● Running · item ${idx}/${total}`;
-                wfStatus.style.color = '#5f8fe0';
-            } else if (t.status === 'done' || t.status === 'error' || t.status === 'cancelled') {
-                clearInterval(pollInterval);
-                runningTaskId = null;
-                if (t.status === 'error') {
-                    failedTaskId = taskId;
-                    try { localStorage.setItem('wf_failed_task_id', taskId); } catch (e) {}
-                }
-                hideAwaitingUI();
-                try { localStorage.removeItem('wf_last_task_id'); } catch (e) {}
-                resetRunButtons();
-            }
-        } catch (e) { console.error('Poll error:', e); }
-    };
+            handleUpdate(t);
+        } catch (e) {
+            console.warn('poll error:', e);
+        }
+    }
+
     tick();
-    pollInterval = setInterval(tick, 2500);
+    pollInterval = setInterval(tick, POLL_INTERVAL_MS);
 }
 
+// ── Awaiting approval ──
 function updateAwaitingUI(taskId, awaiting) {
     const card = document.getElementById('wfAwaitingCard');
     const msg = document.getElementById('wfAwaitingMessage');
@@ -1692,10 +1577,9 @@ $('wfZoomReset').addEventListener('click', () => {
     applyTransform();
 });
 
-// ── Cleanup on unload ──
+// ── Cleanup ──
 window.addEventListener('beforeunload', () => {
     stopStream();
-    if (pollInterval) clearInterval(pollInterval);
 });
 
 // ── Init ──
