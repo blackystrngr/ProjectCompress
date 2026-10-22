@@ -25,10 +25,12 @@ logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-TELEGRAM_CREDS_FILE = os.path.join(BASE_DIR, 'telegram_creds.json')
-TELEGRAM_SESSION    = os.path.join(BASE_DIR, 'telegram_session')
-LOGGER_SESSION      = os.path.join(BASE_DIR, 'telegram_logger_session')
-LOGGER_BOT_SESSION  = os.path.join(BASE_DIR, 'telegram_logger_bot')
+from config import (
+    TELEGRAM_CREDS_FILE,
+    TELEGRAM_SESSION_FILE       as TELEGRAM_SESSION,
+    TELEGRAM_LOGGER_SESSION     as LOGGER_SESSION,
+    TELEGRAM_LOGGER_BOT_SESSION as LOGGER_BOT_SESSION,
+)
 
 MAX_MSG_LEN       = 3800
 MAX_QUEUE_SIZE    = 500
