@@ -9,7 +9,6 @@ from . import subtitle_finder
 from . import video_extractor
 from . import video_clipper
 from . import torrent_search
-from . import face_swap
 from . import ocr
 from . import web_crawler
 from . import thumbnails
@@ -37,7 +36,6 @@ def register_all_features(app):
     video_extractor.register_routes(app)
     video_clipper.register_routes(app)
     torrent_search.register_routes(app)
-    face_swap.register_routes(app)
     ocr.register_routes(app)
     web_crawler.register_routes(app)
     thumbnails.register_routes(app)
