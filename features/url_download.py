@@ -1375,17 +1375,28 @@ def download_with_ytdlp(url, task_id, quality='best', title_based=False):
         '-o', output_template,
         '-f', format_choice,
         '--merge-output-format', 'mp4',
-        '--no-part', '--no-mtime', '--no-warnings', '--ignore-errors',
+        '--no-mtime', '--no-warnings', '--ignore-errors',
         '--impersonate', 'chrome',
-        '--extractor-args', 'youtube:player_client=mweb',
+        # Multi-client fallback — mweb alone is unstable lately
+        '--extractor-args',
+        'youtube:player_client=android,web,tv_embedded,ios',
         '--extractor-args', 'generic:impersonate',
         '--ffmpeg-location', ffmpeg_path,
         '--newline', '--progress', '--no-colors',
-        '--concurrent-fragments', CONCURRENT_FRAGMENTS,
-        '--retries', '3', '--fragment-retries', '3',
+        '--concurrent-fragments', '1',
+        # Much more patient with flaky connections
+        '--retries', '20',
+        '--fragment-retries', '20',
+        '--retry-sleep', '5',
+        '--socket-timeout', '30',
+        '--http-chunk-size', '10M',
+        # Keep .part files so retries resume instead of restarting
+        '--continue',
         '--no-playlist',
     ]
+    
 
+  
     if os.path.exists(COOKIES_FILE):
         cmd += ['--cookies', COOKIES_FILE]
 
@@ -1577,18 +1588,23 @@ def download_playlist(url, task_id, quality='best', range_start=1, range_end=0):
         '-o', output_template,
         '-f', format_choice,
         '--merge-output-format', 'mp4',
-        '--no-part', '--no-mtime', '--no-warnings', '--ignore-errors',
+        '--no-mtime', '--no-warnings', '--ignore-errors',
         '--impersonate', 'chrome',
-        '--extractor-args', 'youtube:player_client=mweb',
+        '--extractor-args',
+        'youtube:player_client=android,web,tv_embedded,ios',
         '--extractor-args', 'generic:impersonate',
         '--ffmpeg-location', ffmpeg_path,
         '--newline', '--progress', '--no-colors',
-        '--concurrent-fragments', CONCURRENT_FRAGMENTS,
-        '--retries', '3', '--fragment-retries', '3',
+        '--concurrent-fragments', '1',
+        '--retries', '20',
+        '--fragment-retries', '20',
+        '--retry-sleep', '5',
+        '--socket-timeout', '30',
+        '--http-chunk-size', '10M',
+        '--continue',
         '--yes-playlist',
         '--download-archive', archive_file,
     ]
-
     if range_start > 1 or range_end > 0:
         items = f"{range_start}-{range_end}" if range_end > 0 else f"{range_start}-"
         cmd += ['--playlist-items', items]
