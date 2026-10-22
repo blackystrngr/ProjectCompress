@@ -137,7 +137,7 @@ def get_effective_config() -> dict:
 # ============================================================
 def register_routes(app):
 
-    logger.info(f"Registering settings routes (file={SETTINGS_FILE})")
+    logger.info(f"Settings file: {SETTINGS_FILE} (secrets dir: {SECRETS_DIR})")
 
     @app.route('/settings', methods=['GET'])
     def settings_get():
