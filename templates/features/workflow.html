@@ -36,7 +36,7 @@
         <i class="fas fa-info-circle"></i>
         Drag nodes · Connect <b>●</b> → <b>●</b> · Click wire to delete ·
         Scroll to zoom · Delete removes selected
-        <span style="margin-left: 0.5rem; color: #22d3ee;">💾 Auto-saves · ⚡ Live updates</span>
+        <span style="margin-left: 0.5rem; color: #22d3ee;">💾 Auto-saves · ⚡ Live (SSE + polling)</span>
     </div>
 </div>
 
@@ -309,14 +309,13 @@
 (function () {
 'use strict';
 
-// ── Constants ──
 const NODE_W = 240;
 const MIN_ZOOM = 0.3, MAX_ZOOM = 2.5;
 const DRAG_THRESHOLD = 3;
 const AUTOSAVE_DELAY_MS = 3500;
-const POLL_INTERVAL_MS = 3000;
+const POLL_INTERVAL_MS = 4000;
+const SSE_STALL_MS = 3000;
 
-// ── State ──
 let NODE_TYPES = {};
 let nodes = [], edges = [];
 let selectedNodeId = null;
@@ -325,6 +324,7 @@ let isDirty = false;
 let isSaving = false;
 let autosaveTimer = null;
 let pollInterval = null;
+let streamSource = null;
 let runningTaskId = null;
 let nodeStatuses = {};
 let failedTaskId = null;
@@ -340,7 +340,6 @@ let draggedNodeEl = null;
 let wireSource = null;
 let wireTempEl = null;
 
-// ── DOM refs ──
 const $ = (id) => document.getElementById(id);
 const viewport = $('wfViewport');
 const world = $('wfWorld');
@@ -363,7 +362,6 @@ const exportBtn = $('wfExportBtn');
 const importBtn = $('wfImportBtn');
 const importInput = $('wfImportInput');
 
-// ── Utils ──
 function escapeHtml(s) {
     if (!s) return '';
     return String(s).replace(/[&<>"]/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));
@@ -378,7 +376,6 @@ function nodeById(id) { return nodes.find(n => n.id === id); }
 function applyTransform() {
     world.style.transform = `translate3d(${panX}px, ${panY}px, 0) scale(${zoom})`;
 }
-
 function screenToWorld(clientX, clientY) {
     const rect = viewport.getBoundingClientRect();
     return {
@@ -406,7 +403,6 @@ function zoomAt(factor, clientX, clientY) {
     applyTransform();
 }
 
-// ── Port helpers ──
 function nodePorts(node) {
     const meta = NODE_TYPES[node.type];
     if (!meta || !meta.ports) return { in: ['in'], out: ['out'] };
@@ -430,7 +426,6 @@ function portWorldPos(node, portName, direction) {
     };
 }
 
-// ── rAF-scheduled renders ──
 let _renderNodesScheduled = false;
 function scheduleRenderNodes() {
     if (_renderNodesScheduled) return;
@@ -441,7 +436,6 @@ function scheduleRenderNodes() {
     });
 }
 
-// ── Wire geometry (incremental) ──
 function wirePath(x1, y1, x2, y2) {
     const dx = Math.max(60, Math.abs(x2 - x1) * 0.5);
     return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
@@ -471,8 +465,7 @@ function updateWireGeometry(edgeIdx) {
     const g = wiresEl.querySelector(`[data-edge-idx="${edgeIdx}"]`);
     if (!g) return;
     const d = wirePath(p1.x, p1.y, p2.x, p2.y);
-    const paths = g.querySelectorAll('path');
-    for (const p of paths) p.setAttribute('d', d);
+    for (const p of g.querySelectorAll('path')) p.setAttribute('d', d);
 }
 
 function updateConnectedWires(nodeId) {
@@ -481,7 +474,6 @@ function updateConnectedWires(nodeId) {
     for (const idx of set) updateWireGeometry(idx);
 }
 
-// ── Palette ──
 function renderPalette() {
     const cats = {};
     Object.entries(NODE_TYPES).forEach(([type, meta]) => {
@@ -507,7 +499,6 @@ function renderPalette() {
     });
 }
 
-// ── Node summary ──
 function nodeSummary(type, config) {
     config = config || {};
     if (type === 'trigger.url_list') {
@@ -543,7 +534,6 @@ function nodeSummary(type, config) {
     return '';
 }
 
-// ── Render nodes (transform-based positioning) ──
 function renderNodes() {
     if (!nodes.length) {
         nodesEl.innerHTML = '';
@@ -600,7 +590,6 @@ function renderNodes() {
     attachNodeEvents();
 }
 
-// ── Render wires ──
 function renderWires() {
     let html = '';
     edges.forEach((edge, idx) => {
@@ -639,7 +628,6 @@ function renderWires() {
     });
 }
 
-// ── Inspector ──
 function renderInspector() {
     if (!selectedNodeId) {
         inspectorEl.innerHTML = `<div style="font-size: 0.8rem; color: #6b7a9c;
@@ -763,7 +751,6 @@ function renderAll() {
     if (exportBtn) exportBtn.disabled = !currentWorkflowId;
 }
 
-// ── Node events ──
 function attachNodeEvents() {
     nodesEl.querySelectorAll('.wf-node').forEach(el => {
         const nodeId = el.dataset.nodeId;
@@ -812,7 +799,6 @@ function attachNodeEvents() {
     });
 }
 
-// ── Viewport events ──
 viewport.addEventListener('mousedown', (e) => {
     if (e.button === 1 || (e.button === 0 && e.target === viewport)) {
         mode = 'panning';
@@ -857,7 +843,6 @@ document.addEventListener('mousemove', (e) => {
             draggedNodeEl.style.transform =
                 `translate3d(${node.x}px, ${node.y}px, 0)`;
         }
-
         updateConnectedWires(node.id);
         dragOffset = { x: dx, y: dy };
     }
@@ -929,7 +914,6 @@ function createEdge(fromId, fromPort, toId) {
     markDirty();
 }
 
-// ── Node CRUD ──
 function addNodeFromPalette(type) {
     if (!NODE_TYPES[type]) return;
     if (type.startsWith('trigger.') && nodes.some(n => n.type.startsWith('trigger.'))) {
@@ -1031,7 +1015,6 @@ document.addEventListener('keydown', (e) => {
     }
 });
 
-// ── Autosave ──
 function markDirty() {
     isDirty = true;
     updateToolbarState();
@@ -1080,7 +1063,6 @@ function updateResumeButton() {
     }
 }
 
-// ── Save / Load ──
 async function loadWorkflowList() {
     try {
         const r = await fetch('/workflow/list', { cache: 'no-store' });
@@ -1183,7 +1165,6 @@ async function saveWorkflow(silent = false) {
     }
 }
 
-// ── Run / Stop ──
 async function runWorkflow(dryRun) {
     if (runningTaskId) return;
     if (!nodes.length) { showToast('Empty workflow', true); return; }
@@ -1245,9 +1226,13 @@ async function stopWorkflow() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// Live updates — polling only (no SSE, no EventSource)
+// SSE + guaranteed 4s polling fallback
 // ═══════════════════════════════════════════════════════════
 function stopStream() {
+    if (streamSource) {
+        try { streamSource.close(); } catch (e) {}
+        streamSource = null;
+    }
     if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
 }
 
@@ -1257,8 +1242,13 @@ function startStream(taskId) {
     let lastLogTs = 0;
     let lastStatusesJSON = '';
     let lastAwaitingJSON = '';
+    let sseAlive = false;
+    let pollActive = false;
+    let stallTimer = null;
 
     function handleUpdate(t) {
+        if (!t || typeof t !== 'object') return;
+
         const statusesJSON = JSON.stringify(t.node_statuses || {});
         if (statusesJSON !== lastStatusesJSON) {
             lastStatusesJSON = statusesJSON;
@@ -1322,14 +1312,19 @@ function startStream(taskId) {
         }
     }
 
-    async function tick() {
+    // ── Polling fallback: always fires within 4s of start, catches
+    //    anything SSE misses. Also runs if SSE stalls or errors.
+    async function pollOnce() {
         try {
-            const r = await fetch(`/workflow/progress_lite/${taskId}`,
-                                   { cache: 'no-store' });
-            if (r.status === 404) {
-                stopStream();
-                runningTaskId = null;
-                resetRunButtons();
+            const url = `/workflow/progress_lite/${taskId}` +
+                        (lastLogTs ? `?since=${lastLogTs}` : '');
+            const r = await fetch(url, { cache: 'no-store' });
+            if (!r.ok) {
+                if (r.status === 404) {
+                    stopStream();
+                    runningTaskId = null;
+                    resetRunButtons();
+                }
                 return;
             }
             const t = await r.json();
@@ -1339,11 +1334,77 @@ function startStream(taskId) {
         }
     }
 
-    tick();
-    pollInterval = setInterval(tick, POLL_INTERVAL_MS);
+    function startPollingFallback() {
+        if (pollActive) return;
+        pollActive = true;
+        pollOnce();
+        pollInterval = setInterval(pollOnce, POLL_INTERVAL_MS);
+    }
+
+    // ── SSE ──
+    try {
+        streamSource = new EventSource(`/workflow/stream/${taskId}`);
+
+        // If SSE doesn't deliver ANY message in SSE_STALL_MS, start polling
+        stallTimer = setTimeout(() => {
+            if (!sseAlive) {
+                console.info('[workflow] SSE stalled — starting polling fallback');
+                startPollingFallback();
+            }
+        }, SSE_STALL_MS);
+
+        streamSource.onopen = () => {
+            console.info('[workflow] SSE connected');
+        };
+
+        streamSource.onmessage = (ev) => {
+            sseAlive = true;
+            if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
+            // If polling is running but SSE recovers, keep both — dedupe
+            // is handled by lastLogTs / lastStatusesJSON comparison
+            try {
+                const t = JSON.parse(ev.data);
+                handleUpdate(t);
+            } catch (e) {
+                console.error('SSE parse error:', e);
+            }
+        };
+
+        streamSource.addEventListener('close', (ev) => {
+            sseAlive = true;
+            if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
+            try {
+                if (ev.data) handleUpdate(JSON.parse(ev.data));
+            } catch (e) {}
+            stopStream();
+        });
+
+        streamSource.onerror = () => {
+            console.warn('[workflow] SSE error');
+            if (!sseAlive) {
+                startPollingFallback();
+            }
+            // Don't close — EventSource auto-reconnects, and polling
+            // is already catching anything in the meantime
+        };
+    } catch (e) {
+        console.error('EventSource ctor failed:', e);
+        startPollingFallback();
+    }
+
+    // Always kick off a polling cycle after POLL_INTERVAL_MS regardless
+    // of SSE — belt and suspenders so the log ALWAYS renders.
+    setTimeout(() => {
+        if (!sseAlive) {
+            startPollingFallback();
+        } else {
+            // Even if SSE works, run one poll to make sure we have the
+            // current state (SSE may have been slow to send the first event)
+            pollOnce();
+        }
+    }, 800);
 }
 
-// ── Awaiting approval ──
 function updateAwaitingUI(taskId, awaiting) {
     const card = document.getElementById('wfAwaitingCard');
     const msg = document.getElementById('wfAwaitingMessage');
@@ -1424,7 +1485,6 @@ async function loadExistingRun(taskId) {
     } catch (e) { console.error(e); }
 }
 
-// ── Context inspector ──
 document.getElementById('wfContextBtn').addEventListener('click', async () => {
     const panel = document.getElementById('wfContextPanel');
     if (panel.style.display === 'block') {
@@ -1444,7 +1504,6 @@ document.getElementById('wfContextBtn').addEventListener('click', async () => {
     } catch (e) { panel.textContent = 'Error: ' + e.message; }
 });
 
-// ── Toolbar wiring ──
 wfSelect.addEventListener('change', () => {
     if (isDirty && !confirm('Discard unsaved changes?')) {
         wfSelect.value = currentWorkflowId || '';
@@ -1512,125 +1571,4 @@ importInput.addEventListener('change', async () => {
         const r = await fetch('/workflow/import', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(data),
-        });
-        const result = await r.json();
-        if (!r.ok) throw new Error(result.error || 'Import failed');
-        showToast(`Imported: ${result.name}`);
-        await loadWorkflowList();
-        await loadWorkflow(result.id);
-    } catch (e) {
-        showToast('Import failed: ' + e.message, true);
-    } finally { importInput.value = ''; }
-});
-
-resumeBtn.addEventListener('click', async () => {
-    if (!failedTaskId || runningTaskId) return;
-    if (isDirty && currentWorkflowId) {
-        const ok = await saveWorkflow(true);
-        if (!ok) { showToast('Cannot resume: save failed', true); return; }
-    }
-    resumeBtn.disabled = true;
-    resumeBtn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Resuming…';
-    try {
-        const r = await fetch(`/workflow/resume/${failedTaskId}`, { method: 'POST' });
-        const data = await r.json();
-        if (!r.ok) throw new Error(data.error || 'Resume failed');
-        failedTaskId = null;
-        try { localStorage.removeItem('wf_failed_task_id'); } catch (e) {}
-        runningTaskId = data.task_id;
-        try { localStorage.setItem('wf_last_task_id', runningTaskId); } catch (e) {}
-        nodeStatuses = {};
-        wfLog.innerHTML = '';
-        runBtn.disabled = true;
-        dryRunBtn.disabled = true;
-        stopBtn.style.display = '';
-        updateResumeButton();
-        updateToolbarState();
-        renderAll();
-        startStream(runningTaskId);
-        let msg = `Resumed: ${data.completed_items}/${data.total_items} ` +
-                  `already done (attempt ${data.resume_attempts})`;
-        if (data.graph_changed) {
-            const stats = data.checkpoint_stats || {};
-            msg += ` — workflow changed (${stats.dropped_partial || 0} dropped)`;
-        }
-        showToast(msg);
-    } catch (e) {
-        showToast('Resume failed: ' + e.message, true);
-    } finally {
-        resumeBtn.innerHTML = '<i class="fas fa-redo"></i> Resume';
-        updateResumeButton();
-    }
-});
-
-$('wfZoomIn').addEventListener('click', () => {
-    const r = viewport.getBoundingClientRect();
-    zoomAt(1.2, r.left + r.width / 2, r.top + r.height / 2);
-});
-$('wfZoomOut').addEventListener('click', () => {
-    const r = viewport.getBoundingClientRect();
-    zoomAt(1 / 1.2, r.left + r.width / 2, r.top + r.height / 2);
-});
-$('wfZoomReset').addEventListener('click', () => {
-    panX = 0; panY = 0; zoom = 1;
-    applyTransform();
-});
-
-// ── Cleanup ──
-window.addEventListener('beforeunload', () => {
-    stopStream();
-});
-
-// ── Init ──
-(async () => {
-    try {
-        const r = await fetch('/workflow/node-types', { cache: 'no-store' });
-        NODE_TYPES = await r.json();
-    } catch (e) {
-        wfHint.textContent = 'Failed to load workflow engine';
-        return;
-    }
-    renderPalette();
-    applyTransform();
-    await loadWorkflowList();
-
-    let lastId = null;
-    try { lastId = localStorage.getItem('wf_last_id'); } catch (e) {}
-    if (lastId) await loadWorkflow(lastId);
-    else { renderAll(); updateToolbarState(); }
-
-    let lastTaskId = null;
-    try { lastTaskId = localStorage.getItem('wf_last_task_id'); } catch (e) {}
-    if (lastTaskId) await loadExistingRun(lastTaskId);
-
-    let storedFailed = null;
-    try { storedFailed = localStorage.getItem('wf_failed_task_id'); } catch (e) {}
-    if (storedFailed && !runningTaskId) {
-        try {
-            const r = await fetch(`/workflow/resume/info/${storedFailed}`,
-                                   { cache: 'no-store' });
-            if (r.ok) {
-                const info = await r.json();
-                if (info.resumable && info.status === 'error') {
-                    failedTaskId = storedFailed;
-                    const item = (info.failed_item_index != null)
-                        ? ` at item ${info.failed_item_index + 1}/${info.total_items}`
-                        : '';
-                    wfStatus.textContent = '❌ Failed' + item +
-                        ` (${info.completed_items}/${info.total_items} done)` +
-                        ' · click Resume';
-                    wfStatus.style.color = '#ff8a8a';
-                } else {
-                    try { localStorage.removeItem('wf_failed_task_id'); } catch (e) {}
-                }
-            }
-        } catch (e) {
-            try { localStorage.removeItem('wf_failed_task_id'); } catch (e) {}
-        }
-        updateResumeButton();
-    }
-})();
-
-})();
-</script>
+            body: JSON
