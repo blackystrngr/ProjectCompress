@@ -394,6 +394,49 @@ def get_colab_output_folder_id(account='default'):
         return None
 
 
+def upload_to_colab_processing(input_path, account='default',
+                                task_id=None, node_id=None):
+    """
+    Upload a file to Colab_Processing (no Colab wait).
+    Returns the Drive API response dict ({id, name, webViewLink}).
+    If task_id given, progress is written to task['upload_progress'].
+    """
+    from googleapiclient.http import MediaFileUpload
+
+    if not os.path.exists(input_path):
+        raise Exception(f'Input file not found: {input_path}')
+
+    service = get_drive_service(account)
+    folder_id = get_colab_folder_id(account)
+    if not folder_id:
+        raise Exception(f'Cannot resolve Colab_Processing for {account}')
+
+    filename = os.path.basename(input_path)
+    media = MediaFileUpload(input_path, resumable=True,
+                             chunksize=10 * 1024 * 1024)
+    req = service.files().create(
+        body={'name': filename, 'parents': [folder_id]},
+        media_body=media,
+        fields='id, name, webViewLink, size',
+    )
+
+    response = None
+    while response is None:
+        status, response = req.next_chunk()
+        if status and task_id:
+            pct = int(status.progress() * 100)
+            try:
+                from features.workflow import _update_node_progress
+                if node_id:
+                    _update_node_progress(task_id, node_id, pct)
+            except Exception:
+                pass
+
+    logger.info(f"Uploaded '{filename}' to Colab_Processing ({account}): "
+                f"id={response.get('id')}")
+    return response
+                                    
+
 def get_all_processed_outputs(force_refresh=False):
     with _processed_cache['lock']:
         now = time.time()
