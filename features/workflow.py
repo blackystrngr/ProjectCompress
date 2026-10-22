@@ -2322,7 +2322,6 @@ def register_routes(app):
             headers={
                 'Cache-Control': 'no-cache, no-transform',
                 'X-Accel-Buffering': 'no',
-                'Connection': 'keep-alive',
             },
         )
 
