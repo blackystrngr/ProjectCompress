@@ -12,19 +12,36 @@ logger = logging.getLogger(__name__)
 _save_lock = threading.Lock()
 _task_cache_lock = threading.Lock()
 
-# ---------- In-memory task cache (the big win) ----------
+# ---------- In-memory task cache ----------
 _task_cache = {}     # task_id -> task dict
 
 # ---------- SSE broadcaster ----------
 _subscribers = []
 _subscribers_lock = threading.Lock()
 
-# Statuses that represent search/scan *results* rather than a download in progress.
+# ---------- Broadcast coalescing ----------
+_broadcast_timer = None
+_broadcast_timer_lock = threading.Lock()
+
+# Statuses hidden from the visible task list
 _HIDDEN_STATUSES = {'search_done', 'scan_done'}
 
-# Terminal statuses kept visible briefly so users can see results.
+# Terminal statuses kept visible briefly
 _TERMINAL_STATUSES = {'done', 'error', 'cancelled'}
-TERMINAL_RETENTION_SECONDS = 600  # 10 minutes
+TERMINAL_RETENTION_SECONDS = 600
+
+# Fields the browser task panel never needs — excluded from broadcasts
+# to keep SSE payloads small (~2 KB instead of ~150 KB per task).
+_HEAVY_FIELDS = {
+    'workflow_snapshot',   # node graph
+    'items',               # playlist URLs
+    'checkpoints',         # per-item progress snapshots (grows O(n))
+    'context_snapshots',   # ctx at each node
+    'node_timings',        # per-node durations
+    'logs',                # workflow logs (up to 500 entries)
+    'candidates',          # URL cracker candidates
+    'process_pid',         # internal
+}
 
 
 # ============================================================
@@ -32,12 +49,10 @@ TERMINAL_RETENTION_SECONDS = 600  # 10 minutes
 # ============================================================
 def load_task(task_id):
     """Return task dict (from cache if possible, else from disk)."""
-    # 1. Cache hit
     with _task_cache_lock:
         if task_id in _task_cache:
             return dict(_task_cache[task_id])
 
-    # 2. Disk fallback
     path = os.path.join(TASKS_DIR, f"{task_id}.json")
     if not os.path.exists(path):
         return None
@@ -48,7 +63,6 @@ def load_task(task_id):
             logger.error(f"Task {task_id} missing 'task_id' – removing")
             os.remove(path)
             return None
-        # Cache it
         with _task_cache_lock:
             _task_cache[task_id] = task
         return dict(task)
@@ -62,12 +76,10 @@ def load_task(task_id):
 
 
 def save_task(task_id, task_data):
-    """Save task to cache + disk, then broadcast."""
-    # 1. Update cache immediately (all readers see it instantly)
+    """Save task to cache + disk, then schedule a coalesced broadcast."""
     with _task_cache_lock:
         _task_cache[task_id] = dict(task_data)
 
-    # 2. Write to disk (atomic)
     success = False
     with _save_lock:
         os.makedirs(TASKS_DIR, exist_ok=True)
@@ -75,19 +87,18 @@ def save_task(task_id, task_data):
         tmp = path + '.tmp'
         try:
             with open(tmp, 'w') as f:
-                json.dump(task_data, f, indent=2)
+                json.dump(task_data, f, separators=(',', ':'))  # compact
             os.replace(tmp, path)
             success = True
         except Exception as e:
             logger.error(f"Save error for {task_id}: {e}")
 
-    # 3. Broadcast from cache (no disk reads)
     if success:
-        _broadcast_from_cache()
+        _schedule_broadcast()
 
 
 # ============================================================
-# Active tasks (from cache – NO disk reads)
+# Active tasks (from cache — NO disk reads)
 # ============================================================
 def get_active_tasks():
     """Build the visible task list from the in-memory cache."""
@@ -95,8 +106,6 @@ def get_active_tasks():
     visible = []
     with _task_cache_lock:
         for tid, task in _task_cache.items():
-            if task.get('_hidden'):            # ← NEW: filter internal sub-tasks
-                continue
             status = task.get('status')
             if status in _HIDDEN_STATUSES:
                 continue
@@ -104,14 +113,44 @@ def get_active_tasks():
                 created = task.get('created_at', now)
                 if now - created > TERMINAL_RETENTION_SECONDS:
                     continue
-            safe = {k: v for k, v in task.items() if k != 'process_pid'}
+            # Strip heavy fields → ~2 KB payload instead of ~150 KB
+            safe = {k: v for k, v in task.items() if k not in _HEAVY_FIELDS}
             visible.append(safe)
     return visible
 
 
+# ============================================================
+# Coalesced broadcast
+# ============================================================
+def _schedule_broadcast():
+    """Schedule a broadcast at most once per 300ms."""
+    global _broadcast_timer
+    with _broadcast_timer_lock:
+        if _broadcast_timer is not None:
+            return  # already scheduled
+        _broadcast_timer = threading.Timer(0.3, _do_scheduled_broadcast)
+        _broadcast_timer.daemon = True
+        _broadcast_timer.start()
+
+
+def _do_scheduled_broadcast():
+    global _broadcast_timer
+    with _broadcast_timer_lock:
+        _broadcast_timer = None
+    try:
+        _broadcast_from_cache()
+    except Exception as e:
+        logger.warning(f"Coalesced broadcast failed: {e}")
+
+
 def _broadcast_from_cache():
     """Push current task snapshot to all SSE subscribers."""
-    data = json.dumps(get_active_tasks())
+    try:
+        data = json.dumps(get_active_tasks(), separators=(',', ':'))
+    except Exception as e:
+        logger.warning(f"Failed to serialize tasks: {e}")
+        return
+
     with _subscribers_lock:
         for q in list(_subscribers):
             try:
@@ -128,7 +167,7 @@ def _broadcast_from_cache():
 
 
 def broadcast_active_tasks():
-    """Public alias for compatibility."""
+    """Public alias — used by route handlers."""
     _broadcast_from_cache()
 
 
@@ -158,10 +197,7 @@ def get_all_task_ids():
 
 
 def cleanup_old_tasks(max_age_seconds=86400):
-    """
-    Delete terminal task files older than `max_age_seconds`.
-    Also warms the cache from disk for non-terminal tasks.
-    """
+    """Delete terminal task files older than max_age_seconds."""
     now = time.time()
     cleaned = 0
     with _task_cache_lock:
@@ -174,7 +210,6 @@ def cleanup_old_tasks(max_age_seconds=86400):
         except OSError:
             continue
 
-        # Load into cache if not present (cheap: single read)
         if tid not in cached_ids:
             task = load_task(tid)
             if not task:
@@ -188,7 +223,6 @@ def cleanup_old_tasks(max_age_seconds=86400):
             task = load_task(tid)
             status = task.get('status') if task else None
 
-        # Remove very old terminal tasks
         if status in _TERMINAL_STATUSES and (now - mtime) > max_age_seconds:
             try:
                 os.remove(path)
