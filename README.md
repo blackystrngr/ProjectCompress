@@ -105,8 +105,9 @@ Recent additions to ProjectCompress (v2):
 ```bash
 git clone https://github.com/blackystrng/ProjectCompress.git
 cd ProjectCompress
-chmod +x install.sh
-sudo ./install.sh
+chmod +x setup.sh
+sudo ./setup.sh
+python3 app.py
 ```
 
 The script installs and configures:
