@@ -128,17 +128,22 @@ def _invalidate_processed_cache():
 # ============================================================
 def discover_accounts():
     out = {}
+    from config import SECRETS_DIR
     base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    for path in sorted(glob.glob(os.path.join(base, 'token*.json'))):
-        name = os.path.splitext(os.path.basename(path))[0]
-        if name == 'token':
-            key = 'default'
-        elif name.startswith('token_'):
-            key = name[len('token_'):]
-        else:
+    # Check both BASE_DIR and SECRETS_DIR; secrets overrides legacy
+    for search_dir in (base, SECRETS_DIR):
+        if not os.path.isdir(search_dir):
             continue
-        if _token_file_valid(path):
-            out[key] = path
+        for path in sorted(glob.glob(os.path.join(search_dir, 'token*.json'))):
+            name = os.path.splitext(os.path.basename(path))[0]
+            if name == 'token':
+                key = 'default'
+            elif name.startswith('token_'):
+                key = name[len('token_'):]
+            else:
+                continue
+            if _token_file_valid(path):
+                out[key] = path
     return out
 
 
