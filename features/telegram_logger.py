@@ -56,7 +56,7 @@ _task_started = OrderedDict()   # task_id -> first-seen timestamp (elapsed fallb
 # Presentation helpers
 # ============================================================
 _DIVIDER = '▰▱▰▱▰▱▰▱▰▱▰▱'
-_BATCH_SEP = '\n\n🔹▫️🔹▫️🔹▫️🔹\n\n'
+_BATCH_SEP = '\n\n'
 
 _LEVEL_STYLE = {
     # level      (colour bar, icon, flair)
@@ -239,7 +239,7 @@ def notify(text: str, level: str = 'info'):
     if _worker is None or not is_enabled():
         return
     ts = datetime.now().strftime('%H:%M:%S')
-    _worker.enqueue(f"{text}\n🕒 <code>{ts}</code>")
+    _worker.enqueue(f"{text} · <code>{ts}</code>")
 
 
 # ============================================================
@@ -299,14 +299,14 @@ def notify_task_event(task_id: str, task_data: dict):
     if prev is None:
         lines = [
             f"🟦 {emoji} <b><u>New {label}</u></b> ✨",
-            f"🆔 <code>{short_id}</code>",
+            f"🆔 <b><code>{short_id}</code></b>",
         ]
         if typ == 'download' and task_data.get('quality'):
             q = _escape(str(task_data['quality']))
             lines.append(f"🎯 Quality: <b><code>{q}</code></b>")
         if source_line:
             lines.append(source_line)
-        lines.append(f"⏳ <i>Queued…</i>")
+        lines.append("⏳ <b>Queued…</b>")
         _worker.enqueue('\n'.join(lines))
         return
 
@@ -319,7 +319,7 @@ def notify_task_event(task_id: str, task_data: dict):
         else:
             header = f"🟧⛔ <b><u>{label} Cancelled</u></b> 🛑"
 
-        lines = [header, f"🆔 <code>{short_id}</code>"]
+        lines = [header, f"🆔 <b><code>{short_id}</code></b>"]
 
         # Workflow-specific context
         if typ == 'workflow':
@@ -355,7 +355,7 @@ def notify_task_event(task_id: str, task_data: dict):
             elapsed = now - _task_started[task_id]
         dur_str = _fmt_duration(elapsed)
         if dur_str:
-            lines.append(f"⏱️ <i>{dur_str}</i>")
+            lines.append(f"⏱️ <b>{dur_str}</b>")
 
         # Error body — blockquote so it reads as a distinct block
         err = task_data.get('error_msg')
@@ -538,13 +538,13 @@ class _Handler(logging.Handler):
             ts = datetime.fromtimestamp(record.created).strftime('%H:%M:%S')
             bar, icon, flair = _LEVEL_STYLE.get(record.levelname, ('⬜', '•', ''))
             msg = self.format(record)
-            text = (
-                f"{bar}{icon} <b><u>{record.levelname}</u></b> {flair}\n"
-                f"📂 <i>{_escape(record.name)}</i>\n"
-                f"{_quote(msg, limit=1500)}\n"
-                f"🕒 <code>{ts}</code>"
-            )
-            self.worker.enqueue(text)
+            head = (f"{bar}{icon} <b><u>{record.levelname}</u></b> {flair}"
+                    f" · <i>{_escape(record.name)}</i> · <code>{ts}</code>")
+            if len(msg) > 160 or '\n' in msg:
+                body = _quote(msg, limit=1500)       # long → collapsible
+            else:
+                body = f"<b>{_escape(msg)}</b>"      # short → bold
+            self.worker.enqueue(f"{head}\n{body}")
         except Exception:
             self.handleError(record)
 
