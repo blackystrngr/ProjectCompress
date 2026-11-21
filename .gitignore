@@ -1,6 +1,7 @@
 # ============================================================
 # SECRETS — never commit these
 # ============================================================
+
 # Telegram
 telegram_session.session
 telegram_session.session-journal
