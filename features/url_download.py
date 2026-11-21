@@ -35,6 +35,7 @@ import requests
 import subprocess
 import shutil
 import signal
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, unquote, parse_qs, urljoin, quote
 from typing import List, Optional, Tuple
 
@@ -68,7 +69,6 @@ except ImportError:
     logger.warning("libtorrent not installed. Torrent downloads disabled.")
 
 from config import COOKIES_FILE
-)
 
 QUALITY_MAP = {
     'best':  'bv*+ba/b',
@@ -135,6 +135,9 @@ USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
               'Chrome/120.0.0.0 Safari/537.36')
 
 MIN_VIDEO_SIZE = 10_000  # 10 KB
+
+# How long process_url_download will wait for the user to pick a candidate
+CHOICE_TIMEOUT_SEC = 600  # 10 minutes
 
 VIDEO_MIME_MARKERS = [
     'video/',
@@ -1749,6 +1752,82 @@ def download_playlist(url, task_id, quality='best', range_start=1, range_end=0):
 
 
 # ============================================================
+# Media chooser helpers
+# ============================================================
+def _fmt_size(size_bytes):
+    try:
+        n = int(size_bytes)
+    except (TypeError, ValueError):
+        return '—'
+    if n <= 0:
+        return '—'
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != 'B' else f"{n} B"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def _enrich_candidates(urls, timeout=5):
+    """
+    HEAD each candidate URL in parallel → dict with:
+      url, mime, size, size_str, duration (0 = unknown), is_thumbnail.
+    Failure of HEAD is non-fatal — we still emit the URL.
+    """
+    if not urls:
+        return []
+
+    def _head(u):
+        entry = {
+            'url': u,
+            'mime': '',
+            'size': 0,
+            'size_str': '—',
+            'duration': 0,
+            'is_thumbnail': _is_thumbnail(u),
+        }
+        try:
+            session = requests.Session()
+            if PROXY_DICT:
+                session.proxies = PROXY_DICT
+            session.headers.update({'User-Agent': USER_AGENT})
+            r = session.head(u, timeout=timeout, allow_redirects=True)
+            if r.status_code in (200, 206):
+                ct = (r.headers.get('content-type') or '').split(';')[0].strip()
+                entry['mime'] = ct
+                cl = r.headers.get('content-length')
+                if cl:
+                    try:
+                        size = int(cl)
+                        entry['size'] = size
+                        entry['size_str'] = _fmt_size(size)
+                    except ValueError:
+                        pass
+        except Exception as e:
+            logger.debug(f"HEAD failed for {u[:80]}: {e}")
+        return entry
+
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        return list(ex.map(_head, urls))
+
+
+def _wait_for_choice(task_id, timeout_sec):
+    """Poll the task until the user posts a choice, or we're cancelled, or timeout."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        t = load_task(task_id)
+        if not t:
+            return None
+        if t.get('cancelled'):
+            raise DownloadCancelled("Cancelled while awaiting choice")
+        choice = t.get('choice')
+        if choice:
+            return choice
+        time.sleep(1)
+    return None
+
+
+# ============================================================
 # MAIN ROUTER
 # ============================================================
 def process_url_download(task_id, url, quality='best', range_start=1, range_end=0):
@@ -1792,13 +1871,16 @@ def process_url_download(task_id, url, quality='best', range_start=1, range_end=
             logger.warning(f"yt-dlp failed. Trying cracker. Reason: "
                            f"{str(ytdlp_err)[:200]}")
 
-        debug_dir = os.path.join(UPLOAD_FOLDER, 'crack_debug')
-        candidates = crack_video_urls(url, deep=True, save_debug_to=debug_dir)
-
+        # ---- Cracker phase ----
         task = load_task(task_id)
         if task:
-            task['candidates'] = candidates[:20]
+            task['status'] = 'sniffing'
+            task['download_progress'] = 0
+            task['progress'] = 0
             save_task(task_id, task)
+
+        debug_dir = os.path.join(UPLOAD_FOLDER, 'crack_debug')
+        candidates = crack_video_urls(url, deep=True, save_debug_to=debug_dir)
 
         if not candidates:
             raise Exception(
@@ -1807,41 +1889,56 @@ def process_url_download(task_id, url, quality='best', range_start=1, range_end=
                 "extension, or check downloads/crack_debug/ for the HTML."
             )
 
-        logger.info(f"Found {len(candidates)} candidate(s). Trying each...")
+        logger.info(f"Crack found {len(candidates)} candidate(s). Enriching…")
 
-        last_err = None
-        for i, candidate in enumerate(candidates, 1):
-            if not _is_probable_video(candidate, allow_thumbnail=True):
-                logger.info(f"→ Skipping non-video candidate {i}: {candidate[:100]}")
-                continue
-            try:
-                logger.info(f"→ yt-dlp candidate {i}/{len(candidates)}: "
-                            f"{candidate[:120]}")
-                download_with_ytdlp(candidate, task_id, quality)
-                return
-            except DownloadCancelled:
-                raise
-            except Exception as e:
-                logger.warning(f"Candidate {i} failed: {str(e)[:150]}")
-                last_err = e
-                continue
+        # Enrich top 20 with mime / size / thumbnail flag (parallel HEADs)
+        enriched = _enrich_candidates(candidates[:20], timeout=5)
 
-        for i, candidate in enumerate(candidates, 1):
-            if not _is_probable_video(candidate, allow_thumbnail=True):
-                continue
-            try:
-                logger.info(f"→ Direct candidate {i}: {candidate[:120]}")
-                download_direct_file(candidate, task_id)
-                return
-            except DownloadCancelled:
-                raise
-            except Exception as e:
-                logger.warning(f"Direct {i} failed: {str(e)[:150]}")
-                last_err = e
-                continue
+        # ---- Awaiting choice ----
+        task = load_task(task_id)
+        if not task:
+            raise DownloadCancelled("Task vanished")
+        task['candidates'] = enriched
+        task['choice'] = None
+        task['status'] = 'awaiting_choice'
+        task['download_progress'] = 0
+        task['progress'] = 0
+        save_task(task_id, task)
 
-        raise Exception(f"All {len(candidates)} candidates failed. "
-                        f"Last: {last_err}")
+        logger.info(
+            f"Task {task_id} awaiting user choice "
+            f"({len(enriched)} candidate(s), timeout {CHOICE_TIMEOUT_SEC}s)"
+        )
+
+        chosen_url = _wait_for_choice(task_id, CHOICE_TIMEOUT_SEC)
+        if not chosen_url:
+            raise Exception(
+                f"No media chosen within {CHOICE_TIMEOUT_SEC}s "
+                f"({len(enriched)} candidate(s) offered)."
+            )
+
+        logger.info(f"User chose: {chosen_url[:120]}")
+
+        # ---- Download chosen URL (yt-dlp first, direct as fallback) ----
+        task = load_task(task_id)
+        if task:
+            task['status'] = 'downloading'
+            task['chosen_url'] = chosen_url
+            save_task(task_id, task)
+            # /choose_media may have stored a quality picked in the chooser
+            quality = task.get('quality') or quality
+
+        try:
+            download_with_ytdlp(chosen_url, task_id, quality)
+            return
+        except DownloadCancelled:
+            raise
+        except Exception as e:
+            logger.warning(
+                f"yt-dlp on chosen URL failed: {str(e)[:150]} — trying direct"
+            )
+            download_direct_file(chosen_url, task_id)
+            return
 
     except DownloadCancelled:
         task = load_task(task_id)
@@ -2195,6 +2292,44 @@ def register_routes(app):
             'count': len(candidates),
             'candidates': candidates,
         })
+
+    @app.route('/choose_media', methods=['POST'])
+    def choose_media():
+        task_id = (request.form.get('task_id') or '').strip()
+        chosen_url = (request.form.get('url') or '').strip()
+        quality = (request.form.get('quality') or '').strip().lower()
+
+        if not task_id or not chosen_url:
+            return jsonify({'error': 'task_id and url required'}), 400
+        if not chosen_url.startswith(('http://', 'https://')):
+            return jsonify({'error': 'URL must start with http:// or https://'}), 400
+
+        task = load_task(task_id)
+        if not task:
+            return jsonify({'error': 'Task not found'}), 404
+        if task.get('status') != 'awaiting_choice':
+            return jsonify({
+                'error': f"Task is not awaiting choice "
+                         f"(status={task.get('status')!r})"
+            }), 400
+
+        candidates = task.get('candidates') or []
+        if candidates:
+            valid_urls = {
+                c.get('url') for c in candidates if isinstance(c, dict)
+            }
+            if chosen_url not in valid_urls:
+                return jsonify({
+                    'error': 'URL is not one of the offered candidates'
+                }), 400
+
+        if quality and quality in QUALITY_MAP:
+            task['quality'] = quality
+        task['choice'] = chosen_url
+        save_task(task_id, task)
+
+        logger.info(f"Media chosen for task {task_id}: {chosen_url[:120]}")
+        return jsonify({'status': 'ok', 'chosen_url': chosen_url})
 
     @app.route('/sniff/url', methods=['POST'])
     def sniff_url():
