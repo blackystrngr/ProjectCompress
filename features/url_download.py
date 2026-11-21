@@ -68,7 +68,18 @@ try:
 except ImportError:
     logger.warning("libtorrent not installed. Torrent downloads disabled.")
 
-from config import COOKIES_FILE
+try:
+    from config import COOKIES_FILE
+except ImportError:
+    # Older config.py without COOKIES_FILE: look in secrets dir, then project root
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _secrets = os.environ.get('PROJECT_SECRETS_DIR', '/root/secrets')
+    COOKIES_FILE = next(
+        (c for c in (os.path.join(_secrets, 'cookies.txt'),
+                     os.path.join(_root, 'cookies.txt'))
+         if os.path.exists(c)),
+        os.path.join(_root, 'cookies.txt'),
+    )
 
 QUALITY_MAP = {
     'best':  'bv*+ba/b',
