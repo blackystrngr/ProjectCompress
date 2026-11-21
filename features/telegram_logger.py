@@ -49,6 +49,92 @@ _worker  = None
 _handler = None
 _task_state = OrderedDict()
 _MAX_TRACKED_TASKS = 500
+_task_started = OrderedDict()   # task_id -> first-seen timestamp (elapsed fallback)
+
+
+# ============================================================
+# Presentation helpers
+# ============================================================
+_DIVIDER = '▰▱▰▱▰▱▰▱▰▱▰▱'
+_BATCH_SEP = '\n\n🔹▫️🔹▫️🔹▫️🔹\n\n'
+
+_LEVEL_STYLE = {
+    # level      (colour bar, icon, flair)
+    'DEBUG':    ('⬜', '🐛', ''),
+    'INFO':     ('🟦', '💡', ''),
+    'WARNING':  ('🟨', '⚠️', '❗'),
+    'ERROR':    ('🟥', '❌', '💥'),
+    'CRITICAL': ('🟥', '🔥', '🚨🚨'),
+}
+
+
+def _fmt_size(n):
+    """1234567 → '1.2 MB'. Returns None if n invalid/zero."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != 'B' else f"{n} B"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def _fmt_duration(sec):
+    """95 → '1m 35s'. Returns None if sec invalid/zero."""
+    try:
+        sec = int(sec)
+    except (TypeError, ValueError):
+        return None
+    if sec <= 0:
+        return None
+    if sec < 60:
+        return f"{sec}s"
+    m, s = divmod(sec, 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m"
+
+
+def _bar(done, total, width=10):
+    """Progress bar: _bar(3, 12) → '▰▰▰▱▱▱▱▱▱▱ 25%'."""
+    try:
+        done, total = int(done), int(total)
+    except (TypeError, ValueError):
+        return ''
+    if total <= 0:
+        return ''
+    done = max(0, min(done, total))
+    filled = round(width * done / total)
+    pct = round(100 * done / total)
+    return '▰' * filled + '▱' * (width - filled) + f' {pct}%'
+
+
+def _quote(text, limit=300):
+    """Blockquote; long bodies become collapsible (expandable) quotes."""
+    body = _escape(str(text)[:limit])
+    tag = 'blockquote expandable' if len(str(text)) > 120 or '\n' in str(text) else 'blockquote'
+    return f"<{tag}>{body}</blockquote>"
+
+
+def _task_meta(task_type):
+    """Map a guessed task type to (emoji, human label)."""
+    mapping = {
+        'download':      ('🎬', 'Download'),
+        'video':         ('🎥', 'Video'),
+        'telegram':      ('📨', 'Telegram'),
+        'extract':       ('🔍', 'Extractor'),
+        'search':        ('🔎', 'Search'),
+        'ocr':           ('📄', 'OCR'),
+        'workflow':      ('🔀', 'Workflow'),
+        'workflow_test': ('🧪', 'Workflow Test'),
+        'task':          ('⚙️', 'Task'),
+    }
+    return mapping.get(task_type, ('⚙️', 'Task'))
 
 
 # ============================================================
@@ -142,12 +228,18 @@ def _strip_html(s: str) -> str:
 
 
 def notify(text: str, level: str = 'info'):
+    """
+    Enqueue a free-form notification.
+
+    The caller provides any header/emoji/formatting in `text` — this
+    helper just appends a small timestamp footer so messages stay
+    chronologically anchored. `level` is accepted for API compatibility
+    and is not used to style the message.
+    """
     if _worker is None or not is_enabled():
         return
-    emoji = {'info': 'ℹ️', 'success': '✅',
-             'warning': '⚠️', 'error': '❌'}.get(level.lower(), '•')
     ts = datetime.now().strftime('%H:%M:%S')
-    _worker.enqueue(f"{emoji} <b>[{level.upper()}]</b> ({ts})\n{text}")
+    _worker.enqueue(f"{text}\n🕒 <code>{ts}</code>")
 
 
 # ============================================================
@@ -164,6 +256,7 @@ def _guess_task_type(t: dict) -> str:
 
 
 def notify_task_event(task_id: str, task_data: dict):
+    """Push a colourful, structured task lifecycle message."""
     if _worker is None or not is_enabled():
         return
     status = task_data.get('status')
@@ -172,34 +265,105 @@ def notify_task_event(task_id: str, task_data: dict):
 
     if len(_task_state) > _MAX_TRACKED_TASKS:
         _task_state.popitem(last=False)
+    if len(_task_started) > _MAX_TRACKED_TASKS:
+        _task_started.popitem(last=False)
 
     prev = _task_state.get(task_id)
-    _task_state[task_id] = (status, time.time())
+    now = time.time()
+    _task_state[task_id] = (status, now)
     _task_state.move_to_end(task_id)
-
     if prev is None:
-        typ = _guess_task_type(task_data)
-        detail = f"<code>{task_id[:8]}</code> — {typ}"
-        for key in ('url', 'video_file', 'chat_link', 'page_url', 'query'):
-            v = task_data.get(key)
-            if v:
-                detail += f"\n<i>{_escape(str(v)[:120])}</i>"
-                break
-        notify(f"▶️ <b>New task</b>\n{detail}", level='info')
+        _task_started[task_id] = now
+
+    short_id = task_id[:8]
+    typ = _guess_task_type(task_data)
+    emoji, label = _task_meta(typ)
+
+    # --- Source identifier line (URL / file / chat / query) ---
+    source_line = ''
+    for key in ('url', 'video_file', 'chat_link', 'page_url', 'query'):
+        v = task_data.get(key)
+        if v:
+            v_str = str(v)
+            if (v_str.startswith(('http://', 'https://'))
+                    and '"' not in v_str and len(v_str) < 2000):
+                shown = re.sub(r'^https?://(www\.)?', '', v_str)
+                display = shown if len(shown) <= 70 else shown[:67] + '…'
+                source_line = (f'🔗 <a href="{_escape(v_str)}">'
+                               f'<i>{_escape(display)}</i></a>')
+            else:
+                source_line = f"🔗 <code>{_escape(v_str[:120])}</code>"
+            break
+
+    # ---------------- New task ----------------
+    if prev is None:
+        lines = [
+            f"🟦 {emoji} <b><u>New {label}</u></b> ✨",
+            f"🆔 <code>{short_id}</code>",
+        ]
+        if typ == 'download' and task_data.get('quality'):
+            q = _escape(str(task_data['quality']))
+            lines.append(f"🎯 Quality: <b><code>{q}</code></b>")
+        if source_line:
+            lines.append(source_line)
+        lines.append(f"⏳ <i>Queued…</i>")
+        _worker.enqueue('\n'.join(lines))
         return
 
+    # ---------------- Terminal transitions ----------------
     if status in ('done', 'error', 'cancelled') and prev[0] != status:
-        emoji = {'done': '✅', 'error': '❌', 'cancelled': '⛔'}[status]
-        detail = f"<code>{task_id[:8]}</code>"
+        if status == 'done':
+            header = f"🟩✅ <b><u>{label} Complete</u></b> 🎉"
+        elif status == 'error':
+            header = f"🟥❌ <b><u>{label} Failed</u></b> 💥"
+        else:
+            header = f"🟧⛔ <b><u>{label} Cancelled</u></b> 🛑"
+
+        lines = [header, f"🆔 <code>{short_id}</code>"]
+
+        # Workflow-specific context
+        if typ == 'workflow':
+            failed_idx = task_data.get('failed_item_index')
+            total = task_data.get('total_items') or 0
+            if status == 'error' and failed_idx is not None and total:
+                lines.append(f"📍 Item <b>{failed_idx + 1}/{total}</b>")
+                lines.append(f"<code>{_bar(failed_idx, total)}</code>")
+            elif status == 'done' and total:
+                lines.append(f"🏁 <b>{total}</b> item(s) processed")
+                lines.append(f"<code>{_bar(total, total)}</code>")
+
+        if source_line:
+            lines.append(source_line)
+
+        # Output artifact
         out = task_data.get('output_file')
-        err = task_data.get('error_msg')
         if out:
-            detail += f"\n📄 <code>{_escape(str(out))}</code>"
+            name = os.path.basename(str(out)) or str(out)
+            lines.append(f"📄 <b><code>{_escape(name[:200])}</code></b>")
+
+        # Size
+        size = (task_data.get('total_size')
+                or task_data.get('downloaded_size')
+                or task_data.get('output_size'))
+        size_str = _fmt_size(size)
+        if size_str:
+            lines.append(f"📦 <b>{size_str}</b>")
+
+        # Elapsed time (task-reported, else measured from first sighting)
+        elapsed = task_data.get('elapsed_time')
+        if not elapsed and task_id in _task_started:
+            elapsed = now - _task_started[task_id]
+        dur_str = _fmt_duration(elapsed)
+        if dur_str:
+            lines.append(f"⏱️ <i>{dur_str}</i>")
+
+        # Error body — blockquote so it reads as a distinct block
+        err = task_data.get('error_msg')
         if err:
-            detail += f"\n<i>{_escape(str(err)[:200])}</i>"
-        lvl = 'success' if status == 'done' else (
-              'warning' if status == 'cancelled' else 'error')
-        notify(f"{emoji} <b>Task {status}</b>\n{detail}", level=lvl)
+            lines.append(_quote(f"⚠️ {err}", limit=300))
+
+        _task_started.pop(task_id, None)
+        _worker.enqueue('\n'.join(lines))
 
 
 # ============================================================
@@ -264,7 +428,7 @@ class _Worker:
         return out
 
     def _flush(self, batch):
-        text = '\n\n'.join(batch)
+        text = _BATCH_SEP.join(batch) if len(batch) > 1 else batch[0]
         if len(text) > MAX_MSG_LEN:
             text = text[:MAX_MSG_LEN - 40] + '\n\n<i>… (truncated)</i>'
 
@@ -372,12 +536,14 @@ class _Handler(logging.Handler):
             if not is_enabled():
                 return
             ts = datetime.fromtimestamp(record.created).strftime('%H:%M:%S')
-            emoji = {'DEBUG': '🐛', 'INFO': 'ℹ️', 'WARNING': '⚠️',
-                     'ERROR': '❌', 'CRITICAL': '🔥'}.get(record.levelname, '•')
+            bar, icon, flair = _LEVEL_STYLE.get(record.levelname, ('⬜', '•', ''))
             msg = self.format(record)
-            text = (f"{emoji} <b>[{record.levelname}]</b> "
-                    f"<code>{_escape(record.name)}</code> ({ts})\n"
-                    f"{_escape(msg)}")
+            text = (
+                f"{bar}{icon} <b><u>{record.levelname}</u></b> {flair}\n"
+                f"📂 <i>{_escape(record.name)}</i>\n"
+                f"{_quote(msg, limit=1500)}\n"
+                f"🕒 <code>{ts}</code>"
+            )
             self.worker.enqueue(text)
         except Exception:
             self.handleError(record)
@@ -390,7 +556,12 @@ def _shutdown():
     if _worker is None:
         return
     try:
-        _worker.enqueue("🛑 <b>ProjectCompress shutting down</b>")
+        ts = datetime.now().strftime('%H:%M:%S')
+        _worker.enqueue(
+            "🟥🛑 <b><u>ProjectCompress shutting down</u></b> 🌙\n"
+            "👋 <i>See you next time…</i> 💤\n"
+            f"🕒 <code>{ts}</code>"
+        )
         time.sleep(2.5)
     except Exception:
         pass
@@ -452,7 +623,11 @@ def _apply_config(initial: bool):
                 + (" (initial)" if initial else " (reconfigured)"))
 
     if initial:
-        notify("🚀 <b>ProjectCompress started</b>", level='success')
+        notify(
+            "🟩🚀 <b>ProjectCompress</b> is <b><u>ONLINE</u></b> ✨\n"
+            "📡 <i>Ready to process media</i> 🎬🎵🖼️",
+            level='success',
+        )
 
 
 # ============================================================
@@ -485,7 +660,11 @@ def register_routes(app):
                 },
             }), 400
 
-        notify("🧪 <b>Test message</b> — Telegram logging works!", level='success')
+        notify(
+            "🟩🧪 <b><u>Test message</u></b> 🎊\n"
+            "📡 <i>Telegram logging is working correctly</i> ✅",
+            level='success',
+        )
 
         start = time.time()
         delivered = False
