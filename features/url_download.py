@@ -1856,7 +1856,7 @@ def process_url_download(task_id, url, quality='best', range_start=1, range_end=
 
         if needs_ytdlp(url):
             logger.info("→ yt-dlp (known site / stream)")
-            download_with_ytdlp(url, task_id, quality)
+            download_with_ytdlp(url, task_id, quality, title_based=True)
             return
 
         ext = _ext(url)
@@ -1867,7 +1867,7 @@ def process_url_download(task_id, url, quality='best', range_start=1, range_end=
 
         logger.info("→ Unknown URL — trying yt-dlp first")
         try:
-            download_with_ytdlp(url, task_id, quality)
+            download_with_ytdlp(url, task_id, quality, title_based=True)
             return
         except Exception as ytdlp_err:
             err_text = str(ytdlp_err).lower()
@@ -1940,7 +1940,7 @@ def process_url_download(task_id, url, quality='best', range_start=1, range_end=
             quality = task.get('quality') or quality
 
         try:
-            download_with_ytdlp(chosen_url, task_id, quality)
+            download_with_ytdlp(chosen_url, task_id, quality, title_based=True)
             return
         except DownloadCancelled:
             raise
