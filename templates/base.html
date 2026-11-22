@@ -4,7 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
     <title>Media Compressor & Manager</title>
-        <!-- Resource hints — open CDN sockets during HTML parse -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="preconnect" href="https://cdnjs.cloudflare.com">
@@ -238,6 +237,25 @@
             white-space: pre-wrap;
         }
 
+        /* Textarea in settings rows */
+        .settings-row textarea {
+            width: 100%;
+            background: rgba(20,26,42,0.95);
+            border: 1px solid rgba(95,143,224,0.3);
+            color: #eef2ff;
+            padding: 0.5rem 0.75rem;
+            border-radius: 0.5rem;
+            font-size: 0.75rem;
+            font-family: 'JetBrains Mono', monospace;
+            resize: vertical;
+            outline: none;
+            transition: border-color 0.15s ease, box-shadow 0.15s ease;
+        }
+        .settings-row textarea:focus {
+            border-color: #5f8fe0;
+            box-shadow: 0 0 0 3px rgba(95,143,224,0.18);
+        }
+
         @media (max-width: 700px) {
             .settings-panel { width: 100vw; }
             .settings-fab { top: auto; bottom: 5rem; right: 1rem; transform: none; }
@@ -249,7 +267,7 @@
 <body>
 <div class="container">
 
-    <!-- ========== System Stats Meter (no duplicate toggles) ========== -->
+    <!-- ========== System Stats Meter ========== -->
     <div class="sys-stats" id="sysStats">
         <div class="sys-stat" title="CPU usage">
             <i class="fas fa-microchip"></i>
@@ -369,6 +387,68 @@
             </button>
         </section>
 
+        <!-- ===== Telegram Announcement Listener ===== -->
+        <section class="settings-section">
+            <h3><i class="fas fa-bullhorn"></i> Announcement Listener</h3>
+            <p style="font-size: 0.72rem; color: #8a9bc0; margin-bottom: 0.6rem;">
+                Monitors channels for zero-deposit promos (demo trading,
+                learn &amp; earn, giveaways) and forwards matches to a target chat.
+                Shares the main Telegram session — no separate login.
+            </p>
+
+            <label class="settings-row">
+                <span>Enabled</span>
+                <input type="checkbox" id="setTgListenerEnabled">
+            </label>
+
+            <label class="settings-row" style="flex-direction: column; align-items: stretch; gap: 0.35rem;">
+                <span>Source channels</span>
+                <textarea id="setTgListenerSources" rows="2"
+                          placeholder="binance_announcements, Bybit_Announcements"></textarea>
+            </label>
+
+            <label class="settings-row">
+                <span>Target chat</span>
+                <input type="text" id="setTgListenerTarget"
+                       placeholder="@my_alerts or -1001234567890" autocomplete="off">
+            </label>
+
+            <label class="settings-row" style="flex-direction: column; align-items: stretch; gap: 0.35rem;">
+                <span>Include pattern (regex)</span>
+                <input type="text" id="setTgListenerInclude"
+                       placeholder="learn.*earn|demo.*trading|zero.*deposit"
+                       style="font-family: 'JetBrains Mono', monospace; font-size: 0.72rem;">
+            </label>
+
+            <label class="settings-row" style="flex-direction: column; align-items: stretch; gap: 0.35rem;">
+                <span>Exclude pattern (regex)</span>
+                <input type="text" id="setTgListenerExclude"
+                       placeholder="first.*deposit|delisting"
+                       style="font-family: 'JetBrains Mono', monospace; font-size: 0.72rem;">
+            </label>
+
+            <label class="settings-row" style="flex-direction: column; align-items: stretch; gap: 0.35rem;">
+                <span>Alert prefix</span>
+                <input type="text" id="setTgListenerPrefix"
+                       placeholder="🚨 Zero-Deposit Promo Alert">
+            </label>
+
+            <div class="settings-hint" id="setTgListenerStatus"></div>
+
+            <div style="margin-top: 0.6rem;">
+                <div style="font-size: 0.7rem; color: #8a9bc0; margin-bottom: 0.3rem;">
+                    Test filter on sample text:
+                </div>
+                <textarea id="setTgListenerTestInput" rows="2"
+                          placeholder="Paste a sample announcement here to test"></textarea>
+                <button id="setTgListenerTestBtn" class="settings-btn" type="button">
+                    <i class="fas fa-vial"></i> Test filter
+                </button>
+                <div id="setTgListenerTestResult" class="settings-hint"
+                     style="display:none;"></div>
+            </div>
+        </section>
+
         <!-- ===== Colab Coordinator ===== -->
         <section class="settings-section">
             <h3><i class="fas fa-shield-halved"></i> Colab Coordinator</h3>
@@ -466,10 +546,7 @@
 })();
 </script>
 
-<!-- ============================================================
-     Thumbnail initial state — no UI control here anymore
-     (the settings panel is the single source of truth)
-     ============================================================ -->
+<!-- ========== Thumbnail initial state ========== -->
 <script>
 (function () {
     window.thumbnailsEnabled = true;
@@ -483,9 +560,7 @@
 })();
 </script>
 
-<!-- ============================================================
-     Theme API (used by the settings panel)
-     ============================================================ -->
+<!-- ========== Theme API ========== -->
 <script>
 window.applyTheme = function (theme, syncServer) {
     if (theme !== 'modern' && theme !== 'classic') theme = 'classic';
@@ -509,9 +584,7 @@ window.applyTheme = function (theme, syncServer) {
 };
 </script>
 
-<!-- ============================================================
-     SETTINGS PANEL LOGIC
-     ============================================================ -->
+<!-- ========== SETTINGS PANEL LOGIC ========== -->
 <script>
 (function () {
     const fab        = document.getElementById('settingsFab');
@@ -532,6 +605,18 @@ window.applyTheme = function (theme, syncServer) {
     const inThumbs   = document.getElementById('setThumbnailsEnabled');
     const tgHint     = document.getElementById('setTgHint');
     const tgTestBtn  = document.getElementById('setTgTest');
+
+    // Listener refs
+    const inTgListenerEnabled = document.getElementById('setTgListenerEnabled');
+    const inTgListenerSources = document.getElementById('setTgListenerSources');
+    const inTgListenerTarget  = document.getElementById('setTgListenerTarget');
+    const inTgListenerInclude = document.getElementById('setTgListenerInclude');
+    const inTgListenerExclude = document.getElementById('setTgListenerExclude');
+    const inTgListenerPrefix  = document.getElementById('setTgListenerPrefix');
+    const inTgListenerStatus  = document.getElementById('setTgListenerStatus');
+    const tgListenerTestBtn   = document.getElementById('setTgListenerTestBtn');
+    const tgListenerTestInput = document.getElementById('setTgListenerTestInput');
+    const tgListenerTestResult = document.getElementById('setTgListenerTestResult');
 
     let current = null;
 
@@ -584,6 +669,14 @@ window.applyTheme = function (theme, syncServer) {
             inCoord.checked     = !!current.coordinator_enabled;
             inThumbs.checked    = !!current.thumbnails_enabled;
 
+            // Listener
+            inTgListenerEnabled.checked = !!current.tg_listener_enabled;
+            inTgListenerSources.value   = current.tg_listener_sources || '';
+            inTgListenerTarget.value    = current.tg_listener_target || '';
+            inTgListenerInclude.value   = current.tg_listener_include_pattern || '';
+            inTgListenerExclude.value   = current.tg_listener_exclude_pattern || '';
+            inTgListenerPrefix.value    = current.tg_listener_forward_prefix || '';
+
             const hints = [];
             if (current.env && current.env.TG_LOG_CHANNEL)
                 hints.push('env TG_LOG_CHANNEL is set');
@@ -595,6 +688,9 @@ window.applyTheme = function (theme, syncServer) {
             tgHint.classList.toggle('warn', hints.length > 0);
 
             statusEl.style.display = 'none';
+
+            // Fetch listener runtime state
+            refreshListenerStatus();
         } catch (e) {
             toast('Failed to load settings', true);
             console.error(e);
@@ -620,6 +716,22 @@ window.applyTheme = function (theme, syncServer) {
             payload.coordinator_enabled = inCoord.checked;
         if (inThumbs.checked !== !!current.thumbnails_enabled)
             payload.thumbnails_enabled = inThumbs.checked;
+
+        // Listener payload (only changed fields)
+        if (inTgListenerEnabled.checked !== !!current.tg_listener_enabled)
+            payload.tg_listener_enabled = inTgListenerEnabled.checked;
+        if (inTgListenerSources.value.trim() !== (current.tg_listener_sources || ''))
+            payload.tg_listener_sources = inTgListenerSources.value.trim();
+        if (inTgListenerTarget.value.trim() !== (current.tg_listener_target || ''))
+            payload.tg_listener_target = inTgListenerTarget.value.trim();
+        if (inTgListenerInclude.value.trim() !== (current.tg_listener_include_pattern || ''))
+            payload.tg_listener_include_pattern = inTgListenerInclude.value.trim();
+        if (inTgListenerExclude.value.trim() !== (current.tg_listener_exclude_pattern || ''))
+            payload.tg_listener_exclude_pattern = inTgListenerExclude.value.trim();
+        if (inTgListenerPrefix.value.trim() !== (current.tg_listener_forward_prefix || ''))
+            payload.tg_listener_forward_prefix = inTgListenerPrefix.value.trim();
+
+        const anyListenerKeyUpdated = Object.keys(payload).some(k => k.startsWith('tg_listener_'));
 
         if (!Object.keys(payload).length) {
             toast('No changes');
@@ -669,6 +781,11 @@ window.applyTheme = function (theme, syncServer) {
             toast(`Saved (${data.updated.length} field${data.updated.length === 1 ? '' : 's'})`);
             inTgToken.value = '';
             await load();
+
+            if (anyListenerKeyUpdated) {
+                // Give the backend a beat to apply the change before refreshing
+                setTimeout(refreshListenerStatus, 1500);
+            }
         } catch (e) {
             statusEl.style.display = 'block';
             statusEl.style.color = '#ff8a8a';
@@ -683,7 +800,7 @@ window.applyTheme = function (theme, syncServer) {
     /* ---------- Reload ---------- */
     resetBtn.addEventListener('click', load);
 
-    /* ---------- Test Telegram ---------- */
+    /* ---------- Test Telegram logging ---------- */
     tgTestBtn.addEventListener('click', async () => {
         tgTestBtn.disabled = true;
         tgTestBtn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Sending…';
@@ -700,6 +817,68 @@ window.applyTheme = function (theme, syncServer) {
         }
     });
 
+    /* ---------- Listener status ---------- */
+    async function refreshListenerStatus() {
+        try {
+            const r = await fetch('/telegram/listener/status', { cache: 'no-store' });
+            if (!r.ok) return;
+            const s = await r.json();
+            const parts = [];
+            parts.push(s.running ? '🟢 Running' : '⚪ Stopped');
+            if (s.running && s.uptime_sec) {
+                const m = Math.floor(s.uptime_sec / 60);
+                const h = Math.floor(m / 60);
+                parts.push('up ' + (h > 0 ? `${h}h ${m % 60}m` : `${m}m`));
+            }
+            if (s.messages_seen)     parts.push(`seen ${s.messages_seen}`);
+            if (s.matches_forwarded) parts.push(`forwarded ${s.matches_forwarded}`);
+            if (s.last_error)        parts.push('⚠️ ' + s.last_error);
+            inTgListenerStatus.textContent = parts.join(' · ');
+            inTgListenerStatus.classList.toggle('warn', !!s.last_error);
+        } catch (e) { /* silent */ }
+    }
+
+    /* ---------- Test filter ---------- */
+    tgListenerTestBtn.addEventListener('click', async () => {
+        const text = tgListenerTestInput.value.trim();
+        if (!text) { toast('Paste sample text first', true); return; }
+        tgListenerTestBtn.disabled = true;
+        tgListenerTestBtn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Testing…';
+        tgListenerTestResult.style.display = 'block';
+        try {
+            const r = await fetch('/telegram/listener/test', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ text })
+            });
+            const data = await r.json();
+            if (data.error) {
+                tgListenerTestResult.style.color = '#ff8a8a';
+                tgListenerTestResult.textContent = '❌ ' + data.error;
+            } else if (data.matched) {
+                tgListenerTestResult.style.color = '#a5f3c5';
+                tgListenerTestResult.textContent = '✅ MATCH — this post would be forwarded.';
+            } else {
+                const reasons = [];
+                if (!data.included) reasons.push('does not match include pattern');
+                if (data.excluded)  reasons.push('matches exclude pattern');
+                tgListenerTestResult.style.color = '#fcd34d';
+                tgListenerTestResult.textContent = '⏭ NO MATCH — ' + reasons.join('; ') + '.';
+            }
+        } catch (e) {
+            tgListenerTestResult.style.color = '#ff8a8a';
+            tgListenerTestResult.textContent = '❌ ' + e.message;
+        } finally {
+            tgListenerTestBtn.disabled = false;
+            tgListenerTestBtn.innerHTML = '<i class="fas fa-vial"></i> Test filter';
+        }
+    });
+
+    /* ---------- Keep listener status fresh while panel is open ---------- */
+    setInterval(() => {
+        if (panel && panel.classList.contains('open')) refreshListenerStatus();
+    }, 10000);
+
     /* ---------- Sync theme from server on initial load ---------- */
     fetch('/settings', { cache: 'no-store' })
         .then(r => r.ok ? r.json() : null)
@@ -714,7 +893,6 @@ window.applyTheme = function (theme, syncServer) {
 
 <!-- ============================================================
      Modern-UI polish (spotlight + ripple)
-     Auto-disabled when classic theme active.
      ============================================================ -->
 <script>
 (function () {
