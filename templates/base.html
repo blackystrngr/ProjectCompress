@@ -391,8 +391,8 @@
         <section class="settings-section">
             <h3><i class="fas fa-bullhorn"></i> Announcement Listener</h3>
             <p style="font-size: 0.72rem; color: #8a9bc0; margin-bottom: 0.6rem;">
-                Monitors channels for zero-deposit promos (demo trading,
-                learn &amp; earn, giveaways) and forwards matches to a target chat.
+                Detects potential free crypto opportunities from context, not just fixed keywords.
+                Uses local rules and semantic signals; no paid AI API or external message processing.
                 Shares the main Telegram session — no separate login.
             </p>
 
@@ -411,6 +411,24 @@
                 <span>Target chat</span>
                 <input type="text" id="setTgListenerTarget"
                        placeholder="@my_alerts or -1001234567890" autocomplete="off">
+            </label>
+            <label class="settings-row">
+                <span>Detection engine</span>
+                <select id="setTgListenerMode">
+                    <option value="intelligent">Intelligent hybrid (recommended)</option>
+                    <option value="legacy">Legacy regex filter</option>
+                </select>
+            </label>
+            <label class="settings-row">
+                <span>Minimum confidence (0–100)</span>
+                <input type="number" id="setTgListenerMinScore" min="0" max="100" value="45">
+            </label>
+            <label class="settings-row">
+                <span>Opportunity cost policy</span>
+                <select id="setTgListenerCostPolicy">
+                    <option value="free">Free-only (no deposit / funded action)</option>
+                    <option value="any">Include paid or capital-required campaigns</option>
+                </select>
             </label>
 
             <label class="settings-row" style="flex-direction: column; align-items: stretch; gap: 0.35rem;">
@@ -610,6 +628,9 @@ window.applyTheme = function (theme, syncServer) {
     const inTgListenerEnabled = document.getElementById('setTgListenerEnabled');
     const inTgListenerSources = document.getElementById('setTgListenerSources');
     const inTgListenerTarget  = document.getElementById('setTgListenerTarget');
+    const inTgListenerMode = document.getElementById('setTgListenerMode');
+    const inTgListenerMinScore = document.getElementById('setTgListenerMinScore');
+    const inTgListenerCostPolicy = document.getElementById('setTgListenerCostPolicy');
     const inTgListenerInclude = document.getElementById('setTgListenerInclude');
     const inTgListenerExclude = document.getElementById('setTgListenerExclude');
     const inTgListenerPrefix  = document.getElementById('setTgListenerPrefix');
@@ -673,6 +694,9 @@ window.applyTheme = function (theme, syncServer) {
             inTgListenerEnabled.checked = !!current.tg_listener_enabled;
             inTgListenerSources.value   = current.tg_listener_sources || '';
             inTgListenerTarget.value    = current.tg_listener_target || '';
+            inTgListenerMode.value = current.tg_listener_detection_mode || 'intelligent';
+            inTgListenerMinScore.value = current.tg_listener_min_score ?? 45;
+            inTgListenerCostPolicy.value = current.tg_listener_cost_policy || 'free';
             inTgListenerInclude.value   = current.tg_listener_include_pattern || '';
             inTgListenerExclude.value   = current.tg_listener_exclude_pattern || '';
             inTgListenerPrefix.value    = current.tg_listener_forward_prefix || '';
@@ -724,6 +748,12 @@ window.applyTheme = function (theme, syncServer) {
             payload.tg_listener_sources = inTgListenerSources.value.trim();
         if (inTgListenerTarget.value.trim() !== (current.tg_listener_target || ''))
             payload.tg_listener_target = inTgListenerTarget.value.trim();
+        if (inTgListenerMode.value !== (current.tg_listener_detection_mode || 'intelligent'))
+            payload.tg_listener_detection_mode = inTgListenerMode.value;
+        if (Number(inTgListenerMinScore.value) !== Number(current.tg_listener_min_score ?? 45))
+            payload.tg_listener_min_score = Math.max(0, Math.min(100, Number(inTgListenerMinScore.value) || 0));
+        if (inTgListenerCostPolicy.value !== (current.tg_listener_cost_policy || 'free'))
+            payload.tg_listener_cost_policy = inTgListenerCostPolicy.value;
         if (inTgListenerInclude.value.trim() !== (current.tg_listener_include_pattern || ''))
             payload.tg_listener_include_pattern = inTgListenerInclude.value.trim();
         if (inTgListenerExclude.value.trim() !== (current.tg_listener_exclude_pattern || ''))
