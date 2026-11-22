@@ -102,13 +102,74 @@ def get_telegram_creds():
 
 
 async def get_telegram_client():
+    """
+    Build a fresh TelegramClient.
+
+    ── Option B applied ─────────────────────────────────────
+    • timeout=120        — socket-level timeout (generous for slow VPS links)
+    • request_retries=8  — up from Telethon's default 5, so each
+                           awaited request gets more internal retries
+                           before surfacing "Request was unsuccessful".
+    Combined with the outer retry loop in send_file_to_telegram_async,
+    this gives up to 8 × 4 = 32 attempts before permanent failure.
+    """
     api_id, api_hash = get_telegram_creds()
+    common_kwargs = {
+        'timeout': 120,
+        'request_retries': 8,
+    }
     if TELEGRAM_PROXY:
-        client = TelegramClient(TELEGRAM_SESSION_FILE, int(api_id), api_hash, proxy=TELEGRAM_PROXY)
+        client = TelegramClient(
+            TELEGRAM_SESSION_FILE, int(api_id), api_hash,
+            proxy=TELEGRAM_PROXY, **common_kwargs
+        )
     else:
-        client = TelegramClient(TELEGRAM_SESSION_FILE, int(api_id), api_hash)
+        client = TelegramClient(
+            TELEGRAM_SESSION_FILE, int(api_id), api_hash, **common_kwargs
+        )
     await client.start()
     return client
+
+
+def _humanize_telegram_error(e):
+    """
+    Turn common Telegram/Telethon error strings into readable text
+    suitable for showing in the workflow log / task panel.
+    """
+    msg = str(e)
+    low = msg.lower()
+    if 'unsuccessful' in low or 'internal issues' in low:
+        return (
+            "Telegram's servers had a transient issue saving this file. "
+            "This is usually temporary — retry in a few minutes."
+        )
+    if 'flood' in low or 'too many requests' in low:
+        return f"Rate limited by Telegram. Wait a bit before retrying. ({msg})"
+    if 'file is too big' in low or 'file too large' in low:
+        return f"File exceeds Telegram's size limit. ({msg})"
+    if 'chat_write_forbidden' in low or 'not enough rights' in low:
+        return (
+            "The bot/session can't post in that chat. Check that the bot "
+            f"is an admin with 'Post messages' permission. ({msg})"
+        )
+    if 'cannot find any entity' in low or 'chat not found' in low:
+        return (
+            "Chat not found. Check the link/ID — bot mode needs the numeric "
+            f"-100… ID for private channels. ({msg})"
+        )
+    if 'user is banned' in low or 'not a member' in low:
+        return f"The bot/user is banned or not a member of that chat. ({msg})"
+    return msg
+
+
+# List of substrings that indicate a PERMANENT error — never retry these.
+_PERMANENT_ERROR_MARKERS = (
+    'file is too big', 'file too large',
+    'chat_write_forbidden', 'not enough rights',
+    'cannot find any entity', 'chat not found',
+    'user is banned', 'not a member',
+    'message too long', 'peer_id_invalid',
+)
 
 
 class TelegramCancelled(Exception):
@@ -178,7 +239,7 @@ async def scan_chat_async(task_id, chat_link, limit):
         task = load_task(task_id)
         if task and not task.get('cancelled', False):
             task['status'] = 'error'
-            task['error_msg'] = str(e)
+            task['error_msg'] = _humanize_telegram_error(e)
             save_task(task_id, task)
     finally:
         unregister_client(task_id)
@@ -269,7 +330,7 @@ async def download_selected_async(download_task_id, chat_link, message_ids):
         task = load_task(download_task_id)
         if task and not task.get('cancelled', False):
             task['status'] = 'error'
-            task['error_msg'] = str(e)
+            task['error_msg'] = _humanize_telegram_error(e)
             save_task(download_task_id, task)
     finally:
         unregister_client(download_task_id)
@@ -280,7 +341,7 @@ async def download_selected_async(download_task_id, chat_link, message_ids):
 
 
 # ============================================================
-# SEND FILE (with cancellation + throttled progress)
+# SEND FILE (with cancellation + throttled progress + retries)
 # ============================================================
 async def send_file_to_telegram_async(task_id, chat_link, file_path, original_filename, caption=None):
     client = await get_telegram_client()
@@ -293,6 +354,7 @@ async def send_file_to_telegram_async(task_id, chat_link, file_path, original_fi
         if task:
             task['status'] = 'sending'
             task['upload_progress'] = 0
+            task['error_msg'] = None
             save_task(task_id, task)
 
         def progress_cb(current, total):
@@ -301,7 +363,7 @@ async def send_file_to_telegram_async(task_id, chat_link, file_path, original_fi
             # Check cancellation on every callback
             t = load_task(task_id)
             if t and t.get('cancelled', False):
-                # Raise a CancelledError to interrupt Telethon
+                # Raise CancelledError to interrupt Telethon
                 raise asyncio.CancelledError("Cancelled by user")
 
             if throttle.should_save():
@@ -311,17 +373,89 @@ async def send_file_to_telegram_async(task_id, chat_link, file_path, original_fi
                     t['upload_progress'] = pct
                     save_task(task_id, t)
 
-        await client.send_file(
-            entity, file_path,
-            progress_callback=progress_cb,
-            caption=caption or f"📁 {original_filename}",
-            force_document=True,
-        )
+        # ── Option A: outer retry loop with exponential backoff ──
+        # Telethon itself already retries failed SaveBigFilePartRequest
+        # calls request_retries times (default 5, we bumped it to 8 in
+        # get_telegram_client). This outer loop gives an additional 4
+        # attempts with backoff, riding out transient Telegram flaps.
+        MAX_ATTEMPTS = 4
+        retry_delay = 3.0
+        last_err = None
+
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            # Re-check cancellation before each attempt
+            t = load_task(task_id)
+            if t and t.get('cancelled', False):
+                raise TelegramCancelled("Cancelled by user")
+
+            try:
+                await client.send_file(
+                    entity, file_path,
+                    progress_callback=progress_cb,
+                    caption=caption or f"📁 {original_filename}",
+                    force_document=True,
+                    # Smaller chunk = each SaveBigFilePartRequest has
+                    # more headroom on a slow/flaky link.
+                    part_size_kb=256,
+                )
+                last_err = None
+                if attempt > 1:
+                    logger.info(
+                        f"Telegram send succeeded for task {task_id} "
+                        f"on attempt {attempt}/{MAX_ATTEMPTS}"
+                    )
+                break
+            except (asyncio.CancelledError, TelegramCancelled):
+                raise
+            except (ValueError, errors.RPCError) as e:
+                last_err = e
+                err_low = str(e).lower()
+
+                # User cancelled inside the progress callback
+                if 'cancelled' in err_low:
+                    raise TelegramCancelled("Cancelled by user")
+
+                # Permanent errors: do NOT waste time retrying
+                if any(m in err_low for m in _PERMANENT_ERROR_MARKERS):
+                    logger.error(
+                        f"Telegram send permanent failure for task {task_id}: {e}"
+                    )
+                    raise
+
+                if attempt == MAX_ATTEMPTS:
+                    logger.error(
+                        f"Telegram send failed for task {task_id} after "
+                        f"{MAX_ATTEMPTS} outer attempts (each with up to "
+                        f"8 inner retries): {e}"
+                    )
+                    raise
+
+                logger.warning(
+                    f"Telegram send attempt {attempt}/{MAX_ATTEMPTS} "
+                    f"failed for task {task_id}: {type(e).__name__}: {e}"
+                )
+                # Reset progress + surface status so the UI doesn't show a
+                # stale percentage while we're backing off
+                t = load_task(task_id)
+                if t:
+                    t['upload_progress'] = 0
+                    t['error_msg'] = (
+                        f"Retrying upload (attempt {attempt + 1}/{MAX_ATTEMPTS}) "
+                        f"in {int(retry_delay)}s…"
+                    )
+                    save_task(task_id, t)
+
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2
+
+        if last_err is not None:
+            raise last_err
 
         task = load_task(task_id)
         if task and not task.get('cancelled', False):
             task['status'] = 'done'
             task['upload_progress'] = 100
+            task['error_msg'] = None
             save_task(task_id, task)
 
     except (asyncio.CancelledError, TelegramCancelled):
@@ -343,14 +477,14 @@ async def send_file_to_telegram_async(task_id, chat_link, file_path, original_fi
             task = load_task(task_id)
             if task:
                 task['status'] = 'error'
-                task['error_msg'] = str(e)
+                task['error_msg'] = _humanize_telegram_error(e)
                 save_task(task_id, task)
     except Exception as e:
         logger.exception(f"Send file error for task {task_id}")
         task = load_task(task_id)
         if task and not task.get('cancelled', False):
             task['status'] = 'error'
-            task['error_msg'] = str(e)
+            task['error_msg'] = _humanize_telegram_error(e)
             save_task(task_id, task)
     finally:
         unregister_client(task_id)
@@ -411,7 +545,7 @@ def register_routes(app):
                 t = load_task(task_id)
                 if t:
                     t['status'] = 'error'
-                    t['error_msg'] = str(e)
+                    t['error_msg'] = _humanize_telegram_error(e)
                     save_task(task_id, t)
 
         threading.Thread(target=run_scan, daemon=True).start()
@@ -449,7 +583,7 @@ def register_routes(app):
                 t = load_task(download_task_id)
                 if t:
                     t['status'] = 'error'
-                    t['error_msg'] = str(e)
+                    t['error_msg'] = _humanize_telegram_error(e)
                     save_task(download_task_id, t)
 
         threading.Thread(target=run_download, daemon=True).start()
@@ -493,7 +627,7 @@ def register_routes(app):
                 t = load_task(task_id)
                 if t:
                     t['status'] = 'error'
-                    t['error_msg'] = str(e)
+                    t['error_msg'] = _humanize_telegram_error(e)
                     save_task(task_id, t)
 
         threading.Thread(target=run_send, daemon=True).start()
