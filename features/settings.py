@@ -65,6 +65,14 @@ ALLOWED_KEYS = {
     'tg_log_bot_token':     {'type': 'str',  'max': 200},
     'tg_log_level':         {'type': 'str',
                              'choices': ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')},
+
+    # ── Telegram announcement listener ───────────────────────
+    'tg_listener_enabled':         {'type': 'bool'},
+    'tg_listener_sources':         {'type': 'str', 'max': 2000},
+    'tg_listener_target':          {'type': 'str', 'max': 200},
+    'tg_listener_include_pattern': {'type': 'str', 'max': 2000},
+    'tg_listener_exclude_pattern': {'type': 'str', 'max': 2000},
+    'tg_listener_forward_prefix':  {'type': 'str', 'max': 200},
 }
 
 
@@ -129,6 +137,14 @@ def get_effective_config() -> dict:
         'tg_log_bot_token':    pick('tg_log_bot_token', '', 'TG_LOG_BOT_TOKEN'),
         'tg_log_level':        pick('tg_log_level', 'WARNING', 'TG_LOG_LEVEL',
                                     lambda v: str(v).upper() or 'WARNING'),
+
+        # ── Listener ──
+        'tg_listener_enabled':         bool(s.get('tg_listener_enabled', False)),
+        'tg_listener_sources':         s.get('tg_listener_sources', ''),
+        'tg_listener_target':          s.get('tg_listener_target', ''),
+        'tg_listener_include_pattern': s.get('tg_listener_include_pattern', ''),
+        'tg_listener_exclude_pattern': s.get('tg_listener_exclude_pattern', ''),
+        'tg_listener_forward_prefix':  s.get('tg_listener_forward_prefix', ''),
     }
 
 
@@ -161,6 +177,15 @@ def register_routes(app):
             'tg_log_bot_token_set':    bool(token),
             'tg_log_bot_token_masked': masked,
             'tg_log_level':            cfg['tg_log_level'],
+
+            # ── Listener ──
+            'tg_listener_enabled':         cfg['tg_listener_enabled'],
+            'tg_listener_sources':         cfg['tg_listener_sources'],
+            'tg_listener_target':          cfg['tg_listener_target'],
+            'tg_listener_include_pattern': cfg['tg_listener_include_pattern'],
+            'tg_listener_exclude_pattern': cfg['tg_listener_exclude_pattern'],
+            'tg_listener_forward_prefix':  cfg['tg_listener_forward_prefix'],
+
             'env':                     env_info,
             'settings_file':           SETTINGS_FILE,
         })
@@ -234,6 +259,15 @@ def register_routes(app):
             except Exception as e:
                 logger.exception("Failed to apply tg_log settings")
                 errors['tg_log'] = str(e)
+
+        if any(k.startswith('tg_listener_') for k in updated):
+            try:
+                from .telegram_listener import reconfigure as _listener_reconfigure
+                _listener_reconfigure()
+                applied.append('telegram_listener')
+            except Exception as e:
+                logger.exception("Failed to apply tg_listener settings")
+                errors['tg_listener'] = str(e)
 
         logger.info(f"settings saved: updated={updated}, applied={applied}")
 
