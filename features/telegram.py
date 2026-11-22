@@ -49,9 +49,90 @@ def start_tg_loop_if_needed():
 
 
 # ============================================================
-# RUNNING TASK REGISTRY (for cancellation)
+# PERSISTENT CLIENT — one per process, shared by ops + listener
 # ============================================================
-_running_clients = {}      # task_id -> TelegramClient
+_persistent_client = None
+_async_init_lock = None
+_client_ready = threading.Event()
+
+
+async def _ensure_client_async():
+    """
+    Return the persistent Telegram client, creating it once.
+    Must be awaited on the event loop (i.e. inside run_in_tg_loop).
+    """
+    global _persistent_client, _async_init_lock
+
+    if _persistent_client is not None and _persistent_client.is_connected():
+        return _persistent_client
+
+    if _async_init_lock is None:
+        _async_init_lock = asyncio.Lock()
+
+    async with _async_init_lock:
+        if _persistent_client is not None:
+            if _persistent_client.is_connected():
+                return _persistent_client
+            try:
+                await _persistent_client.connect()
+                if _persistent_client.is_connected():
+                    logger.info("Persistent Telegram client reconnected")
+                    return _persistent_client
+            except Exception as e:
+                logger.warning(f"Reconnect failed: {e} — rebuilding client")
+                try:
+                    await _persistent_client.disconnect()
+                except Exception:
+                    pass
+                _persistent_client = None
+
+        if not os.path.exists(TELEGRAM_CREDS_FILE):
+            raise FileNotFoundError(
+                f"{TELEGRAM_CREDS_FILE} not found. Create it with "
+                '{"api_id": ..., "api_hash": ...}'
+            )
+        with open(TELEGRAM_CREDS_FILE) as f:
+            creds = json.load(f)
+        api_id = int(creds['api_id'])
+        api_hash = creds['api_hash']
+
+        common_kwargs = {'timeout': 120, 'request_retries': 8}
+        if TELEGRAM_PROXY:
+            client = TelegramClient(
+                TELEGRAM_SESSION_FILE, api_id, api_hash,
+                proxy=TELEGRAM_PROXY, **common_kwargs
+            )
+        else:
+            client = TelegramClient(
+                TELEGRAM_SESSION_FILE, api_id, api_hash, **common_kwargs
+            )
+        await client.start()
+        _persistent_client = client
+        _client_ready.set()
+        logger.info("Persistent Telegram client ready")
+        return client
+
+
+def ensure_client():
+    """Sync helper — blocks until the persistent client is ready."""
+    start_tg_loop_if_needed()
+    return run_in_tg_loop(_ensure_client_async())
+
+
+def get_persistent_client():
+    """Public getter used by telegram_listener."""
+    return _persistent_client
+
+
+# ============================================================
+# LEGACY COMPAT (pre-persistent-client API)
+# ------------------------------------------------------------
+# Older code created one TelegramClient per task and cancelled by
+# disconnecting it. Cancellation now goes through _current_ops
+# (see cancel_telegram_task), so these only keep bookkeeping and
+# NEVER disconnect the shared client.
+# ============================================================
+_running_clients = {}      # task_id -> TelegramClient (informational only)
 _running_lock = threading.Lock()
 
 
@@ -65,30 +146,57 @@ def unregister_client(task_id):
         _running_clients.pop(task_id, None)
 
 
+async def get_telegram_client():
+    """
+    Legacy alias — returns the shared persistent client.
+    Callers must NOT call client.disconnect() on it.
+    """
+    return await _ensure_client_async()
+
+
+# ============================================================
+# CURRENT OPS REGISTRY (cancellation without disconnecting)
+# ============================================================
+_current_ops = {}      # task_id -> asyncio.Task
+_current_ops_lock = threading.Lock()
+
+
+def _register_current_op(task_id):
+    atask = asyncio.current_task()
+    with _current_ops_lock:
+        _current_ops[task_id] = atask
+
+
+def _unregister_op(task_id):
+    with _current_ops_lock:
+        _current_ops.pop(task_id, None)
+
+
 def cancel_telegram_task(task_id):
     """
-    Cancel a running Telegram upload/download by disconnecting its client.
-    Called from /cancel/<task_id> route.
-    Returns True if a client was found and disconnected.
+    Cancel the running Telegram operation for a task.
+
+    The persistent client stays connected — the listener and any other
+    operations continue to run.
     """
-    with _running_lock:
-        client = _running_clients.get(task_id)
-    if not client:
+    with _current_ops_lock:
+        atask = _current_ops.get(task_id)
+
+    if atask is None or atask.done():
         return False
 
     try:
         loop = get_tg_loop()
-        # Schedule disconnect on the event loop
-        asyncio.run_coroutine_threadsafe(client.disconnect(), loop)
-        logger.info(f"Telegram client for task {task_id} disconnected (cancel)")
+        loop.call_soon_threadsafe(atask.cancel)
+        logger.info(f"Cancelling Telegram operation for task {task_id}")
         return True
     except Exception as e:
-        logger.warning(f"Failed to disconnect Telegram client for {task_id}: {e}")
+        logger.warning(f"Failed to cancel Telegram op {task_id}: {e}")
         return False
 
 
 # ============================================================
-# TELEGRAM HELPERS
+# HELPERS
 # ============================================================
 def get_telegram_creds():
     if os.path.exists(TELEGRAM_CREDS_FILE):
@@ -101,68 +209,27 @@ def get_telegram_creds():
     )
 
 
-async def get_telegram_client():
-    """
-    Build a fresh TelegramClient.
-
-    ── Option B applied ─────────────────────────────────────
-    • timeout=120        — socket-level timeout (generous for slow VPS links)
-    • request_retries=8  — up from Telethon's default 5, so each
-                           awaited request gets more internal retries
-                           before surfacing "Request was unsuccessful".
-    Combined with the outer retry loop in send_file_to_telegram_async,
-    this gives up to 8 × 4 = 32 attempts before permanent failure.
-    """
-    api_id, api_hash = get_telegram_creds()
-    common_kwargs = {
-        'timeout': 120,
-        'request_retries': 8,
-    }
-    if TELEGRAM_PROXY:
-        client = TelegramClient(
-            TELEGRAM_SESSION_FILE, int(api_id), api_hash,
-            proxy=TELEGRAM_PROXY, **common_kwargs
-        )
-    else:
-        client = TelegramClient(
-            TELEGRAM_SESSION_FILE, int(api_id), api_hash, **common_kwargs
-        )
-    await client.start()
-    return client
-
-
 def _humanize_telegram_error(e):
-    """
-    Turn common Telegram/Telethon error strings into readable text
-    suitable for showing in the workflow log / task panel.
-    """
     msg = str(e)
     low = msg.lower()
     if 'unsuccessful' in low or 'internal issues' in low:
-        return (
-            "Telegram's servers had a transient issue saving this file. "
-            "This is usually temporary — retry in a few minutes."
-        )
+        return ("Telegram's servers had a transient issue saving this file. "
+                "This is usually temporary — retry in a few minutes.")
     if 'flood' in low or 'too many requests' in low:
         return f"Rate limited by Telegram. Wait a bit before retrying. ({msg})"
     if 'file is too big' in low or 'file too large' in low:
         return f"File exceeds Telegram's size limit. ({msg})"
     if 'chat_write_forbidden' in low or 'not enough rights' in low:
-        return (
-            "The bot/session can't post in that chat. Check that the bot "
-            f"is an admin with 'Post messages' permission. ({msg})"
-        )
+        return ("The bot/session can't post in that chat. Check that the bot "
+                f"is an admin with 'Post messages' permission. ({msg})")
     if 'cannot find any entity' in low or 'chat not found' in low:
-        return (
-            "Chat not found. Check the link/ID — bot mode needs the numeric "
-            f"-100… ID for private channels. ({msg})"
-        )
+        return ("Chat not found. Check the link/ID — bot mode needs the numeric "
+                f"-100… ID for private channels. ({msg})")
     if 'user is banned' in low or 'not a member' in low:
         return f"The bot/user is banned or not a member of that chat. ({msg})"
     return msg
 
 
-# List of substrings that indicate a PERMANENT error — never retry these.
 _PERMANENT_ERROR_MARKERS = (
     'file is too big', 'file too large',
     'chat_write_forbidden', 'not enough rights',
@@ -197,8 +264,8 @@ class ProgressThrottle:
 # SCAN CHAT
 # ============================================================
 async def scan_chat_async(task_id, chat_link, limit):
-    client = await get_telegram_client()
-    register_client(task_id, client)
+    client = await _ensure_client_async()
+    _register_current_op(task_id)
     try:
         entity = await client.get_entity(chat_link)
         videos = []
@@ -234,6 +301,13 @@ async def scan_chat_async(task_id, chat_link, limit):
             task['status'] = 'scan_done'
             task['videos'] = videos
             save_task(task_id, task)
+    except asyncio.CancelledError:
+        logger.info(f"Scan {task_id} cancelled")
+        task = load_task(task_id)
+        if task:
+            task['status'] = 'cancelled'
+            save_task(task_id, task)
+        raise
     except Exception as e:
         logger.exception(f"Scan chat error for task {task_id}")
         task = load_task(task_id)
@@ -242,19 +316,15 @@ async def scan_chat_async(task_id, chat_link, limit):
             task['error_msg'] = _humanize_telegram_error(e)
             save_task(task_id, task)
     finally:
-        unregister_client(task_id)
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
+        _unregister_op(task_id)
 
 
 # ============================================================
 # DOWNLOAD SELECTED
 # ============================================================
 async def download_selected_async(download_task_id, chat_link, message_ids):
-    client = await get_telegram_client()
-    register_client(download_task_id, client)
+    client = await _ensure_client_async()
+    _register_current_op(download_task_id)
     throttle = ProgressThrottle(1.0)
 
     try:
@@ -319,7 +389,7 @@ async def download_selected_async(download_task_id, chat_link, message_ids):
             task['progress'] = 100
             save_task(download_task_id, task)
 
-    except TelegramCancelled:
+    except (asyncio.CancelledError, TelegramCancelled):
         logger.info(f"Download {download_task_id} cancelled")
         task = load_task(download_task_id)
         if task:
@@ -333,19 +403,15 @@ async def download_selected_async(download_task_id, chat_link, message_ids):
             task['error_msg'] = _humanize_telegram_error(e)
             save_task(download_task_id, task)
     finally:
-        unregister_client(download_task_id)
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
+        _unregister_op(download_task_id)
 
 
 # ============================================================
 # SEND FILE (with cancellation + throttled progress + retries)
 # ============================================================
 async def send_file_to_telegram_async(task_id, chat_link, file_path, original_filename, caption=None):
-    client = await get_telegram_client()
-    register_client(task_id, client)
+    client = await _ensure_client_async()
+    _register_current_op(task_id)
     throttle = ProgressThrottle(1.0)   # save at most once per second
 
     try:
@@ -363,7 +429,7 @@ async def send_file_to_telegram_async(task_id, chat_link, file_path, original_fi
             # Check cancellation on every callback
             t = load_task(task_id)
             if t and t.get('cancelled', False):
-                # Raise CancelledError to interrupt Telethon
+                # Raise a CancelledError to interrupt Telethon
                 raise asyncio.CancelledError("Cancelled by user")
 
             if throttle.should_save():
@@ -373,17 +439,11 @@ async def send_file_to_telegram_async(task_id, chat_link, file_path, original_fi
                     t['upload_progress'] = pct
                     save_task(task_id, t)
 
-        # ── Option A: outer retry loop with exponential backoff ──
-        # Telethon itself already retries failed SaveBigFilePartRequest
-        # calls request_retries times (default 5, we bumped it to 8 in
-        # get_telegram_client). This outer loop gives an additional 4
-        # attempts with backoff, riding out transient Telegram flaps.
         MAX_ATTEMPTS = 4
         retry_delay = 3.0
         last_err = None
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
-            # Re-check cancellation before each attempt
             t = load_task(task_id)
             if t and t.get('cancelled', False):
                 raise TelegramCancelled("Cancelled by user")
@@ -394,8 +454,6 @@ async def send_file_to_telegram_async(task_id, chat_link, file_path, original_fi
                     progress_callback=progress_cb,
                     caption=caption or f"📁 {original_filename}",
                     force_document=True,
-                    # Smaller chunk = each SaveBigFilePartRequest has
-                    # more headroom on a slow/flaky link.
                     part_size_kb=256,
                 )
                 last_err = None
@@ -410,32 +468,23 @@ async def send_file_to_telegram_async(task_id, chat_link, file_path, original_fi
             except (ValueError, errors.RPCError) as e:
                 last_err = e
                 err_low = str(e).lower()
-
-                # User cancelled inside the progress callback
                 if 'cancelled' in err_low:
                     raise TelegramCancelled("Cancelled by user")
-
-                # Permanent errors: do NOT waste time retrying
                 if any(m in err_low for m in _PERMANENT_ERROR_MARKERS):
                     logger.error(
                         f"Telegram send permanent failure for task {task_id}: {e}"
                     )
                     raise
-
                 if attempt == MAX_ATTEMPTS:
                     logger.error(
                         f"Telegram send failed for task {task_id} after "
-                        f"{MAX_ATTEMPTS} outer attempts (each with up to "
-                        f"8 inner retries): {e}"
+                        f"{MAX_ATTEMPTS} outer attempts: {e}"
                     )
                     raise
-
                 logger.warning(
                     f"Telegram send attempt {attempt}/{MAX_ATTEMPTS} "
                     f"failed for task {task_id}: {type(e).__name__}: {e}"
                 )
-                # Reset progress + surface status so the UI doesn't show a
-                # stale percentage while we're backing off
                 t = load_task(task_id)
                 if t:
                     t['upload_progress'] = 0
@@ -444,7 +493,6 @@ async def send_file_to_telegram_async(task_id, chat_link, file_path, original_fi
                         f"in {int(retry_delay)}s…"
                     )
                     save_task(task_id, t)
-
                 await asyncio.sleep(retry_delay)
                 retry_delay *= 2
 
@@ -466,10 +514,10 @@ async def send_file_to_telegram_async(task_id, chat_link, file_path, original_fi
             task['error_msg'] = 'Cancelled by user'
             save_task(task_id, task)
     except errors.RPCError as e:
-        # Disconnect aborts send_file → we get an RPC error
+        # A cancel that surfaces as an RPC error is still a cancel
         task = load_task(task_id)
         if task and task.get('cancelled', False):
-            logger.info(f"Send file task {task_id} aborted via disconnect")
+            logger.info(f"Send file task {task_id} aborted via cancel")
             task['status'] = 'cancelled'
             save_task(task_id, task)
         else:
@@ -487,11 +535,7 @@ async def send_file_to_telegram_async(task_id, chat_link, file_path, original_fi
             task['error_msg'] = _humanize_telegram_error(e)
             save_task(task_id, task)
     finally:
-        unregister_client(task_id)
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
+        _unregister_op(task_id)
 
 
 # ============================================================
@@ -518,6 +562,16 @@ def _get_unique_filename(filename):
 # ============================================================
 def register_routes(app):
     start_tg_loop_if_needed()
+
+    # Warm the client in the background so the first user op is instant
+    def _warmup():
+        try:
+            ensure_client()
+            logger.info("Telegram client warmed up")
+        except Exception as e:
+            logger.warning(f"Telegram warmup failed: {e}")
+
+    threading.Timer(2.0, _warmup).start()
 
     @app.route('/telegram/scan_chat', methods=['POST'])
     def telegram_scan_chat():
