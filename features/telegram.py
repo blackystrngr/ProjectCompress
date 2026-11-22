@@ -5,6 +5,7 @@ import asyncio
 import threading
 import time
 import logging
+from concurrent.futures import CancelledError as FuturesCancelled
 from flask import request, jsonify
 from telethon import TelegramClient, errors
 from telethon.tl.types import DocumentAttributeVideo
@@ -13,12 +14,18 @@ from config import UPLOAD_FOLDER, TELEGRAM_SESSION_FILE, TELEGRAM_CREDS_FILE, TE
 
 logger = logging.getLogger(__name__)
 
+# How many Telegram jobs (scan / download / upload) may run at once.
+# 1 = old strict serialisation. Keep small to avoid FloodWait.
+TG_MAX_CONCURRENT_JOBS = 3
+# Attempts for scan / download steps that hit a dropped connection.
+TG_RETRY_ATTEMPTS = 3
+
 # ============================================================
 # GLOBAL EVENT LOOP (single, persistent) + LOCK
 # ============================================================
 _tg_loop = None
 _tg_loop_lock = threading.Lock()
-_tg_operation_lock = threading.Lock()
+_tg_job_slots = threading.BoundedSemaphore(TG_MAX_CONCURRENT_JOBS)
 
 
 def get_tg_loop():
@@ -96,7 +103,13 @@ async def _ensure_client_async():
         api_id = int(creds['api_id'])
         api_hash = creds['api_hash']
 
-        common_kwargs = {'timeout': 120, 'request_retries': 8}
+        common_kwargs = {
+            'timeout': 120,
+            'request_retries': 8,
+            'connection_retries': 10,   # survive short network drops
+            'retry_delay': 2,
+            'auto_reconnect': True,
+        }
         if TELEGRAM_PROXY:
             client = TelegramClient(
                 TELEGRAM_SESSION_FILE, api_id, api_hash,
@@ -210,7 +223,7 @@ def get_telegram_creds():
 
 
 def _humanize_telegram_error(e):
-    msg = str(e)
+    msg = str(e) or type(e).__name__
     low = msg.lower()
     if 'unsuccessful' in low or 'internal issues' in low:
         return ("Telegram's servers had a transient issue saving this file. "
@@ -243,6 +256,69 @@ class TelegramCancelled(Exception):
     pass
 
 
+def _is_transient(e):
+    """True for dropped-connection style errors worth retrying."""
+    low = str(e).lower()
+    if any(m in low for m in _PERMANENT_ERROR_MARKERS):
+        return False
+    if isinstance(e, (FileNotFoundError, PermissionError, IsADirectoryError)):
+        return False
+    return isinstance(e, (ConnectionError, TimeoutError, asyncio.TimeoutError,
+                          OSError, EOFError, errors.RPCError))
+
+
+async def _retry_async(task_id, label, call, cleanup=None,
+                       attempts=TG_RETRY_ATTEMPTS, base_delay=3.0):
+    """
+    Run `await call(client)`; on a transient failure wait, re-acquire the
+    (possibly rebuilt) persistent client and try again.
+    """
+    delay = base_delay
+    client = await _ensure_client_async()
+    for attempt in range(1, attempts + 1):
+        t = load_task(task_id)
+        if t and t.get('cancelled', False):
+            raise TelegramCancelled("Cancelled by user")
+        try:
+            return await call(client)
+        except (asyncio.CancelledError, TelegramCancelled):
+            raise
+        except Exception as e:
+            if attempt == attempts or not _is_transient(e):
+                raise
+            logger.warning(
+                f"Telegram {label} attempt {attempt}/{attempts} failed for "
+                f"task {task_id}: {type(e).__name__}: {e} — retrying in {delay:.0f}s"
+            )
+            if cleanup:
+                try:
+                    cleanup()
+                except Exception:
+                    pass
+            await asyncio.sleep(delay)
+            delay *= 2
+            client = await _ensure_client_async()
+
+
+def _mark_wrapper_failure(task_id, e):
+    """Common handler for exceptions escaping a sync job wrapper."""
+    t = load_task(task_id)
+    if not t:
+        return
+    if (isinstance(e, (FuturesCancelled, asyncio.CancelledError, TelegramCancelled))
+            or t.get('cancelled', False)):
+        if t.get('status') not in ('done', 'cancelled'):
+            t['status'] = 'cancelled'
+            t['error_msg'] = 'Cancelled by user'
+            save_task(task_id, t)
+        return
+    if t.get('status') in ('done', 'cancelled'):
+        return
+    t['status'] = 'error'
+    t['error_msg'] = _humanize_telegram_error(e)
+    save_task(task_id, t)
+
+
 # ============================================================
 # THROTTLED PROGRESS SAVER
 # ============================================================
@@ -264,50 +340,61 @@ class ProgressThrottle:
 # SCAN CHAT
 # ============================================================
 async def scan_chat_async(task_id, chat_link, limit):
-    client = await _ensure_client_async()
+    await _ensure_client_async()
     _register_current_op(task_id)
     try:
-        entity = await client.get_entity(chat_link)
-        videos = []
-        async for msg in client.iter_messages(entity, limit=limit):
-            task = load_task(task_id)
-            if task and task.get('cancelled', False):
-                break
+        async def _scan(client):
+            entity = await client.get_entity(chat_link)
+            videos = []
+            was_cancelled = False
+            async for msg in client.iter_messages(entity, limit=limit):
+                task = load_task(task_id)
+                if task and task.get('cancelled', False):
+                    was_cancelled = True
+                    break
 
-            is_video = (
-                msg.video
-                or (msg.document and any(isinstance(a, DocumentAttributeVideo) for a in msg.document.attributes))
-                or (msg.document and msg.document.mime_type and msg.document.mime_type.startswith('video/'))
-            )
-            if not is_video:
-                continue
+                is_video = (
+                    msg.video
+                    or (msg.document and any(isinstance(a, DocumentAttributeVideo) for a in msg.document.attributes))
+                    or (msg.document and msg.document.mime_type and msg.document.mime_type.startswith('video/'))
+                )
+                if not is_video:
+                    continue
 
-            file_name = getattr(msg.file, 'name', None)
-            if not file_name:
-                mime = msg.document.mime_type if msg.document else 'video/mp4'
-                ext = mime.split('/')[-1] if '/' in mime else 'mp4'
-                file_name = f"video_{msg.id}.{ext}"
-            size_mb = (msg.document.size if msg.document else msg.video.size) / (1024 * 1024)
+                file_name = getattr(msg.file, 'name', None)
+                if not file_name:
+                    mime = msg.document.mime_type if msg.document else 'video/mp4'
+                    ext = mime.split('/')[-1] if '/' in mime else 'mp4'
+                    file_name = f"video_{msg.id}.{ext}"
+                size_mb = (msg.document.size if msg.document else msg.video.size) / (1024 * 1024)
 
-            videos.append({
-                'id': msg.id,
-                'file_name': file_name,
-                'size_mb': round(size_mb, 1),
-                'date': msg.date.isoformat() if msg.date else None,
-            })
+                videos.append({
+                    'id': msg.id,
+                    'file_name': file_name,
+                    'size_mb': round(size_mb, 1),
+                    'date': msg.date.isoformat() if msg.date else None,
+                })
+            return videos, was_cancelled
+
+        videos, was_cancelled = await _retry_async(task_id, 'scan', _scan)
 
         task = load_task(task_id)
         if task:
-            task['status'] = 'scan_done'
             task['videos'] = videos
+            if was_cancelled or task.get('cancelled', False):
+                task['status'] = 'cancelled'
+                task['error_msg'] = 'Cancelled by user'
+            else:
+                task['status'] = 'scan_done'
             save_task(task_id, task)
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, TelegramCancelled):
+        # Handled here (not re-raised) so the sync wrapper sees a clean finish
         logger.info(f"Scan {task_id} cancelled")
         task = load_task(task_id)
         if task:
             task['status'] = 'cancelled'
+            task['error_msg'] = 'Cancelled by user'
             save_task(task_id, task)
-        raise
     except Exception as e:
         logger.exception(f"Scan chat error for task {task_id}")
         task = load_task(task_id)
@@ -369,7 +456,16 @@ async def download_selected_async(download_task_id, chat_link, message_ids):
                         t['progress'] = overall
                         save_task(download_task_id, t)
 
-            await client.download_media(message, file=temp_path, progress_callback=progress_cb)
+            def _drop_partial(_p=temp_path):
+                if os.path.exists(_p):
+                    os.remove(_p)
+
+            await _retry_async(
+                download_task_id, f'download msg {msg_id}',
+                lambda c, _m=message, _p=temp_path, _cb=progress_cb:
+                    c.download_media(_m, file=_p, progress_callback=_cb),
+                cleanup=_drop_partial,
+            )
 
             t = load_task(download_task_id)
             if t and t.get('cancelled', False):
@@ -465,7 +561,10 @@ async def send_file_to_telegram_async(task_id, chat_link, file_path, original_fi
                 break
             except (asyncio.CancelledError, TelegramCancelled):
                 raise
-            except (ValueError, errors.RPCError) as e:
+            except (ValueError, errors.RPCError, ConnectionError, TimeoutError,
+                    asyncio.TimeoutError, OSError, EOFError) as e:
+                if isinstance(e, (FileNotFoundError, PermissionError, IsADirectoryError)):
+                    raise
                 last_err = e
                 err_low = str(e).lower()
                 if 'cancelled' in err_low:
@@ -495,6 +594,7 @@ async def send_file_to_telegram_async(task_id, chat_link, file_path, original_fi
                     save_task(task_id, t)
                 await asyncio.sleep(retry_delay)
                 retry_delay *= 2
+                client = await _ensure_client_async()   # may have been rebuilt
 
         if last_err is not None:
             raise last_err
@@ -542,8 +642,9 @@ async def send_file_to_telegram_async(task_id, chat_link, file_path, original_fi
 # SYNC WRAPPERS
 # ============================================================
 def _run_telegram_job(coro_func, *args, **kwargs):
+    """Run a Telegram coroutine; up to TG_MAX_CONCURRENT_JOBS run in parallel."""
     start_tg_loop_if_needed()
-    with _tg_operation_lock:
+    with _tg_job_slots:
         return run_in_tg_loop(coro_func(*args, **kwargs))
 
 
@@ -594,13 +695,9 @@ def register_routes(app):
         def run_scan():
             try:
                 _run_telegram_job(scan_chat_async, task_id, chat_link, limit)
-            except Exception as e:
-                logger.exception(f"scan_chat wrapper error: {e}")
-                t = load_task(task_id)
-                if t:
-                    t['status'] = 'error'
-                    t['error_msg'] = _humanize_telegram_error(e)
-                    save_task(task_id, t)
+            except (Exception, FuturesCancelled) as e:
+                logger.exception(f"scan_chat wrapper error: {e!r}")
+                _mark_wrapper_failure(task_id, e)
 
         threading.Thread(target=run_scan, daemon=True).start()
         return jsonify({'task_id': task_id})
@@ -632,13 +729,9 @@ def register_routes(app):
                     download_selected_async,
                     download_task_id, chat_link, selected_ids
                 )
-            except Exception as e:
-                logger.exception(f"download_selected wrapper error: {e}")
-                t = load_task(download_task_id)
-                if t:
-                    t['status'] = 'error'
-                    t['error_msg'] = _humanize_telegram_error(e)
-                    save_task(download_task_id, t)
+            except (Exception, FuturesCancelled) as e:
+                logger.exception(f"download_selected wrapper error: {e!r}")
+                _mark_wrapper_failure(download_task_id, e)
 
         threading.Thread(target=run_download, daemon=True).start()
         return jsonify({'download_task_id': download_task_id})
@@ -676,13 +769,9 @@ def register_routes(app):
                     send_file_to_telegram_async,
                     task_id, chat_link, full_path, os.path.basename(full_path)
                 )
-            except Exception as e:
-                logger.exception(f"send_file wrapper error: {e}")
-                t = load_task(task_id)
-                if t:
-                    t['status'] = 'error'
-                    t['error_msg'] = _humanize_telegram_error(e)
-                    save_task(task_id, t)
+            except (Exception, FuturesCancelled) as e:
+                logger.exception(f"send_file wrapper error: {e!r}")
+                _mark_wrapper_failure(task_id, e)
 
         threading.Thread(target=run_send, daemon=True).start()
         return jsonify({'task_id': task_id})
