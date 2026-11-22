@@ -15,6 +15,7 @@ from . import thumbnails
 from . import workflow
 from . import settings              # ← NEW
 from . import telegram_logger
+from . import telegram_listener
 
 logger = logging.getLogger(__name__)
 
@@ -42,5 +43,11 @@ def register_all_features(app):
     workflow.register_routes(app)
     settings.register_routes(app)       # ← NEW
     telegram_logger.register_routes(app)
+    telegram_listener.register_routes(app)
+
+    try:
+        telegram_listener.start_listener_if_enabled()
+    except Exception as e:
+        logger.warning(f"telegram_listener auto-start failed: {e}")
 
     logger.info("All features registered")
