@@ -73,6 +73,9 @@ ALLOWED_KEYS = {
     'tg_listener_include_pattern': {'type': 'str', 'max': 2000},
     'tg_listener_exclude_pattern': {'type': 'str', 'max': 2000},
     'tg_listener_forward_prefix':  {'type': 'str', 'max': 200},
+    'tg_listener_detection_mode':  {'type': 'str', 'choices': ('intelligent', 'legacy')},
+    'tg_listener_min_score':       {'type': 'int', 'min': 0, 'max': 100},
+    'tg_listener_cost_policy':     {'type': 'str', 'choices': ('free', 'any')},
 }
 
 
@@ -145,6 +148,9 @@ def get_effective_config() -> dict:
         'tg_listener_include_pattern': s.get('tg_listener_include_pattern', ''),
         'tg_listener_exclude_pattern': s.get('tg_listener_exclude_pattern', ''),
         'tg_listener_forward_prefix':  s.get('tg_listener_forward_prefix', ''),
+        'tg_listener_detection_mode':  s.get('tg_listener_detection_mode', 'intelligent'),
+        'tg_listener_min_score':       int(s.get('tg_listener_min_score', 45)),
+        'tg_listener_cost_policy':     s.get('tg_listener_cost_policy', 'free'),
     }
 
 
@@ -185,6 +191,9 @@ def register_routes(app):
             'tg_listener_include_pattern': cfg['tg_listener_include_pattern'],
             'tg_listener_exclude_pattern': cfg['tg_listener_exclude_pattern'],
             'tg_listener_forward_prefix':  cfg['tg_listener_forward_prefix'],
+            'tg_listener_detection_mode': cfg['tg_listener_detection_mode'],
+            'tg_listener_min_score': cfg['tg_listener_min_score'],
+            'tg_listener_cost_policy': cfg['tg_listener_cost_policy'],
 
             'env':                     env_info,
             'settings_file':           SETTINGS_FILE,

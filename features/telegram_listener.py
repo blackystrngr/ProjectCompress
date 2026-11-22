@@ -38,6 +38,7 @@ from flask import request, jsonify
 from telethon import events, utils
 
 from . import telegram as tg_module
+from .crypto_opportunity_detector import analyze_message, format_alert
 from .telegram import (
     start_tg_loop_if_needed,
     run_in_tg_loop,
@@ -56,7 +57,7 @@ DEFAULT_EXCLUDE = (
     r"futures\s*margin\s*maintenance|scheduled\s*system\s*upgrade|"
     r"delisting\s*notice)\b"
 )
-DEFAULT_PREFIX = "🚨 Zero-Deposit Promo Alert"
+DEFAULT_PREFIX = "🧭 Crypto Opportunity"
 
 WATCHDOG_INTERVAL_SEC = 30
 DEDUPE_TTL_SEC = 6 * 3600
@@ -73,6 +74,8 @@ _seen = OrderedDict()             # text-hash -> timestamp (dedupe)
 _stats = {
     'messages_seen': 0,
     'matches_forwarded': 0,
+    'opportunities_detected': 0,
+    'opportunities_rejected': 0,
     'duplicates_skipped': 0,
     'unresolved_sources': [],
     'invalid_patterns': [],
@@ -95,14 +98,18 @@ def _load_config():
             'target': (cfg.get('tg_listener_target') or '').strip(),
             'include': (cfg.get('tg_listener_include_pattern') or DEFAULT_INCLUDE).strip(),
             'exclude': (cfg.get('tg_listener_exclude_pattern') or DEFAULT_EXCLUDE).strip(),
-            'prefix': (cfg.get('tg_listener_forward_prefix') or DEFAULT_PREFIX).strip(),
+            'prefix': (cfg.get('tg_listener_forward_prefix') or '🧭 Crypto Opportunity').strip(),
+            'mode': cfg.get('tg_listener_detection_mode', 'intelligent'),
+            'min_score': int(cfg.get('tg_listener_min_score', 45)),
+            'cost_policy': cfg.get('tg_listener_cost_policy', 'free'),
         }
     except Exception as e:
         logger.warning(f"telegram_listener: could not read settings: {e}")
         return {
             'enabled': False, 'sources': [], 'target': '',
             'include': DEFAULT_INCLUDE, 'exclude': DEFAULT_EXCLUDE,
-            'prefix': DEFAULT_PREFIX,
+            'prefix': '🧭 Crypto Opportunity', 'mode': 'intelligent',
+            'min_score': 45, 'cost_policy': 'free',
         }
 
 
@@ -269,7 +276,20 @@ async def _attach_async(cfg):
             if not text:
                 return
             _stats['messages_seen'] += 1
-            if not _should_forward(text, include_re, exclude_re):
+            if exclude_re and exclude_re.search(text):
+                return
+            analysis = None
+            if cfg.get('mode', 'intelligent') == 'intelligent':
+                analysis = analyze_message(
+                    text,
+                    min_score=max(0, min(100, int(cfg.get('min_score', 45)))),
+                    policy=cfg.get('cost_policy', 'free'),
+                )
+                if not analysis.get('accepted'):
+                    _stats['opportunities_rejected'] += 1
+                    return
+                _stats['opportunities_detected'] += 1
+            elif not _should_forward(text, include_re, exclude_re):
                 return
             if _is_duplicate(text):
                 _stats['duplicates_skipped'] += 1
@@ -278,9 +298,13 @@ async def _attach_async(cfg):
             chat = await event.get_chat()
             source = _channel_display(chat)
             link = _message_link(chat, event.id)
-            body = text[:3500]
-            head = f"{prefix} ({source})"
-            alert = f"{head}\n\n{body}\n\n🔗 {link}" if link else f"{head}\n\n{body}"
+            if analysis is not None:
+                alert = format_alert(text, analysis, source, link)
+                alert = f"{prefix}\n\n{alert}"
+            else:
+                body = text[:3500]
+                head = f"{prefix} ({source})"
+                alert = f"{head}\n\n{body}\n\n🔗 {link}" if link else f"{head}\n\n{body}"
             await _send_with_retry(client, target_entity, alert)
             _stats['matches_forwarded'] += 1
             _stats['last_forward_at'] = time.time()
@@ -428,11 +452,16 @@ def get_status():
         'include': cfg['include'],
         'exclude': cfg['exclude'],
         'prefix': cfg['prefix'],
+        'detection_mode': cfg['mode'],
+        'min_score': cfg['min_score'],
+        'cost_policy': cfg['cost_policy'],
         'invalid_patterns': _stats['invalid_patterns'],
         'started_at': _stats['started_at'],
         'uptime_sec': int(time.time() - _stats['started_at']) if _stats['started_at'] else 0,
         'messages_seen': _stats['messages_seen'],
         'matches_forwarded': _stats['matches_forwarded'],
+        'opportunities_detected': _stats['opportunities_detected'],
+        'opportunities_rejected': _stats['opportunities_rejected'],
         'duplicates_skipped': _stats['duplicates_skipped'],
         'last_forward_at': _stats['last_forward_at'],
         'last_error': _stats['last_error'],
@@ -456,8 +485,10 @@ def register_routes(app):
         exclude_re, exc_err = _compile(cfg['exclude'], DEFAULT_EXCLUDE)
         included = bool(include_re.search(text))
         excluded = bool(exclude_re.search(text))
+        intelligent = analyze_message(text, min_score=max(0, min(100, int(cfg.get('min_score', 45)))), policy=cfg.get('cost_policy', 'free'))
         return jsonify({
-            'matched': included and not excluded,
+            'matched': (intelligent.get('accepted', False) if cfg.get('mode') == 'intelligent' else included) and not excluded,
+            'intelligent': intelligent,
             'included': included,
             'excluded': excluded,
             'include_pattern': cfg['include'],
