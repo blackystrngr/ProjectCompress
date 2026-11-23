@@ -10,39 +10,53 @@ auth key, one rate-limit bucket.
 Config keys (settings.json):
   tg_listener_enabled, tg_listener_sources, tg_listener_target,
   tg_listener_include_pattern, tg_listener_exclude_pattern,
-  tg_listener_forward_prefix
+  tg_listener_forward_prefix, tg_listener_detection_mode,
+  tg_listener_min_score, tg_listener_cost_policy,
+  tg_listener_llm_mode, tg_listener_llm_model, tg_listener_llm_base_url,
+  tg_listener_llm_api_key, tg_listener_exchange_enabled
 
-Hardening over the first version
---------------------------------
-  * Watchdog re-attaches the handler if the shared client is rebuilt
-    (handlers live on the client object — a new client has none).
-  * Invalid regex no longer means "forward everything": it falls back
-    to the built-in default pattern and the problem is reported.
-  * Numeric IDs (-100123…) work for sources and target.
-  * Target is resolved once at attach time (bad target fails early),
-    and is removed from the source list (no forward loops).
-  * Duplicate announcements (cross-posts / re-posts) are suppressed.
-  * Forwarding retries on dropped connections.
-  * attach/detach are serialised (settings save + timer + reload route
-    can no longer race each other).
+Hardening (v2)
+  * Watchdog re-attaches the handler if the shared client is rebuilt.
+  * Invalid regex falls back to the default pattern (never "forward all").
+  * Numeric IDs work; target resolved once; target removed from sources.
+  * Duplicate suppression; send retries; serialised attach/detach.
+
+Added (v3)
+  * Decisions come from features.opportunity_pipeline (rules → optional
+    LLM second opinion). See crypto_opportunity_detector / llm_classifier.
+  * /telegram/listener/recent shows every message and WHY it was forwarded
+    or skipped — the answer to "why didn't event X show up?".
+  * Starts features.exchange_events: polls Binance + Bybit announcement
+    feeds and forwards new events here too.
+  * Headline already forwarded from the website isn't forwarded twice.
+  * Alerts are sent as Telegram-HTML (bold headline, reward, deadline,
+    collapsible original text); everything is escaped.
 """
 
 import re
 import time
 import asyncio
 import hashlib
+import functools
 import threading
 import logging
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from flask import request, jsonify
 from telethon import events, utils
 
 from . import telegram as tg_module
-from .crypto_opportunity_detector import analyze_message, format_alert
+from . import opportunity_pipeline as pipeline
+from . import llm_classifier
+from .crypto_opportunity_detector import format_alert_html, explain
 from .telegram import (
     start_tg_loop_if_needed,
     run_in_tg_loop,
 )
+try:
+    from . import exchange_events
+except Exception as _e:               # optional — never break the listener
+    exchange_events = None
+    logging.getLogger(__name__).warning(f"exchange_events unavailable: {_e}")
 
 logger = logging.getLogger(__name__)
 
@@ -67,12 +81,15 @@ SEND_ATTEMPTS = 3
 # Runtime state
 _handler = None
 _attached_client = None          # the client object the handler lives on
+_target_entity = None            # resolved forward target (shared with the poller)
 _handler_lock = threading.Lock()
 _attach_lock = threading.RLock()  # serialises attach/detach
 _watchdog_started = False
 _seen = OrderedDict()             # text-hash -> timestamp (dedupe)
+_recent = deque(maxlen=200)       # last decisions: why a message was / wasn't forwarded
 _stats = {
     'messages_seen': 0,
+    'no_text': 0,
     'matches_forwarded': 0,
     'opportunities_detected': 0,
     'opportunities_rejected': 0,
@@ -98,18 +115,25 @@ def _load_config():
             'target': (cfg.get('tg_listener_target') or '').strip(),
             'include': (cfg.get('tg_listener_include_pattern') or DEFAULT_INCLUDE).strip(),
             'exclude': (cfg.get('tg_listener_exclude_pattern') or DEFAULT_EXCLUDE).strip(),
-            'prefix': (cfg.get('tg_listener_forward_prefix') or '🧭 Crypto Opportunity').strip(),
+            'prefix': (cfg.get('tg_listener_forward_prefix') or DEFAULT_PREFIX).strip(),
             'mode': cfg.get('tg_listener_detection_mode', 'intelligent'),
             'min_score': int(cfg.get('tg_listener_min_score', 45)),
             'cost_policy': cfg.get('tg_listener_cost_policy', 'free'),
+            'llm_mode': cfg.get('tg_listener_llm_mode', 'off'),
+            'llm_model': (cfg.get('tg_listener_llm_model') or '').strip(),
+            'llm_base_url': (cfg.get('tg_listener_llm_base_url') or '').strip(),
+            'llm_api_key': (cfg.get('tg_listener_llm_api_key') or '').strip(),
+            'exchange': bool(cfg.get('tg_listener_exchange_enabled', True)),
         }
     except Exception as e:
         logger.warning(f"telegram_listener: could not read settings: {e}")
         return {
             'enabled': False, 'sources': [], 'target': '',
             'include': DEFAULT_INCLUDE, 'exclude': DEFAULT_EXCLUDE,
-            'prefix': '🧭 Crypto Opportunity', 'mode': 'intelligent',
+            'prefix': DEFAULT_PREFIX, 'mode': 'intelligent',
             'min_score': 45, 'cost_policy': 'free',
+            'llm_mode': 'off', 'llm_model': '', 'llm_base_url': '', 'llm_api_key': '',
+            'exchange': True,
         }
 
 
@@ -167,6 +191,18 @@ def _is_duplicate(text):
     return False
 
 
+def _record(source, msg_id, text, decision, reason='', analysis=None, engine=''):
+    row = {
+        'time': time.time(), 'source': source, 'msg_id': msg_id,
+        'text': (text or '')[:200].replace('\n', ' '),
+        'decision': decision, 'reason': reason, 'engine': engine,
+    }
+    if analysis:
+        row.update(score=analysis.get('score'), category=analysis.get('category'),
+                   cost=analysis.get('cost_tier'), reward=analysis.get('reward') or None)
+    _recent.append(row)
+
+
 def _channel_display(chat):
     title = getattr(chat, 'title', None)
     username = getattr(chat, 'username', None)
@@ -192,11 +228,13 @@ def _message_link(chat, msg_id):
     return ''
 
 
-async def _send_with_retry(client, target, text):
+async def _send_with_retry(client, target, text, parse_mode=None):
+    """parse_mode=None → plain text (Telethon's default Markdown would eat _ and *)."""
     delay = 2.0
     for attempt in range(1, SEND_ATTEMPTS + 1):
         try:
-            return await client.send_message(target, text, link_preview=False)
+            return await client.send_message(target, text, link_preview=False,
+                                             parse_mode=parse_mode)
         except (ConnectionError, OSError, asyncio.TimeoutError) as e:
             if attempt == SEND_ATTEMPTS:
                 raise
@@ -212,7 +250,7 @@ async def _send_with_retry(client, target, text):
 # Attach / detach
 # ============================================================
 async def _attach_async(cfg):
-    global _handler, _attached_client
+    global _handler, _attached_client, _target_entity
 
     client = await tg_module._ensure_client_async()
 
@@ -221,6 +259,7 @@ async def _attach_async(cfg):
         old, old_client = _handler, _attached_client
         _handler = None
         _attached_client = None
+        _target_entity = None
     if old is not None:
         try:
             (old_client or client).remove_event_handler(old)
@@ -257,6 +296,7 @@ async def _attach_async(cfg):
         resolved.append(entity)
         logger.info(f"[listener] Resolved: {src} → {_channel_display(entity)}")
     _stats['unresolved_sources'] = unresolved
+    names = {utils.get_peer_id(e): _channel_display(e) for e in resolved}
 
     if not resolved:
         raise Exception("None of the source channels could be resolved")
@@ -268,54 +308,71 @@ async def _attach_async(cfg):
         + ([f"exclude: {exc_err}"] if exc_err else [])
     )
     prefix = cfg['prefix']
+    loop = asyncio.get_running_loop()
+    snapshot = dict(cfg)               # settings change → reconfigure → re-attach
 
     @client.on(events.NewMessage(chats=resolved))
     async def _listener(event):
+        source = names.get(getattr(event, 'chat_id', None), 'unknown')
+        text = event.raw_text or ''
         try:
-            text = event.raw_text or ''
             if not text:
+                _stats['no_text'] += 1
+                _record(source, event.id, '(media only / no text)', 'no_text',
+                        'message has no text — images/stickers cannot be matched')
                 return
             _stats['messages_seen'] += 1
-            if exclude_re and exclude_re.search(text):
+
+            # rules → optional LLM (blocking HTTP → run off the event loop)
+            d = await loop.run_in_executor(
+                None, functools.partial(pipeline.evaluate, text, snapshot,
+                                        include_re, exclude_re))
+            analysis = d.get('analysis')
+            if not d['forward']:
+                _stats['opportunities_rejected'] += 1
+                _record(source, event.id, text, 'skipped', d['reason'], analysis, d['engine'])
                 return
-            analysis = None
-            if cfg.get('mode', 'intelligent') == 'intelligent':
-                analysis = analyze_message(
-                    text,
-                    min_score=max(0, min(100, int(cfg.get('min_score', 45)))),
-                    policy=cfg.get('cost_policy', 'free'),
-                )
-                if not analysis.get('accepted'):
-                    _stats['opportunities_rejected'] += 1
-                    return
-                _stats['opportunities_detected'] += 1
-            elif not _should_forward(text, include_re, exclude_re):
-                return
+            _stats['opportunities_detected'] += 1
+
             if _is_duplicate(text):
                 _stats['duplicates_skipped'] += 1
+                _record(source, event.id, text, 'duplicate', 'same text forwarded recently', analysis, d['engine'])
                 logger.info(f"[listener] Duplicate skipped: msg_id={event.id}")
                 return
+            if exchange_events is not None and exchange_events.covered(text):
+                _record(source, event.id, text, 'covered_by_website',
+                        'same headline was already forwarded (another channel or the exchange feed)', analysis, d['engine'])
+                logger.info(f"[listener] Already forwarded from exchange feed: msg_id={event.id}")
+                return
+
             chat = await event.get_chat()
             source = _channel_display(chat)
             link = _message_link(chat, event.id)
             if analysis is not None:
-                alert = format_alert(text, analysis, source, link)
-                alert = f"{prefix}\n\n{alert}"
+                alert = format_alert_html(text, analysis, source, link, prefix=prefix)
+                pm = 'html'
             else:
                 body = text[:3500]
                 head = f"{prefix} ({source})"
                 alert = f"{head}\n\n{body}\n\n🔗 {link}" if link else f"{head}\n\n{body}"
-            await _send_with_retry(client, target_entity, alert)
+                pm = None
+            await _send_with_retry(client, target_entity, alert, parse_mode=pm)
             _stats['matches_forwarded'] += 1
             _stats['last_forward_at'] = time.time()
-            logger.info(f"[listener] Forwarded match: {source} msg_id={event.id}")
+            _record(source, event.id, text, 'forwarded', d['reason'], analysis, d['engine'])
+            if exchange_events is not None:
+                exchange_events.note_forwarded(text)
+            logger.info(f"[listener] Forwarded match: {source} msg_id={event.id} "
+                        f"({d['engine']}: {d['reason'][:60]})")
         except Exception as e:
             _stats['last_error'] = f"{type(e).__name__}: {e}"
+            _record(source, event.id, text, 'send_error', _stats['last_error'])
             logger.exception("[listener] handler error")
 
     with _handler_lock:
         _handler = _listener
         _attached_client = client
+        _target_entity = target_entity
     _stats['started_at'] = time.time()
     _stats['last_error'] = None
     logger.info(
@@ -325,11 +382,12 @@ async def _attach_async(cfg):
 
 
 async def _detach_async():
-    global _handler, _attached_client
+    global _handler, _attached_client, _target_entity
     with _handler_lock:
         old, old_client = _handler, _attached_client
         _handler = None
         _attached_client = None
+        _target_entity = None
     if old is None:
         return
     client = old_client or tg_module.get_persistent_client()
@@ -341,6 +399,29 @@ async def _detach_async():
             logger.warning(f"[listener] Detach failed: {e}")
 
 
+async def _forward_text_async(text, parse_mode=None):
+    client, target = _attached_client, _target_entity
+    if client is None or target is None or not client.is_connected():
+        return False
+    await _send_with_retry(client, target, text, parse_mode=parse_mode)
+    _stats['matches_forwarded'] += 1
+    _stats['last_forward_at'] = time.time()
+    return True
+
+
+def _send_text_sync(text, parse_mode=None):
+    """Used by features.exchange_events to post to the same target chat."""
+    return bool(run_in_tg_loop(_forward_text_async(text, parse_mode)))
+
+
+def _start_exchange_poller():
+    if exchange_events is not None:
+        try:
+            exchange_events.start(_load_config, _send_text_sync)
+        except Exception:
+            logger.exception("[listener] could not start exchange poller")
+
+
 def attach(cfg=None):
     start_tg_loop_if_needed()
     if cfg is None:
@@ -349,11 +430,13 @@ def attach(cfg=None):
         try:
             run_in_tg_loop(_attach_async(cfg))
             _start_watchdog()
+            _start_exchange_poller()
             return True
         except Exception as e:
             _stats['last_error'] = f"{type(e).__name__}: {e}"
             logger.exception("[listener] Attach failed")
             _start_watchdog()   # keep retrying in the background
+            _start_exchange_poller()
             return False
 
 
@@ -459,12 +542,15 @@ def get_status():
         'started_at': _stats['started_at'],
         'uptime_sec': int(time.time() - _stats['started_at']) if _stats['started_at'] else 0,
         'messages_seen': _stats['messages_seen'],
+        'no_text_messages': _stats['no_text'],
         'matches_forwarded': _stats['matches_forwarded'],
         'opportunities_detected': _stats['opportunities_detected'],
         'opportunities_rejected': _stats['opportunities_rejected'],
         'duplicates_skipped': _stats['duplicates_skipped'],
         'last_forward_at': _stats['last_forward_at'],
         'last_error': _stats['last_error'],
+        'llm': llm_classifier.get_status(cfg),
+        'exchange': exchange_events.get_status() if exchange_events else None,
     }
 
 
@@ -485,10 +571,16 @@ def register_routes(app):
         exclude_re, exc_err = _compile(cfg['exclude'], DEFAULT_EXCLUDE)
         included = bool(include_re.search(text))
         excluded = bool(exclude_re.search(text))
-        intelligent = analyze_message(text, min_score=max(0, min(100, int(cfg.get('min_score', 45)))), policy=cfg.get('cost_policy', 'free'))
+        d = pipeline.evaluate(text, cfg, include_re, exclude_re,
+                              allow_llm=bool(data.get('use_llm')))
+        analysis = d.get('analysis')
         return jsonify({
-            'matched': (intelligent.get('accepted', False) if cfg.get('mode') == 'intelligent' else included) and not excluded,
-            'intelligent': intelligent,
+            'matched': d['forward'],
+            'reason': d['reason'],
+            'engine': d['engine'],
+            'summary': explain(analysis) if analysis else d['reason'],
+            'intelligent': analysis,
+            'llm': d.get('llm'),
             'included': included,
             'excluded': excluded,
             'include_pattern': cfg['include'],
@@ -498,6 +590,31 @@ def register_routes(app):
             'include_error': inc_err,
             'exclude_error': exc_err,
         })
+
+    @app.route('/telegram/listener/recent', methods=['GET'])
+    def listener_recent():
+        """Last messages seen and why each was forwarded or skipped.
+        ?n=50  ?decision=skipped|forwarded|duplicate|no_text|covered_by_website"""
+        try:
+            n = max(1, min(200, int(request.args.get('n', 50))))
+        except ValueError:
+            n = 50
+        only = (request.args.get('decision') or '').strip()
+        rows = [r for r in _recent if not only or r['decision'] == only]
+        summary = {}
+        for r in _recent:
+            summary[r['decision']] = summary.get(r['decision'], 0) + 1
+        return jsonify({'summary': summary, 'messages': list(reversed(rows))[:n]})
+
+    @app.route('/telegram/listener/exchange', methods=['GET', 'POST'])
+    def listener_exchange():
+        """GET: poller status. POST: poll Binance/Bybit right now."""
+        if exchange_events is None:
+            return jsonify({'error': 'exchange_events module not available'}), 500
+        if request.method == 'POST':
+            exchange_events.poll_now()
+            time.sleep(1.5)
+        return jsonify(exchange_events.get_status())
 
     @app.route('/telegram/listener/reload', methods=['POST'])
     def listener_reload():

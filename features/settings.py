@@ -75,7 +75,12 @@ ALLOWED_KEYS = {
     'tg_listener_forward_prefix':  {'type': 'str', 'max': 200},
     'tg_listener_detection_mode':  {'type': 'str', 'choices': ('intelligent', 'legacy')},
     'tg_listener_min_score':       {'type': 'int', 'min': 0, 'max': 100},
-    'tg_listener_cost_policy':     {'type': 'str', 'choices': ('free', 'any')},
+    'tg_listener_cost_policy':     {'type': 'str', 'choices': ('free', 'strict', 'any')},
+    'tg_listener_llm_mode':        {'type': 'str', 'choices': ('off', 'assist', 'full')},
+    'tg_listener_llm_model':       {'type': 'str', 'max': 100},
+    'tg_listener_llm_base_url':    {'type': 'str', 'max': 200},
+    'tg_listener_llm_api_key':     {'type': 'str', 'max': 300},   # write-only (never returned)
+    'tg_listener_exchange_enabled': {'type': 'bool'},
 }
 
 
@@ -151,6 +156,11 @@ def get_effective_config() -> dict:
         'tg_listener_detection_mode':  s.get('tg_listener_detection_mode', 'intelligent'),
         'tg_listener_min_score':       int(s.get('tg_listener_min_score', 45)),
         'tg_listener_cost_policy':     s.get('tg_listener_cost_policy', 'free'),
+        'tg_listener_llm_mode':        s.get('tg_listener_llm_mode', 'off'),
+        'tg_listener_llm_model':       s.get('tg_listener_llm_model', ''),
+        'tg_listener_llm_base_url':    s.get('tg_listener_llm_base_url', ''),
+        'tg_listener_llm_api_key':     s.get('tg_listener_llm_api_key', ''),
+        'tg_listener_exchange_enabled': bool(s.get('tg_listener_exchange_enabled', True)),
     }
 
 
@@ -194,6 +204,15 @@ def register_routes(app):
             'tg_listener_detection_mode': cfg['tg_listener_detection_mode'],
             'tg_listener_min_score': cfg['tg_listener_min_score'],
             'tg_listener_cost_policy': cfg['tg_listener_cost_policy'],
+            'tg_listener_llm_mode':     cfg['tg_listener_llm_mode'],
+            'tg_listener_llm_model':    cfg['tg_listener_llm_model'],
+            'tg_listener_llm_base_url': cfg['tg_listener_llm_base_url'],
+            'tg_listener_llm_api_key':  '',
+            'tg_listener_llm_api_key_set': bool(cfg['tg_listener_llm_api_key']
+                                                or os.environ.get('LLM_API_KEY')
+                                                or os.environ.get('DEEPSEEK_API_KEY')
+                                                or os.environ.get('OPENAI_API_KEY')),
+            'tg_listener_exchange_enabled': cfg['tg_listener_exchange_enabled'],
 
             'env':                     env_info,
             'settings_file':           SETTINGS_FILE,
@@ -348,4 +367,7 @@ def get_effective_config_without_token() -> dict:
     token = cfg.get('tg_log_bot_token') or ''
     cfg['tg_log_bot_token'] = ''
     cfg['tg_log_bot_token_set'] = bool(token)
+    llm_key = cfg.get('tg_listener_llm_api_key') or ''
+    cfg['tg_listener_llm_api_key'] = ''
+    cfg['tg_listener_llm_api_key_set'] = bool(llm_key)
     return cfg
