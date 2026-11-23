@@ -148,6 +148,7 @@
             transition: border-color 0.15s ease, box-shadow 0.15s ease;
         }
         .settings-row input:focus,
+        .settings-row select { max-width: 62%; min-width: 0; text-overflow: ellipsis; }
         .settings-row select:focus {
             border-color: #5f8fe0;
             box-shadow: 0 0 0 3px rgba(95,143,224,0.18);
@@ -392,7 +393,9 @@
             <h3><i class="fas fa-bullhorn"></i> Announcement Listener</h3>
             <p style="font-size: 0.72rem; color: #8a9bc0; margin-bottom: 0.6rem;">
                 Detects potential free crypto opportunities from context, not just fixed keywords.
-                Uses local rules and semantic signals; no paid AI API or external message processing.
+                Local rules judge every message (negation-aware cost check, scam / look-alike-domain
+                filter). An optional LLM (any OpenAI-compatible API, e.g. DeepSeek) can give a second
+                opinion on borderline posts. Also watches Binance + Bybit announcement feeds.
                 Shares the main Telegram session — no separate login.
             </p>
 
@@ -415,7 +418,7 @@
             <label class="settings-row">
                 <span>Detection engine</span>
                 <select id="setTgListenerMode">
-                    <option value="intelligent">Intelligent hybrid (recommended)</option>
+                    <option value="intelligent">Intelligent hybrid</option>
                     <option value="legacy">Legacy regex filter</option>
                 </select>
             </label>
@@ -426,9 +429,34 @@
             <label class="settings-row">
                 <span>Opportunity cost policy</span>
                 <select id="setTgListenerCostPolicy">
-                    <option value="free">Free-only (no deposit / funded action)</option>
-                    <option value="any">Include paid or capital-required campaigns</option>
+                    <option value="free">Free-only (reject if capital required)</option>
+                    <option value="strict">Strict (needs explicit "free")</option>
+                    <option value="any">Any (include paid campaigns)</option>
                 </select>
+            </label>
+            <label class="settings-row">
+                <span>Binance + Bybit website feeds</span>
+                <input type="checkbox" id="setTgListenerExchange">
+            </label>
+            <label class="settings-row">
+                <span>LLM second opinion</span>
+                <select id="setTgListenerLlmMode">
+                    <option value="off">Off (rules only)</option>
+                    <option value="assist">Assist (borderline only)</option>
+                    <option value="full">Full (every candidate)</option>
+                </select>
+            </label>
+            <label class="settings-row">
+                <span>LLM base URL</span>
+                <input type="text" id="setTgListenerLlmBase" placeholder="https://api.deepseek.com" autocomplete="off">
+            </label>
+            <label class="settings-row">
+                <span>LLM model</span>
+                <input type="text" id="setTgListenerLlmModel" placeholder="deepseek-chat" autocomplete="off">
+            </label>
+            <label class="settings-row">
+                <span>LLM API key</span>
+                <input type="password" id="setTgListenerLlmKey" placeholder="(unchanged)" autocomplete="new-password">
             </label>
 
             <label class="settings-row" style="flex-direction: column; align-items: stretch; gap: 0.35rem;">
@@ -459,8 +487,14 @@
                 </div>
                 <textarea id="setTgListenerTestInput" rows="2"
                           placeholder="Paste a sample announcement here to test"></textarea>
+                <label style="font-size:0.7rem;color:#8a9bc0;display:block;margin:0.3rem 0;">
+                    <input type="checkbox" id="setTgListenerTestLlm"> include LLM opinion (uses API credits)
+                </label>
                 <button id="setTgListenerTestBtn" class="settings-btn" type="button">
                     <i class="fas fa-vial"></i> Test filter
+                </button>
+                <button id="setTgListenerRecentBtn" class="settings-btn" type="button">
+                    <i class="fas fa-list-check"></i> Why were messages skipped?
                 </button>
                 <div id="setTgListenerTestResult" class="settings-hint"
                      style="display:none;"></div>
@@ -631,6 +665,13 @@ window.applyTheme = function (theme, syncServer) {
     const inTgListenerMode = document.getElementById('setTgListenerMode');
     const inTgListenerMinScore = document.getElementById('setTgListenerMinScore');
     const inTgListenerCostPolicy = document.getElementById('setTgListenerCostPolicy');
+    const inTgListenerExchange = document.getElementById('setTgListenerExchange');
+    const inTgListenerLlmMode = document.getElementById('setTgListenerLlmMode');
+    const inTgListenerLlmBase = document.getElementById('setTgListenerLlmBase');
+    const inTgListenerLlmModel = document.getElementById('setTgListenerLlmModel');
+    const inTgListenerLlmKey = document.getElementById('setTgListenerLlmKey');
+    const tgListenerTestLlm = document.getElementById('setTgListenerTestLlm');
+    const tgListenerRecentBtn = document.getElementById('setTgListenerRecentBtn');
     const inTgListenerInclude = document.getElementById('setTgListenerInclude');
     const inTgListenerExclude = document.getElementById('setTgListenerExclude');
     const inTgListenerPrefix  = document.getElementById('setTgListenerPrefix');
@@ -697,6 +738,12 @@ window.applyTheme = function (theme, syncServer) {
             inTgListenerMode.value = current.tg_listener_detection_mode || 'intelligent';
             inTgListenerMinScore.value = current.tg_listener_min_score ?? 45;
             inTgListenerCostPolicy.value = current.tg_listener_cost_policy || 'free';
+            inTgListenerExchange.checked = current.tg_listener_exchange_enabled !== false;
+            inTgListenerLlmMode.value = current.tg_listener_llm_mode || 'off';
+            inTgListenerLlmBase.value = current.tg_listener_llm_base_url || '';
+            inTgListenerLlmModel.value = current.tg_listener_llm_model || '';
+            inTgListenerLlmKey.value = '';
+            inTgListenerLlmKey.placeholder = current.tg_listener_llm_api_key_set ? '•••••• (saved — type to replace)' : 'sk-…';
             inTgListenerInclude.value   = current.tg_listener_include_pattern || '';
             inTgListenerExclude.value   = current.tg_listener_exclude_pattern || '';
             inTgListenerPrefix.value    = current.tg_listener_forward_prefix || '';
@@ -754,6 +801,16 @@ window.applyTheme = function (theme, syncServer) {
             payload.tg_listener_min_score = Math.max(0, Math.min(100, Number(inTgListenerMinScore.value) || 0));
         if (inTgListenerCostPolicy.value !== (current.tg_listener_cost_policy || 'free'))
             payload.tg_listener_cost_policy = inTgListenerCostPolicy.value;
+        if (inTgListenerExchange.checked !== (current.tg_listener_exchange_enabled !== false))
+            payload.tg_listener_exchange_enabled = inTgListenerExchange.checked;
+        if (inTgListenerLlmMode.value !== (current.tg_listener_llm_mode || 'off'))
+            payload.tg_listener_llm_mode = inTgListenerLlmMode.value;
+        if (inTgListenerLlmBase.value.trim() !== (current.tg_listener_llm_base_url || ''))
+            payload.tg_listener_llm_base_url = inTgListenerLlmBase.value.trim();
+        if (inTgListenerLlmModel.value.trim() !== (current.tg_listener_llm_model || ''))
+            payload.tg_listener_llm_model = inTgListenerLlmModel.value.trim();
+        if (inTgListenerLlmKey.value.trim())
+            payload.tg_listener_llm_api_key = inTgListenerLlmKey.value.trim();
         if (inTgListenerInclude.value.trim() !== (current.tg_listener_include_pattern || ''))
             payload.tg_listener_include_pattern = inTgListenerInclude.value.trim();
         if (inTgListenerExclude.value.trim() !== (current.tg_listener_exclude_pattern || ''))
@@ -862,6 +919,13 @@ window.applyTheme = function (theme, syncServer) {
             }
             if (s.messages_seen)     parts.push(`seen ${s.messages_seen}`);
             if (s.matches_forwarded) parts.push(`forwarded ${s.matches_forwarded}`);
+            if (s.exchange && s.exchange.running) {
+                const b = s.exchange.sources || {};
+                const bad = Object.keys(b).filter(k => b[k].last_error);
+                parts.push('feeds ' + (bad.length ? '⚠️ ' + bad.join('/') + ' failing' : '✓'));
+            }
+            if (s.llm && s.llm.mode !== 'off')
+                parts.push('LLM ' + (s.llm.key_set ? `${s.llm.calls} calls` : '⚠️ no key'));
             if (s.last_error)        parts.push('⚠️ ' + s.last_error);
             inTgListenerStatus.textContent = parts.join(' · ');
             inTgListenerStatus.classList.toggle('warn', !!s.last_error);
@@ -879,21 +943,29 @@ window.applyTheme = function (theme, syncServer) {
             const r = await fetch('/telegram/listener/test', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ text })
+                body: JSON.stringify({ text, use_llm: !!tgListenerTestLlm.checked })
             });
             const data = await r.json();
             if (data.error) {
                 tgListenerTestResult.style.color = '#ff8a8a';
                 tgListenerTestResult.textContent = '❌ ' + data.error;
-            } else if (data.matched) {
-                tgListenerTestResult.style.color = '#a5f3c5';
-                tgListenerTestResult.textContent = '✅ MATCH — this post would be forwarded.';
             } else {
-                const reasons = [];
-                if (!data.included) reasons.push('does not match include pattern');
-                if (data.excluded)  reasons.push('matches exclude pattern');
-                tgListenerTestResult.style.color = '#fcd34d';
-                tgListenerTestResult.textContent = '⏭ NO MATCH — ' + reasons.join('; ') + '.';
+                const ok = !!data.matched;
+                tgListenerTestResult.style.color = ok ? '#a5f3c5' : '#fcd34d';
+                let msg = (ok ? '✅ WOULD FORWARD' : '⏭ WOULD SKIP') + ' — ' + (data.summary || data.reason || '');
+                const ev = (data.intelligent && data.intelligent.cost_evidence) || null;
+                if (ev) {
+                    const bits = [];
+                    if (ev.required && ev.required.length) bits.push('required: ' + ev.required.join(', '));
+                    if (ev.mentioned && ev.mentioned.length) bits.push('mentioned: ' + ev.mentioned.join(', '));
+                    if (ev.negated && ev.negated.length) bits.push('negated (ok): ' + ev.negated.join(', '));
+                    if (bits.length) msg += '\nCost words → ' + bits.join(' | ');
+                }
+                if (data.llm) msg += '\nLLM: ' + (data.llm.is_opportunity ? 'opportunity' : 'not an opportunity') +
+                    ` (${data.llm.cost}, ${data.llm.confidence}%, scam ${data.llm.scam_risk}) ${data.llm.summary || ''}`;
+                if (data.excluded) msg += '\nMatches exclude pattern.';
+                tgListenerTestResult.style.whiteSpace = 'pre-wrap';
+                tgListenerTestResult.textContent = msg;
             }
         } catch (e) {
             tgListenerTestResult.style.color = '#ff8a8a';
@@ -901,6 +973,24 @@ window.applyTheme = function (theme, syncServer) {
         } finally {
             tgListenerTestBtn.disabled = false;
             tgListenerTestBtn.innerHTML = '<i class="fas fa-vial"></i> Test filter';
+        }
+    });
+
+    /* ---------- Why were messages skipped? ---------- */
+    tgListenerRecentBtn.addEventListener('click', async () => {
+        tgListenerTestResult.style.display = 'block';
+        tgListenerTestResult.style.whiteSpace = 'pre-wrap';
+        tgListenerTestResult.style.color = '#cbd5f5';
+        try {
+            const r = await fetch('/telegram/listener/recent?n=12', { cache: 'no-store' });
+            const d = await r.json();
+            const sum = Object.entries(d.summary || {}).map(([k, v]) => `${k}: ${v}`).join(' · ') || 'nothing seen yet';
+            const rows = (d.messages || []).map(m =>
+                `${m.decision === 'forwarded' ? '✅' : '⏭'} [${m.source}] ${m.text.slice(0, 70)}\n    → ${m.decision}: ${m.reason || ''}` +
+                (m.score != null ? ` (score ${m.score}, ${m.category}, cost ${m.cost})` : ''));
+            tgListenerTestResult.textContent = sum + '\n\n' + rows.join('\n');
+        } catch (e) {
+            tgListenerTestResult.textContent = '❌ ' + e.message;
         }
     });
 
