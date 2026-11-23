@@ -392,4 +392,59 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // ─── Download ───
     downloadBtn.addEventListener('click', () => {
-        if (currentTaskId
+        if (currentTaskId) {
+            window.open(`/crawler/download_domains/${currentTaskId}`);
+        }
+    });
+
+    // ─── Files ───
+    async function loadFileList() {
+        try {
+            const resp = await fetch('/crawler/list_files');
+            const files = await resp.json();
+            if (!files.length) {
+                fileListDiv.innerHTML = isCrawling
+                    ? '<div class="empty-state"><i class="fas fa-spinner fa-pulse"></i> Crawl running…</div>'
+                    : '<div class="empty-state">No domain files saved yet.</div>';
+                return;
+            }
+            let html = '';
+            files.forEach(f => {
+                const mtime = new Date(f.mtime * 1000).toLocaleString();
+                html += `<div class="file-card">
+                    <div class="file-name">
+                        <i class="fas fa-file-alt"></i> ${escapeHtml(f.name)}
+                    </div>
+                    <div class="file-size">${f.size_str || formatBytes(f.size)} · ${mtime}</div>
+                    <div class="file-actions">
+                        <a href="/crawler/download_domains_by_filename?filename=${encodeURIComponent(f.path)}"
+                           target="_blank">
+                            <i class="fas fa-download"></i> Download
+                        </a>
+                        <button class="view-file-btn" data-filename="${escapeHtml(f.path)}">
+                            <i class="fas fa-eye"></i> View
+                        </button>
+                    </div>
+                </div>`;
+            });
+            fileListDiv.innerHTML = html;
+            document.querySelectorAll('.view-file-btn').forEach(btn => {
+                btn.addEventListener('click', function () {
+                    window.open(`/crawler/view/${encodeURIComponent(this.dataset.filename)}`, '_blank');
+                });
+            });
+        } catch (err) {
+            console.error('file list error:', err);
+        }
+    }
+    function formatBytes(bytes) {
+        if (bytes === 0) return '0 B';
+        const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(1024));
+        return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + u[i];
+    }
+
+    refreshFilesBtn.addEventListener('click', loadFileList);
+    loadFileList();
+});
+</script>
