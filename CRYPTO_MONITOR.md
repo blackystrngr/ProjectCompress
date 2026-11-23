@@ -1,7 +1,22 @@
-# Crypto Opportunity Monitor (v3)
+# Crypto Opportunity Monitor (v4)
 
 Forwards **free** crypto opportunities from Telegram channels **and** the Binance / Bybit announcement
 feeds to your alert chat, with a log that tells you exactly why anything was skipped.
+
+## Unread notifications (bot delivery)
+
+Alerts sent by your own account are *outgoing* messages: Telegram marks them read and never notifies you.
+Delivery **Bot** sends them through a Bot API bot instead, so they arrive as normal unread messages.
+
+1. Telegram → **@BotFather** → `/newbot` → copy the token.
+2. Open your new bot and press **START** (a bot cannot message you before that).
+3. Settings → Announcement Listener → *Deliver alerts via* **Bot**, paste the token, click **Detect my chat**
+   (fills your chat id), **Save**, then **Send test via bot**.
+
+* Channel/group instead: add the bot as an admin that can post and use `@channelname` or the `-100…` id.
+* If no dedicated token is set, the Telegram-logger bot token is reused.
+* If the bot fails, the alert still goes out through your account (never lost) and the status line shows the reason.
+* Make sure the chat/bot isn't muted. The token is stored in `settings.json` (secrets dir), never returned by the API.
 
 ## Why v1 missed events (fixed)
 
@@ -86,18 +101,20 @@ If Binance prints `HTTP 403/451`, run the app through `PROXY_URL` or turn the fe
 | `GET /telegram/listener/recent?n=50&decision=skipped` | why each message was forwarded/skipped |
 | `POST /telegram/listener/test` `{text, use_llm}` | full analysis of a sample |
 | `GET/POST /telegram/listener/exchange` | feed status / poll now |
+| `POST /telegram/listener/bot/verify\|detect\|test` | check token / find your chat id / send a test alert |
 | `POST /telegram/listener/reload` | re-apply settings |
 
 ## Settings keys
 
 Existing: `tg_listener_enabled|sources|target|include_pattern|exclude_pattern|forward_prefix|detection_mode|min_score|cost_policy`
 (`cost_policy` now also accepts `strict`). New: `tg_listener_llm_mode` (`off|assist|full`),
-`tg_listener_llm_model`, `tg_listener_llm_base_url`, `tg_listener_llm_api_key`, `tg_listener_exchange_enabled`.
+`tg_listener_llm_model`, `tg_listener_llm_base_url`, `tg_listener_llm_api_key`, `tg_listener_exchange_enabled`,
+`tg_listener_delivery` (`account|bot`), `tg_listener_bot_token`, `tg_listener_bot_chat`.
 
 ## Tests
 
 ```bash
-python -m unittest discover -s tests -v      # 42 tests, needs only `requests`
+python -m unittest discover -s tests -v      # 53 tests, needs only `requests`
 python -m compileall -q .
 ```
 

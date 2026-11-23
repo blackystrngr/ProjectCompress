@@ -81,6 +81,9 @@ ALLOWED_KEYS = {
     'tg_listener_llm_base_url':    {'type': 'str', 'max': 200},
     'tg_listener_llm_api_key':     {'type': 'str', 'max': 300},   # write-only (never returned)
     'tg_listener_exchange_enabled': {'type': 'bool'},
+    'tg_listener_delivery':        {'type': 'str', 'choices': ('account', 'bot')},
+    'tg_listener_bot_token':       {'type': 'str', 'max': 200},   # write-only (never returned)
+    'tg_listener_bot_chat':        {'type': 'str', 'max': 100},
 }
 
 
@@ -161,6 +164,9 @@ def get_effective_config() -> dict:
         'tg_listener_llm_base_url':    s.get('tg_listener_llm_base_url', ''),
         'tg_listener_llm_api_key':     s.get('tg_listener_llm_api_key', ''),
         'tg_listener_exchange_enabled': bool(s.get('tg_listener_exchange_enabled', True)),
+        'tg_listener_delivery':        s.get('tg_listener_delivery', 'account'),
+        'tg_listener_bot_token':       s.get('tg_listener_bot_token', ''),
+        'tg_listener_bot_chat':        s.get('tg_listener_bot_chat', ''),
     }
 
 
@@ -213,6 +219,10 @@ def register_routes(app):
                                                 or os.environ.get('DEEPSEEK_API_KEY')
                                                 or os.environ.get('OPENAI_API_KEY')),
             'tg_listener_exchange_enabled': cfg['tg_listener_exchange_enabled'],
+            'tg_listener_delivery':     cfg['tg_listener_delivery'],
+            'tg_listener_bot_token':    '',
+            'tg_listener_bot_token_set': bool(cfg['tg_listener_bot_token'] or cfg.get('tg_log_bot_token')),
+            'tg_listener_bot_chat':     cfg['tg_listener_bot_chat'],
 
             'env':                     env_info,
             'settings_file':           SETTINGS_FILE,
@@ -370,4 +380,7 @@ def get_effective_config_without_token() -> dict:
     llm_key = cfg.get('tg_listener_llm_api_key') or ''
     cfg['tg_listener_llm_api_key'] = ''
     cfg['tg_listener_llm_api_key_set'] = bool(llm_key)
+    lbot = cfg.get('tg_listener_bot_token') or ''
+    cfg['tg_listener_bot_token'] = ''
+    cfg['tg_listener_bot_token_set'] = bool(lbot)
     return cfg

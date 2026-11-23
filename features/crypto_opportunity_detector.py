@@ -518,7 +518,7 @@ def format_alert(message: str, analysis: Dict, source: str, link: str, max_chars
 def format_alert_html(message: str, analysis: Dict, source: str, link: str,
                       prefix: str = "", max_chars: int = 3000) -> str:
     """Telegram-HTML version: bold headline, reward/deadline up front."""
-    e = html.escape
+    e = lambda v: html.escape(str(v), quote=False)   # Bot API HTML needs only & < >
     tier = {"high": "🟢", "medium": "🟡", "low": "🟠"}.get(analysis.get("tier", "medium"), "🟡")
     cat = _label(analysis.get("category", "unknown"))
     out = []

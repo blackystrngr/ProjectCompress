@@ -13,7 +13,8 @@ Config keys (settings.json):
   tg_listener_forward_prefix, tg_listener_detection_mode,
   tg_listener_min_score, tg_listener_cost_policy,
   tg_listener_llm_mode, tg_listener_llm_model, tg_listener_llm_base_url,
-  tg_listener_llm_api_key, tg_listener_exchange_enabled
+  tg_listener_llm_api_key, tg_listener_exchange_enabled,
+  tg_listener_delivery (account|bot), tg_listener_bot_token, tg_listener_bot_chat
 
 Hardening (v2)
   * Watchdog re-attaches the handler if the shared client is rebuilt.
@@ -31,6 +32,12 @@ Added (v3)
   * Headline already forwarded from the website isn't forwarded twice.
   * Alerts are sent as Telegram-HTML (bold headline, reward, deadline,
     collapsible original text); everything is escaped.
+
+Added (v4) — unread notifications
+  * Alerts sent by your own account are *outgoing*, so Telegram marks them
+    read and never notifies you. Delivery "bot" sends them through a Bot API
+    bot instead (see features.bot_delivery) → unread badge + notification.
+    If the bot fails the alert still goes out via the account (never lost).
 """
 
 import re
@@ -47,6 +54,7 @@ from telethon import events, utils
 from . import telegram as tg_module
 from . import opportunity_pipeline as pipeline
 from . import llm_classifier
+from . import bot_delivery
 from .crypto_opportunity_detector import format_alert_html, explain
 from .telegram import (
     start_tg_loop_if_needed,
@@ -94,6 +102,8 @@ _stats = {
     'opportunities_detected': 0,
     'opportunities_rejected': 0,
     'duplicates_skipped': 0,
+    'bot_sent': 0,
+    'bot_failed': 0,
     'unresolved_sources': [],
     'invalid_patterns': [],
     'last_error': None,
@@ -124,6 +134,10 @@ def _load_config():
             'llm_base_url': (cfg.get('tg_listener_llm_base_url') or '').strip(),
             'llm_api_key': (cfg.get('tg_listener_llm_api_key') or '').strip(),
             'exchange': bool(cfg.get('tg_listener_exchange_enabled', True)),
+            'delivery': cfg.get('tg_listener_delivery', 'account'),
+            # dedicated alert bot, else reuse the Telegram-logger bot token
+            'bot_token': ((cfg.get('tg_listener_bot_token') or cfg.get('tg_log_bot_token') or '')).strip(),
+            'bot_chat': (cfg.get('tg_listener_bot_chat') or '').strip(),
         }
     except Exception as e:
         logger.warning(f"telegram_listener: could not read settings: {e}")
@@ -133,7 +147,7 @@ def _load_config():
             'prefix': DEFAULT_PREFIX, 'mode': 'intelligent',
             'min_score': 45, 'cost_policy': 'free',
             'llm_mode': 'off', 'llm_model': '', 'llm_base_url': '', 'llm_api_key': '',
-            'exchange': True,
+            'exchange': True, 'delivery': 'account', 'bot_token': '', 'bot_chat': '',
         }
 
 
@@ -246,6 +260,24 @@ async def _send_with_retry(client, target, text, parse_mode=None):
             delay *= 2
 
 
+async def _deliver(client, target_entity, text, parse_mode, cfg):
+    """Bot first (real notification); fall back to the account so nothing is lost."""
+    if bot_delivery.is_configured(cfg):
+        loop = asyncio.get_running_loop()
+        ok, err = await loop.run_in_executor(
+            None, functools.partial(bot_delivery.send, text, parse_mode, cfg))
+        if ok:
+            _stats['bot_sent'] += 1
+            return 'bot'
+        _stats['bot_failed'] += 1
+        _stats['last_error'] = f"bot delivery failed: {err}"
+        logger.warning(f"[listener] bot delivery failed ({err}) — falling back to account")
+    if client is None or target_entity is None:
+        raise RuntimeError("no delivery path available (bot failed and account target unresolved)")
+    await _send_with_retry(client, target_entity, text, parse_mode=parse_mode)
+    return 'account'
+
+
 # ============================================================
 # Attach / detach
 # ============================================================
@@ -270,16 +302,24 @@ async def _attach_async(cfg):
     if not cfg['sources']:
         logger.info("[listener] No sources configured — nothing to attach")
         return
-    if not cfg['target']:
+    if not cfg['target'] and not (cfg.get('bot_chat') and bot_delivery.is_configured(cfg)):
         logger.info("[listener] No target configured — nothing to attach")
         return
 
-    # Resolve target once — fail early on a bad target
+    # Resolve target once — fail early on a bad target. In bot mode the bot
+    # delivers, so an account-side miss is only a warning (no fallback then).
+    bot_mode = bot_delivery.is_configured(cfg)
     try:
+        if not cfg['target']:
+            raise ValueError("no account-side target set")
         target_entity = await client.get_entity(_parse_peer(cfg['target']))
         target_id = utils.get_peer_id(target_entity)
     except Exception as e:
-        raise Exception(f"Cannot resolve target {cfg['target']!r}: {e}")
+        if not bot_mode:
+            raise Exception(f"Cannot resolve target {cfg['target']!r}: {e}")
+        logger.warning(f"[listener] account cannot resolve target {cfg['target']!r} ({e}) "
+                       f"— bot delivery will be used without account fallback")
+        target_entity, target_id = None, None
 
     resolved, unresolved = [], []
     for src in cfg['sources']:
@@ -289,7 +329,7 @@ async def _attach_async(cfg):
             logger.warning(f"[listener] Cannot resolve {src}: {e}")
             unresolved.append(src)
             continue
-        if utils.get_peer_id(entity) == target_id:
+        if target_id is not None and utils.get_peer_id(entity) == target_id:
             logger.warning(f"[listener] Source {src} is the target chat — "
                            f"skipped (would forward in a loop)")
             continue
@@ -356,10 +396,10 @@ async def _attach_async(cfg):
                 head = f"{prefix} ({source})"
                 alert = f"{head}\n\n{body}\n\n🔗 {link}" if link else f"{head}\n\n{body}"
                 pm = None
-            await _send_with_retry(client, target_entity, alert, parse_mode=pm)
+            via = await _deliver(client, target_entity, alert, pm, snapshot)
             _stats['matches_forwarded'] += 1
             _stats['last_forward_at'] = time.time()
-            _record(source, event.id, text, 'forwarded', d['reason'], analysis, d['engine'])
+            _record(source, event.id, text, 'forwarded', f"{d['reason']} [via {via}]", analysis, d['engine'])
             if exchange_events is not None:
                 exchange_events.note_forwarded(text)
             logger.info(f"[listener] Forwarded match: {source} msg_id={event.id} "
@@ -400,10 +440,12 @@ async def _detach_async():
 
 
 async def _forward_text_async(text, parse_mode=None):
+    cfg = _load_config()
     client, target = _attached_client, _target_entity
-    if client is None or target is None or not client.is_connected():
-        return False
-    await _send_with_retry(client, target, text, parse_mode=parse_mode)
+    if not bot_delivery.is_configured(cfg):
+        if client is None or target is None or not client.is_connected():
+            return False
+    await _deliver(client, target, text, parse_mode, cfg)
     _stats['matches_forwarded'] += 1
     _stats['last_forward_at'] = time.time()
     return True
@@ -482,7 +524,7 @@ def start_listener_if_enabled():
 def _needs_reattach():
     """Enabled in settings, but no live handler on the CURRENT client."""
     cfg = _load_config()
-    if not cfg['enabled'] or not cfg['sources'] or not cfg['target']:
+    if not cfg['enabled'] or not cfg['sources'] or not (cfg['target'] or cfg['bot_chat']):
         return None
     client = tg_module.get_persistent_client()
     if client is None:
@@ -549,6 +591,7 @@ def get_status():
         'duplicates_skipped': _stats['duplicates_skipped'],
         'last_forward_at': _stats['last_forward_at'],
         'last_error': _stats['last_error'],
+        'delivery': bot_delivery.get_status(cfg),
         'llm': llm_classifier.get_status(cfg),
         'exchange': exchange_events.get_status() if exchange_events else None,
     }
@@ -605,6 +648,26 @@ def register_routes(app):
         for r in _recent:
             summary[r['decision']] = summary.get(r['decision'], 0) + 1
         return jsonify({'summary': summary, 'messages': list(reversed(rows))[:n]})
+
+    @app.route('/telegram/listener/bot/<action>', methods=['POST'])
+    def listener_bot(action):
+        """verify | detect | test — uses the token/chat in the request body when
+        given (so you can try values before saving), else the saved settings."""
+        data = request.get_json(silent=True) or {}
+        cfg = _load_config()
+        token = (data.get('token') or '').strip() or cfg['bot_token']
+        chat = str(data.get('chat') or '').strip() or cfg['bot_chat'] or cfg['target']
+        if action == 'verify':
+            return jsonify(bot_delivery.verify(token))
+        if action == 'detect':
+            return jsonify(bot_delivery.detect_chats(token))
+        if action == 'test':
+            test_cfg = dict(cfg, delivery='bot', bot_token=token, bot_chat=chat)
+            ok, err = bot_delivery.send(
+                "<b>✅ Alert bot connected</b>\nYou'll get opportunity alerts here "
+                "as normal unread messages.", 'html', test_cfg)
+            return jsonify({'ok': ok, 'error': err})
+        return jsonify({'error': 'unknown action'}), 404
 
     @app.route('/telegram/listener/exchange', methods=['GET', 'POST'])
     def listener_exchange():

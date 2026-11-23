@@ -435,6 +435,30 @@
                 </select>
             </label>
             <label class="settings-row">
+                <span>Deliver alerts via</span>
+                <select id="setTgListenerDelivery">
+                    <option value="account">My account (read, silent)</option>
+                    <option value="bot">Bot (unread + notification)</option>
+                </select>
+            </label>
+            <label class="settings-row">
+                <span>Alert bot token</span>
+                <input type="password" id="setTgListenerBotToken" placeholder="123456789:AA… (from @BotFather)" autocomplete="new-password">
+            </label>
+            <label class="settings-row">
+                <span>Bot chat ID</span>
+                <input type="text" id="setTgListenerBotChat" placeholder="your numeric ID or @channel" autocomplete="off">
+            </label>
+            <div style="display:flex;gap:0.4rem;flex-wrap:wrap;margin:0.2rem 0 0.5rem;">
+                <button id="setTgListenerBotVerify" class="settings-btn" type="button">Verify bot</button>
+                <button id="setTgListenerBotDetect" class="settings-btn" type="button">Detect my chat</button>
+                <button id="setTgListenerBotTest" class="settings-btn" type="button">Send test via bot</button>
+            </div>
+            <div style="font-size:0.68rem;color:#8a9bc0;margin-bottom:0.5rem;">
+                Why: alerts sent by your own account count as "sent by you", so Telegram never marks them unread.
+                Create a bot with @BotFather, open it and press START, then click Detect my chat.
+            </div>
+            <label class="settings-row">
                 <span>Binance + Bybit website feeds</span>
                 <input type="checkbox" id="setTgListenerExchange">
             </label>
@@ -665,6 +689,12 @@ window.applyTheme = function (theme, syncServer) {
     const inTgListenerMode = document.getElementById('setTgListenerMode');
     const inTgListenerMinScore = document.getElementById('setTgListenerMinScore');
     const inTgListenerCostPolicy = document.getElementById('setTgListenerCostPolicy');
+    const inTgListenerDelivery = document.getElementById('setTgListenerDelivery');
+    const inTgListenerBotToken = document.getElementById('setTgListenerBotToken');
+    const inTgListenerBotChat = document.getElementById('setTgListenerBotChat');
+    const tgBotVerifyBtn = document.getElementById('setTgListenerBotVerify');
+    const tgBotDetectBtn = document.getElementById('setTgListenerBotDetect');
+    const tgBotTestBtn = document.getElementById('setTgListenerBotTest');
     const inTgListenerExchange = document.getElementById('setTgListenerExchange');
     const inTgListenerLlmMode = document.getElementById('setTgListenerLlmMode');
     const inTgListenerLlmBase = document.getElementById('setTgListenerLlmBase');
@@ -738,6 +768,10 @@ window.applyTheme = function (theme, syncServer) {
             inTgListenerMode.value = current.tg_listener_detection_mode || 'intelligent';
             inTgListenerMinScore.value = current.tg_listener_min_score ?? 45;
             inTgListenerCostPolicy.value = current.tg_listener_cost_policy || 'free';
+            inTgListenerDelivery.value = current.tg_listener_delivery || 'account';
+            inTgListenerBotToken.value = '';
+            inTgListenerBotToken.placeholder = current.tg_listener_bot_token_set ? '•••••• (saved — type to replace)' : '123456789:AA… (from @BotFather)';
+            inTgListenerBotChat.value = current.tg_listener_bot_chat || '';
             inTgListenerExchange.checked = current.tg_listener_exchange_enabled !== false;
             inTgListenerLlmMode.value = current.tg_listener_llm_mode || 'off';
             inTgListenerLlmBase.value = current.tg_listener_llm_base_url || '';
@@ -801,6 +835,12 @@ window.applyTheme = function (theme, syncServer) {
             payload.tg_listener_min_score = Math.max(0, Math.min(100, Number(inTgListenerMinScore.value) || 0));
         if (inTgListenerCostPolicy.value !== (current.tg_listener_cost_policy || 'free'))
             payload.tg_listener_cost_policy = inTgListenerCostPolicy.value;
+        if (inTgListenerDelivery.value !== (current.tg_listener_delivery || 'account'))
+            payload.tg_listener_delivery = inTgListenerDelivery.value;
+        if (inTgListenerBotToken.value.trim())
+            payload.tg_listener_bot_token = inTgListenerBotToken.value.trim();
+        if (inTgListenerBotChat.value.trim() !== (current.tg_listener_bot_chat || ''))
+            payload.tg_listener_bot_chat = inTgListenerBotChat.value.trim();
         if (inTgListenerExchange.checked !== (current.tg_listener_exchange_enabled !== false))
             payload.tg_listener_exchange_enabled = inTgListenerExchange.checked;
         if (inTgListenerLlmMode.value !== (current.tg_listener_llm_mode || 'off'))
@@ -924,6 +964,13 @@ window.applyTheme = function (theme, syncServer) {
                 const bad = Object.keys(b).filter(k => b[k].last_error);
                 parts.push('feeds ' + (bad.length ? '⚠️ ' + bad.join('/') + ' failing' : '✓'));
             }
+            if (s.delivery) {
+                const d = s.delivery;
+                parts.push(d.delivery === 'bot'
+                    ? (d.configured ? `bot ✓${d.bot_username ? ' @' + d.bot_username : ''}` : '⚠️ bot not configured')
+                    : 'via account');
+                if (d.last_error) parts.push('⚠️ ' + d.last_error.slice(0, 60));
+            }
             if (s.llm && s.llm.mode !== 'off')
                 parts.push('LLM ' + (s.llm.key_set ? `${s.llm.calls} calls` : '⚠️ no key'));
             if (s.last_error)        parts.push('⚠️ ' + s.last_error);
@@ -974,6 +1021,43 @@ window.applyTheme = function (theme, syncServer) {
             tgListenerTestBtn.disabled = false;
             tgListenerTestBtn.innerHTML = '<i class="fas fa-vial"></i> Test filter';
         }
+    });
+
+    /* ---------- Alert bot: verify / detect chat / test ---------- */
+    async function tgBotCall(action) {
+        tgListenerTestResult.style.display = 'block';
+        tgListenerTestResult.style.whiteSpace = 'pre-wrap';
+        tgListenerTestResult.style.color = '#cbd5f5';
+        tgListenerTestResult.textContent = '… working';
+        const body = { token: inTgListenerBotToken.value.trim(), chat: inTgListenerBotChat.value.trim() };
+        try {
+            const r = await fetch('/telegram/listener/bot/' + action, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+            return await r.json();
+        } catch (e) { return { ok: false, error: e.message }; }
+    }
+    tgBotVerifyBtn.addEventListener('click', async () => {
+        const d = await tgBotCall('verify');
+        tgListenerTestResult.style.color = d.ok ? '#a5f3c5' : '#ff8a8a';
+        tgListenerTestResult.textContent = d.ok ? `✅ Bot OK: @${d.username} (${d.name})` : '❌ ' + d.error;
+    });
+    tgBotDetectBtn.addEventListener('click', async () => {
+        const d = await tgBotCall('detect');
+        if (d.ok && d.chats && d.chats.length) {
+            inTgListenerBotChat.value = String(d.chats[0].id);
+            inTgListenerDelivery.value = 'bot';
+            tgListenerTestResult.style.color = '#a5f3c5';
+            tgListenerTestResult.textContent = '✅ Found: ' + d.chats.map(c => `${c.label} (${c.type}, id ${c.id})`).join('\n') +
+                '\n→ filled the first one. Click Save, then "Send test via bot".';
+        } else {
+            tgListenerTestResult.style.color = '#fcd34d';
+            tgListenerTestResult.textContent = '⚠️ ' + (d.error || 'nothing found');
+        }
+    });
+    tgBotTestBtn.addEventListener('click', async () => {
+        const d = await tgBotCall('test');
+        tgListenerTestResult.style.color = d.ok ? '#a5f3c5' : '#ff8a8a';
+        tgListenerTestResult.textContent = d.ok ? '✅ Sent — check Telegram: it should arrive as an unread message with a notification.' : '❌ ' + d.error;
     });
 
     /* ---------- Why were messages skipped? ---------- */
