@@ -30,6 +30,14 @@ logger = logging.getLogger(__name__)
 STORE_FILE = os.path.join(SECRETS_DIR, 'proxy_store.json')
 TEST_URL = "https://httpbin.org/ip"
 TEST_TIMEOUT = 5
+
+# GeoIP (country lookup) — ip-api.com's free batch endpoint, no key needed.
+# Free tier: ~45 req/min from the same source IP, up to 100 IPs per batch
+# call, so this stays cheap even on a full fetch cycle.
+GEOIP_BATCH_URL = "http://ip-api.com/batch"
+GEOIP_BATCH_SIZE = 100
+GEOIP_TIMEOUT = 10
+GEOIP_BATCH_DELAY = 1.5  # seconds between batches, stays well under the rate limit
 DEFAULT_INTERVAL = 900
 MIN_INTERVAL = 60
 MAX_INTERVAL = 86_400
@@ -280,6 +288,44 @@ def _test_batch(proxies_list, on_progress=None, should_cancel=None):
 
 
 # ══════════════════════════════════════════════════════════════
+# GeoIP (country lookup)
+# ══════════════════════════════════════════════════════════════
+def _lookup_countries(ips):
+    """
+    Resolve country for a list of IPs via ip-api.com's free /batch
+    endpoint. Never raises — a network hiccup or an unresolvable IP
+    (private/reserved ranges, rate-limited) just means that IP is
+    missing from the returned dict, and the caller falls back to
+    whatever it already had on file (or leaves it unresolved to retry
+    on a later cycle).
+    """
+    out = {}
+    unique_ips = list(dict.fromkeys(ips))  # de-dupe, keep order
+    for i in range(0, len(unique_ips), GEOIP_BATCH_SIZE):
+        batch = unique_ips[i:i + GEOIP_BATCH_SIZE]
+        payload = [{'query': ip, 'fields': 'status,country,countryCode,query'}
+                   for ip in batch]
+        try:
+            resp = requests.post(GEOIP_BATCH_URL, json=payload,
+                                  timeout=GEOIP_TIMEOUT)
+            if resp.status_code == 200:
+                for item in resp.json():
+                    if item.get('status') == 'success' and item.get('query'):
+                        out[item['query']] = {
+                            'country': item.get('country'),
+                            'country_code': item.get('countryCode'),
+                        }
+            else:
+                logger.warning(f"GeoIP batch lookup HTTP {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"GeoIP batch lookup error: {e}")
+
+        if i + GEOIP_BATCH_SIZE < len(unique_ips):
+            time.sleep(GEOIP_BATCH_DELAY)
+    return out
+
+
+# ══════════════════════════════════════════════════════════════
 # Store operations
 # ══════════════════════════════════════════════════════════════
 def _pick_to_test(store, raw_list):
@@ -313,9 +359,22 @@ def _merge_results(store, successes, failures):
     now = int(time.time())
     proxies = store['proxies']
 
+    # Only geolocate IPs we don't already have a country for — most
+    # successes on any given cycle are re-tests of proxies we've already
+    # resolved, so this keeps GeoIP calls limited to genuinely new entries
+    # (and any older entries saved before this field existed, which
+    # backfill the first time they're re-tested).
+    need_geo_ips = []
+    for r in successes:
+        key = _proxy_key(r['ip'], r['port'], r['type'])
+        if not proxies.get(key, {}).get('country'):
+            need_geo_ips.append(r['ip'])
+    geo = _lookup_countries(need_geo_ips) if need_geo_ips else {}
+
     for r in successes:
         key = _proxy_key(r['ip'], r['port'], r['type'])
         prev = proxies.get(key, {})
+        geo_info = geo.get(r['ip'], {})
         proxies[key] = {
             'ip': r['ip'],
             'port': r['port'],
@@ -325,6 +384,10 @@ def _merge_results(store, successes, failures):
             'success_count': prev.get('success_count', 0) + 1,
             'fail_count': prev.get('fail_count', 0),
             'first_seen': prev.get('first_seen', now),
+            # None (not 'Unknown') when unresolved, so a transient GeoIP
+            # failure gets retried on the next cycle instead of sticking.
+            'country': geo_info.get('country') or prev.get('country'),
+            'country_code': geo_info.get('country_code') or prev.get('country_code'),
         }
 
     for ip, port, ptype in failures:
@@ -630,6 +693,14 @@ def _filter_sort_page(store, args):
     if q:
         proxies = [p for p in proxies if q in p['ip'].lower()]
 
+    country = (args.get('country') or '').strip().lower()
+    if country:
+        proxies = [
+            p for p in proxies
+            if country in (p.get('country') or '').lower()
+            or country == (p.get('country_code') or '').lower()
+        ]
+
     sort = (args.get('sort') or 'latency').lower()
     if sort == 'latency':
         proxies.sort(key=lambda p: p.get('latency_ms', 999_999))
@@ -639,6 +710,10 @@ def _filter_sort_page(store, args):
         proxies.sort(key=lambda p: (p['ip'], p['port']))
     elif sort == 'type':
         proxies.sort(key=lambda p: (p['type'], p.get('latency_ms', 999_999)))
+    elif sort == 'country':
+        # Unresolved countries ('' sorts after real names) fall last.
+        proxies.sort(key=lambda p: (p.get('country') or '￿',
+                                     p.get('latency_ms', 999_999)))
     else:
         proxies.sort(key=lambda p: p.get('latency_ms', 999_999))
 
@@ -728,6 +803,10 @@ def register_routes(app):
         by_type = {}
         for p in proxies:
             by_type[p['type']] = by_type.get(p['type'], 0) + 1
+        by_country = {}
+        for p in proxies:
+            c = p.get('country') or 'Unknown'
+            by_country[c] = by_country.get(c, 0) + 1
         lats = sorted(p.get('latency_ms', 0) for p in proxies
                       if p.get('latency_ms'))
         def pct(q):
@@ -738,6 +817,7 @@ def register_routes(app):
         return jsonify({
             'total': len(proxies),
             'by_type': by_type,
+            'by_country': by_country,
             'latency': {
                 'min': lats[0] if lats else 0,
                 'p50': pct(0.5),
