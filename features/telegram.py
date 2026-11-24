@@ -63,6 +63,35 @@ _async_init_lock = None
 _client_ready = threading.Event()
 
 
+async def _start_with_backoff(client, bot_token=None, max_attempts=5, base_delay=5, max_delay=120):
+    """
+    client.start() can fail with errors.RpcCallFailError when Telegram's
+    own servers report a transient internal issue. Retry the whole
+    start() call with real exponential backoff instead of letting that
+    bubble straight up as a hard failure - the same fix applied to
+    features/telegram_logger.py's bot-mode login, which is where this
+    exact error was first seen hammering the logs in a tight loop.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            if bot_token:
+                await client.start(bot_token=bot_token)
+            else:
+                await client.start()
+            return
+        except errors.RpcCallFailError as e:
+            if attempt >= max_attempts:
+                raise
+            delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+            logger.warning(
+                f"Telegram internal error during login "
+                f"(attempt {attempt}/{max_attempts}): {e}. Retrying in {delay}s…"
+            )
+            await asyncio.sleep(delay)
+
+
 async def _ensure_client_async():
     """
     Return the persistent Telegram client, creating it once.
@@ -119,7 +148,7 @@ async def _ensure_client_async():
             client = TelegramClient(
                 TELEGRAM_SESSION_FILE, api_id, api_hash, **common_kwargs
             )
-        await client.start()
+        await _start_with_backoff(client)
         _persistent_client = client
         _client_ready.set()
         logger.info("Persistent Telegram client ready")
