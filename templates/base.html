@@ -525,6 +525,41 @@
             </div>
         </section>
 
+        <!-- ===== Proxy Fetcher ===== -->
+        <section class="settings-section">
+            <h3><i class="fas fa-network-wired"></i> Proxy Fetcher</h3>
+            <p style="font-size: 0.72rem; color: #8a9bc0; margin-bottom: 0.6rem;">
+                When enabled, the proxy fetcher runs background cycles to fetch
+                new proxies and re-test existing ones. Results persist to disk
+                and are exposed via <code>/api/proxies</code>.
+            </p>
+
+            <label class="settings-row">
+                <span>Continuous automation</span>
+                <input type="checkbox" id="setProxyEnabled">
+            </label>
+
+            <label class="settings-row">
+                <span>Cycle interval</span>
+                <select id="setProxyInterval">
+                    <option value="300">5 minutes</option>
+                    <option value="900">15 minutes</option>
+                    <option value="1800">30 minutes</option>
+                    <option value="3600">1 hour</option>
+                    <option value="7200">2 hours</option>
+                    <option value="21600">6 hours</option>
+                </select>
+            </label>
+
+            <label class="settings-row">
+                <span>Max stored proxies</span>
+                <input type="number" id="setProxyMaxResults"
+                       min="100" max="100000" step="100">
+            </label>
+
+            <div class="settings-hint" id="setProxyStatus"></div>
+        </section>
+
         <!-- ===== Colab Coordinator ===== -->
         <section class="settings-section">
             <h3><i class="fas fa-shield-halved"></i> Colab Coordinator</h3>
@@ -710,6 +745,12 @@ window.applyTheme = function (theme, syncServer) {
     const tgListenerTestInput = document.getElementById('setTgListenerTestInput');
     const tgListenerTestResult = document.getElementById('setTgListenerTestResult');
 
+    // Proxy fetcher refs
+    const inProxyEnabled    = document.getElementById('setProxyEnabled');
+    const inProxyInterval   = document.getElementById('setProxyInterval');
+    const inProxyMaxResults = document.getElementById('setProxyMaxResults');
+    const proxyStatusEl     = document.getElementById('setProxyStatus');
+
     let current = null;
 
     /* ---------- Toast ---------- */
@@ -782,6 +823,11 @@ window.applyTheme = function (theme, syncServer) {
             inTgListenerExclude.value   = current.tg_listener_exclude_pattern || '';
             inTgListenerPrefix.value    = current.tg_listener_forward_prefix || '';
 
+            // Proxy fetcher
+            inProxyEnabled.checked    = !!current.proxy_continuous_enabled;
+            inProxyInterval.value     = String(current.proxy_continuous_interval || 900);
+            inProxyMaxResults.value   = String(current.proxy_max_results || 10000);
+
             const hints = [];
             if (current.env && current.env.TG_LOG_CHANNEL)
                 hints.push('env TG_LOG_CHANNEL is set');
@@ -794,8 +840,9 @@ window.applyTheme = function (theme, syncServer) {
 
             statusEl.style.display = 'none';
 
-            // Fetch listener runtime state
+            // Fetch runtime status
             refreshListenerStatus();
+            refreshProxyStatus();
         } catch (e) {
             toast('Failed to load settings', true);
             console.error(e);
@@ -858,7 +905,18 @@ window.applyTheme = function (theme, syncServer) {
         if (inTgListenerPrefix.value.trim() !== (current.tg_listener_forward_prefix || ''))
             payload.tg_listener_forward_prefix = inTgListenerPrefix.value.trim();
 
+        // Proxy fetcher payload (only changed fields)
+        if (inProxyEnabled.checked !== !!current.proxy_continuous_enabled)
+            payload.proxy_continuous_enabled = inProxyEnabled.checked;
+        const wantInterval = parseInt(inProxyInterval.value, 10);
+        if (!isNaN(wantInterval) && wantInterval !== current.proxy_continuous_interval)
+            payload.proxy_continuous_interval = wantInterval;
+        const wantMax = parseInt(inProxyMaxResults.value, 10);
+        if (!isNaN(wantMax) && wantMax !== current.proxy_max_results)
+            payload.proxy_max_results = wantMax;
+
         const anyListenerKeyUpdated = Object.keys(payload).some(k => k.startsWith('tg_listener_'));
+        const anyProxyKeyUpdated    = Object.keys(payload).some(k => k.startsWith('proxy_'));
 
         if (!Object.keys(payload).length) {
             toast('No changes');
@@ -910,8 +968,10 @@ window.applyTheme = function (theme, syncServer) {
             await load();
 
             if (anyListenerKeyUpdated) {
-                // Give the backend a beat to apply the change before refreshing
                 setTimeout(refreshListenerStatus, 1500);
+            }
+            if (anyProxyKeyUpdated) {
+                setTimeout(refreshProxyStatus, 1500);
             }
         } catch (e) {
             statusEl.style.display = 'block';
@@ -976,6 +1036,33 @@ window.applyTheme = function (theme, syncServer) {
             if (s.last_error)        parts.push('⚠️ ' + s.last_error);
             inTgListenerStatus.textContent = parts.join(' · ');
             inTgListenerStatus.classList.toggle('warn', !!s.last_error);
+        } catch (e) { /* silent */ }
+    }
+
+    /* ---------- Proxy daemon status ---------- */
+    async function refreshProxyStatus() {
+        try {
+            const r = await fetch('/proxy/status', { cache: 'no-store' });
+            if (!r.ok) return;
+            const s = await r.json();
+            const bits = [];
+            if (s.continuous_enabled) {
+                bits.push(s.running ? '🔄 cycle running' : '🟢 daemon active');
+                if (s.daemon_alive && s.next_run_at) {
+                    const inSec = Math.max(0,
+                        s.next_run_at - Math.floor(Date.now() / 1000));
+                    const m = Math.ceil(inSec / 60);
+                    bits.push('next in ' + (m > 60
+                        ? Math.round(m / 60) + 'h'
+                        : m + 'm'));
+                }
+            } else {
+                bits.push('⚪ disabled');
+            }
+            bits.push(`${s.total_stored || 0} proxies stored`);
+            if (s.last_error) bits.push('⚠️ ' + s.last_error);
+            proxyStatusEl.textContent = bits.join(' · ');
+            proxyStatusEl.classList.toggle('warn', !!s.last_error);
         } catch (e) { /* silent */ }
     }
 
@@ -1078,9 +1165,12 @@ window.applyTheme = function (theme, syncServer) {
         }
     });
 
-    /* ---------- Keep listener status fresh while panel is open ---------- */
+    /* ---------- Keep status lines fresh while panel is open ---------- */
     setInterval(() => {
-        if (panel && panel.classList.contains('open')) refreshListenerStatus();
+        if (panel && panel.classList.contains('open')) {
+            refreshListenerStatus();
+            refreshProxyStatus();
+        }
     }, 10000);
 
     /* ---------- Sync theme from server on initial load ---------- */
