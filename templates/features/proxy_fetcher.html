@@ -36,11 +36,14 @@
             <option value="recent">Sort: Newest test</option>
             <option value="ip">Sort: IP</option>
             <option value="type">Sort: Type</option>
+            <option value="country">Sort: Country</option>
         </select>
         <input type="number" id="filterMinLat" placeholder="min ms"
                style="width:100px;">
         <input type="number" id="filterMaxLat" placeholder="max ms"
                style="width:100px;">
+        <input type="text" id="filterCountry" placeholder="country (US, Germany…)"
+               style="width:160px;">
         <input type="text" id="filterQuery" placeholder="search IP"
                style="flex:1; min-width:120px;">
         <button id="applyFiltersBtn" class="primary"
@@ -125,6 +128,12 @@
         if (ms < 1000) return '#f59e0b';
         return '#ef4444';
     }
+    function countryFlag(code) {
+        if (!code || code.length !== 2) return '';
+        const base = 0x1F1E6;
+        const points = [...code.toUpperCase()].map(c => base + (c.charCodeAt(0) - 65));
+        return String.fromCodePoint(...points);
+    }
 
     // ── Build current filter query string ───────────────────
     function buildQuery() {
@@ -139,6 +148,8 @@
         if (!isNaN(mx)) q.set('max_latency', mx);
         const qs = $('filterQuery').value.trim();
         if (qs) q.set('q', qs);
+        const country = $('filterCountry').value.trim();
+        if (country) q.set('country', country);
         q.set('limit', PAGE_SIZE);
         q.set('offset', offset);
         return q;
@@ -199,6 +210,9 @@
                 <div class="file-size"
                      style="font-family:monospace; word-break:break-all;">
                     ${escapeHtml(p.ip)}:${p.port}
+                </div>
+                <div class="file-size" style="font-size:0.72rem; color:#a0aec0;">
+                    ${countryFlag(p.country_code)} ${escapeHtml(p.country || 'Unknown')}
                 </div>
                 <div class="file-size" style="display:flex; gap:0.6rem;
                      align-items:center; font-size:0.7rem;">
@@ -355,11 +369,15 @@
     $('filterQuery').addEventListener('keydown', e => {
         if (e.key === 'Enter') applyFilters();
     });
+    $('filterCountry').addEventListener('keydown', e => {
+        if (e.key === 'Enter') applyFilters();
+    });
     $('resetFiltersBtn').onclick = () => {
         $('filterType').value = '';
         $('filterSort').value = 'latency';
         $('filterMinLat').value = '';
         $('filterMaxLat').value = '';
+        $('filterCountry').value = '';
         $('filterQuery').value = '';
         applyFilters();
     };
