@@ -1,4 +1,4 @@
-# Crypto Opportunity Monitor (v4)
+# Crypto Opportunity Monitor (v5)
 
 Forwards **free** crypto opportunities from Telegram channels **and** the Binance / Bybit announcement
 feeds to your alert chat, with a log that tells you exactly why anything was skipped.
@@ -73,6 +73,33 @@ Off by default. Any OpenAI-compatible API (DeepSeek, OpenAI, OpenRouter, Groq, O
 * First run only records what already exists (no flood). Seen IDs persist in `exchange_events_state.json`.
 * Headlines already forwarded from a Telegram channel (or vice-versa) are not sent twice.
 
+### Binance Square and Bybit ByX (community platforms)
+
+Neither platform offers a way to *read* posts through an official API (Binance's Square API only publishes),
+so the monitor reads their **public pages** — no login, no keys:
+
+| | Binance Square | Bybit ByX |
+|---|---|---|
+| Official accounts | `binance_announcement`, `binance_square_official`, `binance_security` (+ yours) | `BybitX` (official avatar) (+ yours) |
+| Community content | hashtag pages (`airdrop`, `LearnAndEarn`, `RedPacket`, `CreatorPad`, `Booster`… — editable), Discover feed | the ByX feed |
+| Post identity | post ID | author + content hash (ByX posts have no permalink; the alert links to the author's profile) |
+
+* Polled every 5 minutes with polite random delays; first run only records what exists.
+* **Official accounts** are judged like any announcement. **Community posts are user content** and get stricter handling:
+  score must be at least *minimum confidence + 10*, posts with referral / affiliate links are dropped,
+  "like + follow to win" bait needs +10 more, one author can forward at most 2 per hour, at most 5 community
+  posts per cycle, and at most 5 LLM reviews per cycle. They are labelled **Community (unverified)**.
+* Hashtag-page membership is *not* treated as evidence (a post on `#airdrop` isn't a campaign by itself).
+* The pages are parsed from their markup, so a redesign can break parsing, and Binance may show a bot challenge to
+  datacenter IPs. If plain HTTP is challenged and **Playwright** is installed
+  (`pip install playwright && playwright install chromium`) the monitor falls back to a headless browser.
+  Otherwise set `PROXY_URL` or turn the source off in Settings.
+* Settings → **Check feeds** (or `GET /telegram/listener/exchange?probe=1`, `?probe=square|byx|bybit|binance`)
+  fetches everything once *without forwarding* and shows counts, samples, per-page errors and whether Playwright
+  is available — run it first from your server.
+* Settings: *Binance Square*, *Bybit ByX*, *Community posts (Square + ByX)*, *Square hashtags*, *Square accounts*,
+  *ByX accounts* (user ID = last part of a ByX profile URL).
+
 **Check it works from your server first:**
 
 ```bash
@@ -100,7 +127,8 @@ If Binance prints `HTTP 403/451`, run the app through `PROXY_URL` or turn the fe
 | `GET /telegram/listener/status` | state, counters, LLM + feed health |
 | `GET /telegram/listener/recent?n=50&decision=skipped` | why each message was forwarded/skipped |
 | `POST /telegram/listener/test` `{text, use_llm}` | full analysis of a sample |
-| `GET/POST /telegram/listener/exchange` | feed status / poll now |
+| `GET/POST /telegram/listener/exchange` | feed status / poll now (Square + ByX included) |
+| `GET /telegram/listener/exchange?probe=1` | test-fetch every feed from this server, nothing is forwarded |
 | `POST /telegram/listener/bot/verify\|detect\|test` | check token / find your chat id / send a test alert |
 | `POST /telegram/listener/reload` | re-apply settings |
 
@@ -109,12 +137,14 @@ If Binance prints `HTTP 403/451`, run the app through `PROXY_URL` or turn the fe
 Existing: `tg_listener_enabled|sources|target|include_pattern|exclude_pattern|forward_prefix|detection_mode|min_score|cost_policy`
 (`cost_policy` now also accepts `strict`). New: `tg_listener_llm_mode` (`off|assist|full`),
 `tg_listener_llm_model`, `tg_listener_llm_base_url`, `tg_listener_llm_api_key`, `tg_listener_exchange_enabled`,
-`tg_listener_delivery` (`account|bot`), `tg_listener_bot_token`, `tg_listener_bot_chat`.
+`tg_listener_delivery` (`account|bot`), `tg_listener_bot_token`, `tg_listener_bot_chat`,
+`tg_listener_square_enabled`, `tg_listener_square_community`, `tg_listener_square_tags`, `tg_listener_square_accounts`,
+`tg_listener_byx_enabled`, `tg_listener_byx_accounts`.
 
 ## Tests
 
 ```bash
-python -m unittest discover -s tests -v      # 53 tests, needs only `requests`
+python -m unittest discover -s tests -v      # 94 tests, needs `requests` (+ `beautifulsoup4` for the page-parsing tests)
 python -m compileall -q .
 ```
 

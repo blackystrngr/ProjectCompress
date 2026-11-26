@@ -463,6 +463,38 @@
                 <input type="checkbox" id="setTgListenerExchange">
             </label>
             <label class="settings-row">
+                <span>Binance Square</span>
+                <input type="checkbox" id="setTgListenerSquare">
+            </label>
+            <label class="settings-row">
+                <span>Community posts (Square + ByX)</span>
+                <input type="checkbox" id="setTgListenerSquareCommunity">
+            </label>
+            <label class="settings-row">
+                <span>Square hashtags</span>
+                <input type="text" id="setTgListenerSquareTags" placeholder="default: airdrop, LearnAndEarn, RedPacket…" autocomplete="off">
+            </label>
+            <label class="settings-row">
+                <span>Square accounts</span>
+                <input type="text" id="setTgListenerSquareAccounts" placeholder="extra @handles to follow" autocomplete="off">
+            </label>
+            <label class="settings-row">
+                <span>Bybit ByX</span>
+                <input type="checkbox" id="setTgListenerByx">
+            </label>
+            <label class="settings-row">
+                <span>ByX accounts</span>
+                <input type="text" id="setTgListenerByxAccounts" placeholder="extra user IDs (end of profile URL)" autocomplete="off">
+            </label>
+            <div style="display:flex;gap:0.4rem;flex-wrap:wrap;margin:0.2rem 0 0.4rem;">
+                <button id="setTgListenerFeedsCheck" class="settings-btn" type="button">Check feeds (Bybit · Binance · Square · ByX)</button>
+            </div>
+            <div style="font-size:0.68rem;color:#8a9bc0;margin-bottom:0.5rem;">
+                Binance Square and Bybit ByX have no official read API, so their public pages are read (Square: verified accounts,
+                hashtag pages, Discover; ByX: the feed and official profiles). Official accounts are forwarded normally; community
+                posts need a higher score and are skipped when they carry referral links. The check takes about a minute.
+            </div>
+            <label class="settings-row">
                 <span>LLM second opinion</span>
                 <select id="setTgListenerLlmMode">
                     <option value="off">Off (rules only)</option>
@@ -523,41 +555,6 @@
                 <div id="setTgListenerTestResult" class="settings-hint"
                      style="display:none;"></div>
             </div>
-        </section>
-
-        <!-- ===== Proxy Fetcher ===== -->
-        <section class="settings-section">
-            <h3><i class="fas fa-network-wired"></i> Proxy Fetcher</h3>
-            <p style="font-size: 0.72rem; color: #8a9bc0; margin-bottom: 0.6rem;">
-                When enabled, the proxy fetcher runs background cycles to fetch
-                new proxies and re-test existing ones. Results persist to disk
-                and are exposed via <code>/api/proxies</code>.
-            </p>
-
-            <label class="settings-row">
-                <span>Continuous automation</span>
-                <input type="checkbox" id="setProxyEnabled">
-            </label>
-
-            <label class="settings-row">
-                <span>Cycle interval</span>
-                <select id="setProxyInterval">
-                    <option value="300">5 minutes</option>
-                    <option value="900">15 minutes</option>
-                    <option value="1800">30 minutes</option>
-                    <option value="3600">1 hour</option>
-                    <option value="7200">2 hours</option>
-                    <option value="21600">6 hours</option>
-                </select>
-            </label>
-
-            <label class="settings-row">
-                <span>Max stored proxies</span>
-                <input type="number" id="setProxyMaxResults"
-                       min="100" max="100000" step="100">
-            </label>
-
-            <div class="settings-hint" id="setProxyStatus"></div>
         </section>
 
         <!-- ===== Colab Coordinator ===== -->
@@ -730,6 +727,13 @@ window.applyTheme = function (theme, syncServer) {
     const tgBotVerifyBtn = document.getElementById('setTgListenerBotVerify');
     const tgBotDetectBtn = document.getElementById('setTgListenerBotDetect');
     const tgBotTestBtn = document.getElementById('setTgListenerBotTest');
+    const inTgListenerSquare = document.getElementById('setTgListenerSquare');
+    const inTgListenerSquareCommunity = document.getElementById('setTgListenerSquareCommunity');
+    const inTgListenerSquareTags = document.getElementById('setTgListenerSquareTags');
+    const inTgListenerSquareAccounts = document.getElementById('setTgListenerSquareAccounts');
+    const inTgListenerByx = document.getElementById('setTgListenerByx');
+    const inTgListenerByxAccounts = document.getElementById('setTgListenerByxAccounts');
+    const tgFeedsCheckBtn = document.getElementById('setTgListenerFeedsCheck');
     const inTgListenerExchange = document.getElementById('setTgListenerExchange');
     const inTgListenerLlmMode = document.getElementById('setTgListenerLlmMode');
     const inTgListenerLlmBase = document.getElementById('setTgListenerLlmBase');
@@ -744,12 +748,6 @@ window.applyTheme = function (theme, syncServer) {
     const tgListenerTestBtn   = document.getElementById('setTgListenerTestBtn');
     const tgListenerTestInput = document.getElementById('setTgListenerTestInput');
     const tgListenerTestResult = document.getElementById('setTgListenerTestResult');
-
-    // Proxy fetcher refs
-    const inProxyEnabled    = document.getElementById('setProxyEnabled');
-    const inProxyInterval   = document.getElementById('setProxyInterval');
-    const inProxyMaxResults = document.getElementById('setProxyMaxResults');
-    const proxyStatusEl     = document.getElementById('setProxyStatus');
 
     let current = null;
 
@@ -814,6 +812,12 @@ window.applyTheme = function (theme, syncServer) {
             inTgListenerBotToken.placeholder = current.tg_listener_bot_token_set ? '•••••• (saved — type to replace)' : '123456789:AA… (from @BotFather)';
             inTgListenerBotChat.value = current.tg_listener_bot_chat || '';
             inTgListenerExchange.checked = current.tg_listener_exchange_enabled !== false;
+            inTgListenerSquare.checked = current.tg_listener_square_enabled !== false;
+            inTgListenerSquareCommunity.checked = current.tg_listener_square_community !== false;
+            inTgListenerSquareTags.value = current.tg_listener_square_tags || '';
+            inTgListenerSquareAccounts.value = current.tg_listener_square_accounts || '';
+            inTgListenerByx.checked = current.tg_listener_byx_enabled !== false;
+            inTgListenerByxAccounts.value = current.tg_listener_byx_accounts || '';
             inTgListenerLlmMode.value = current.tg_listener_llm_mode || 'off';
             inTgListenerLlmBase.value = current.tg_listener_llm_base_url || '';
             inTgListenerLlmModel.value = current.tg_listener_llm_model || '';
@@ -822,11 +826,6 @@ window.applyTheme = function (theme, syncServer) {
             inTgListenerInclude.value   = current.tg_listener_include_pattern || '';
             inTgListenerExclude.value   = current.tg_listener_exclude_pattern || '';
             inTgListenerPrefix.value    = current.tg_listener_forward_prefix || '';
-
-            // Proxy fetcher
-            inProxyEnabled.checked    = !!current.proxy_continuous_enabled;
-            inProxyInterval.value     = String(current.proxy_continuous_interval || 900);
-            inProxyMaxResults.value   = String(current.proxy_max_results || 10000);
 
             const hints = [];
             if (current.env && current.env.TG_LOG_CHANNEL)
@@ -840,9 +839,8 @@ window.applyTheme = function (theme, syncServer) {
 
             statusEl.style.display = 'none';
 
-            // Fetch runtime status
+            // Fetch listener runtime state
             refreshListenerStatus();
-            refreshProxyStatus();
         } catch (e) {
             toast('Failed to load settings', true);
             console.error(e);
@@ -888,6 +886,18 @@ window.applyTheme = function (theme, syncServer) {
             payload.tg_listener_bot_token = inTgListenerBotToken.value.trim();
         if (inTgListenerBotChat.value.trim() !== (current.tg_listener_bot_chat || ''))
             payload.tg_listener_bot_chat = inTgListenerBotChat.value.trim();
+        if (inTgListenerSquare.checked !== (current.tg_listener_square_enabled !== false))
+            payload.tg_listener_square_enabled = inTgListenerSquare.checked;
+        if (inTgListenerSquareCommunity.checked !== (current.tg_listener_square_community !== false))
+            payload.tg_listener_square_community = inTgListenerSquareCommunity.checked;
+        if (inTgListenerSquareTags.value.trim() !== (current.tg_listener_square_tags || ''))
+            payload.tg_listener_square_tags = inTgListenerSquareTags.value.trim();
+        if (inTgListenerByx.checked !== (current.tg_listener_byx_enabled !== false))
+            payload.tg_listener_byx_enabled = inTgListenerByx.checked;
+        if (inTgListenerByxAccounts.value.trim() !== (current.tg_listener_byx_accounts || ''))
+            payload.tg_listener_byx_accounts = inTgListenerByxAccounts.value.trim();
+        if (inTgListenerSquareAccounts.value.trim() !== (current.tg_listener_square_accounts || ''))
+            payload.tg_listener_square_accounts = inTgListenerSquareAccounts.value.trim();
         if (inTgListenerExchange.checked !== (current.tg_listener_exchange_enabled !== false))
             payload.tg_listener_exchange_enabled = inTgListenerExchange.checked;
         if (inTgListenerLlmMode.value !== (current.tg_listener_llm_mode || 'off'))
@@ -905,18 +915,7 @@ window.applyTheme = function (theme, syncServer) {
         if (inTgListenerPrefix.value.trim() !== (current.tg_listener_forward_prefix || ''))
             payload.tg_listener_forward_prefix = inTgListenerPrefix.value.trim();
 
-        // Proxy fetcher payload (only changed fields)
-        if (inProxyEnabled.checked !== !!current.proxy_continuous_enabled)
-            payload.proxy_continuous_enabled = inProxyEnabled.checked;
-        const wantInterval = parseInt(inProxyInterval.value, 10);
-        if (!isNaN(wantInterval) && wantInterval !== current.proxy_continuous_interval)
-            payload.proxy_continuous_interval = wantInterval;
-        const wantMax = parseInt(inProxyMaxResults.value, 10);
-        if (!isNaN(wantMax) && wantMax !== current.proxy_max_results)
-            payload.proxy_max_results = wantMax;
-
         const anyListenerKeyUpdated = Object.keys(payload).some(k => k.startsWith('tg_listener_'));
-        const anyProxyKeyUpdated    = Object.keys(payload).some(k => k.startsWith('proxy_'));
 
         if (!Object.keys(payload).length) {
             toast('No changes');
@@ -968,10 +967,8 @@ window.applyTheme = function (theme, syncServer) {
             await load();
 
             if (anyListenerKeyUpdated) {
+                // Give the backend a beat to apply the change before refreshing
                 setTimeout(refreshListenerStatus, 1500);
-            }
-            if (anyProxyKeyUpdated) {
-                setTimeout(refreshProxyStatus, 1500);
             }
         } catch (e) {
             statusEl.style.display = 'block';
@@ -1039,33 +1036,6 @@ window.applyTheme = function (theme, syncServer) {
         } catch (e) { /* silent */ }
     }
 
-    /* ---------- Proxy daemon status ---------- */
-    async function refreshProxyStatus() {
-        try {
-            const r = await fetch('/proxy/status', { cache: 'no-store' });
-            if (!r.ok) return;
-            const s = await r.json();
-            const bits = [];
-            if (s.continuous_enabled) {
-                bits.push(s.running ? '🔄 cycle running' : '🟢 daemon active');
-                if (s.daemon_alive && s.next_run_at) {
-                    const inSec = Math.max(0,
-                        s.next_run_at - Math.floor(Date.now() / 1000));
-                    const m = Math.ceil(inSec / 60);
-                    bits.push('next in ' + (m > 60
-                        ? Math.round(m / 60) + 'h'
-                        : m + 'm'));
-                }
-            } else {
-                bits.push('⚪ disabled');
-            }
-            bits.push(`${s.total_stored || 0} proxies stored`);
-            if (s.last_error) bits.push('⚠️ ' + s.last_error);
-            proxyStatusEl.textContent = bits.join(' · ');
-            proxyStatusEl.classList.toggle('warn', !!s.last_error);
-        } catch (e) { /* silent */ }
-    }
-
     /* ---------- Test filter ---------- */
     tgListenerTestBtn.addEventListener('click', async () => {
         const text = tgListenerTestInput.value.trim();
@@ -1108,6 +1078,40 @@ window.applyTheme = function (theme, syncServer) {
             tgListenerTestBtn.disabled = false;
             tgListenerTestBtn.innerHTML = '<i class="fas fa-vial"></i> Test filter';
         }
+    });
+
+    /* ---------- Check feeds (Bybit · Binance · Square) ---------- */
+    tgFeedsCheckBtn.addEventListener('click', async () => {
+        tgListenerTestResult.style.display = 'block';
+        tgListenerTestResult.style.whiteSpace = 'pre-wrap';
+        tgListenerTestResult.style.color = '#cbd5f5';
+        tgListenerTestResult.textContent = '… checking all feeds from the server (about a minute)';
+        tgFeedsCheckBtn.disabled = true;
+        try {
+            const r = await fetch('/telegram/listener/exchange?probe=1', { cache: 'no-store' });
+            const d = await r.json();
+            const lines = [];
+            const names = { bybit: 'Bybit announcements', binance: 'Binance announcements', square: 'Binance Square', byx: 'Bybit ByX' };
+            for (const name of ['bybit', 'binance', 'square', 'byx']) {
+                const x = d[name]; if (!x) continue;
+                lines.push(x.ok ? `✅ ${names[name]}: ${x.count} item(s)` : `❌ ${names[name]}: ${x.error}`);
+                (x.sample || []).slice(0, 3).forEach(t => lines.push('     · ' + t));
+            }
+            for (const key of ['square', 'byx']) {
+                const pg = d[key + '_pages'];
+                if (!pg) continue;
+                lines.push(`${names[key]} pages: ${pg.pages_ok} ok · ${pg.pages_failed} failed` +
+                    (pg.via_browser ? ` · ${pg.via_browser} via browser` : ''));
+                (pg.page_errors || []).slice(0, 2).forEach(e => lines.push('     ! ' + e));
+            }
+            if (((d.square && !d.square.ok) || (d.byx && !d.byx.ok)) && !d.playwright_available)
+                lines.push('Tip: if Binance serves a bot challenge, install Playwright (pip install playwright && playwright install chromium) so Square can fall back to a headless browser, or set PROXY_URL.');
+            tgListenerTestResult.style.color = ((d.square && d.square.ok) && (d.byx && d.byx.ok)) ? '#a5f3c5' : '#fcd34d';
+            tgListenerTestResult.textContent = lines.join('\n');
+        } catch (e) {
+            tgListenerTestResult.style.color = '#ff8a8a';
+            tgListenerTestResult.textContent = '❌ ' + e.message;
+        } finally { tgFeedsCheckBtn.disabled = false; }
     });
 
     /* ---------- Alert bot: verify / detect chat / test ---------- */
@@ -1165,12 +1169,9 @@ window.applyTheme = function (theme, syncServer) {
         }
     });
 
-    /* ---------- Keep status lines fresh while panel is open ---------- */
+    /* ---------- Keep listener status fresh while panel is open ---------- */
     setInterval(() => {
-        if (panel && panel.classList.contains('open')) {
-            refreshListenerStatus();
-            refreshProxyStatus();
-        }
+        if (panel && panel.classList.contains('open')) refreshListenerStatus();
     }, 10000);
 
     /* ---------- Sync theme from server on initial load ---------- */

@@ -115,6 +115,11 @@ _stats = {
 # ============================================================
 # Config / helpers
 # ============================================================
+def _split_list(value):
+    """'airdrop, #quiz\nRedPacket' -> ['airdrop', 'quiz', 'RedPacket']"""
+    return [t.strip().lstrip('#@') for t in re.split(r'[,\n;]+', value or '') if t.strip().lstrip('#@')]
+
+
 def _load_config():
     try:
         from .settings import get_effective_config
@@ -134,6 +139,12 @@ def _load_config():
             'llm_base_url': (cfg.get('tg_listener_llm_base_url') or '').strip(),
             'llm_api_key': (cfg.get('tg_listener_llm_api_key') or '').strip(),
             'exchange': bool(cfg.get('tg_listener_exchange_enabled', True)),
+            'square': bool(cfg.get('tg_listener_square_enabled', True)),
+            'byx': bool(cfg.get('tg_listener_byx_enabled', True)),
+            'byx_accounts': _split_list(cfg.get('tg_listener_byx_accounts')),
+            'square_community': bool(cfg.get('tg_listener_square_community', True)),
+            'square_tags': _split_list(cfg.get('tg_listener_square_tags')),
+            'square_accounts': _split_list(cfg.get('tg_listener_square_accounts')),
             'delivery': cfg.get('tg_listener_delivery', 'account'),
             # dedicated alert bot, else reuse the Telegram-logger bot token
             'bot_token': ((cfg.get('tg_listener_bot_token') or cfg.get('tg_log_bot_token') or '')).strip(),
@@ -147,7 +158,8 @@ def _load_config():
             'prefix': DEFAULT_PREFIX, 'mode': 'intelligent',
             'min_score': 45, 'cost_policy': 'free',
             'llm_mode': 'off', 'llm_model': '', 'llm_base_url': '', 'llm_api_key': '',
-            'exchange': True, 'delivery': 'account', 'bot_token': '', 'bot_chat': '',
+            'exchange': True, 'square': True, 'byx': True, 'byx_accounts': [], 'square_community': True, 'square_tags': [], 'square_accounts': [],
+            'delivery': 'account', 'bot_token': '', 'bot_chat': '',
         }
 
 
@@ -674,8 +686,12 @@ def register_routes(app):
         """GET: poller status. POST: poll Binance/Bybit right now."""
         if exchange_events is None:
             return jsonify({'error': 'exchange_events module not available'}), 500
+        probe = (request.args.get('probe') or '').strip()
+        if probe:                         # ?probe=1|bybit|binance|square : what does THIS server get?
+            only = probe if probe in ('bybit', 'binance', 'square', 'byx') else None
+            return jsonify(exchange_events.probe(_load_config(), only=only))
         if request.method == 'POST':
-            exchange_events.poll_now()
+            exchange_events.poll_now(force_square=True)
             time.sleep(1.5)
         return jsonify(exchange_events.get_status())
 

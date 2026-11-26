@@ -96,6 +96,7 @@ CATEGORIES: Dict[str, Dict] = {
         r"\bmystery\s*box(?:es)?\b", r"\btrading (?:voucher|bonus)\b", r"\bprize pool\b",
         r"\bshare (?:a |an |the )?(?:\$|[\d,.]+\s*(?:k|m)?\s*)?[\d,.]*\s*(?:usdt|usdc|bnb|usd)\b",
         r"\bspin\s*(?:&|and|to)\s*win\b", r"\blucky draw\b", r"\blottery\b",
+        r"#\w*to(?:earn|win)\w*", r"\b(?:post|publish|share)\b[^.\n]{0,40}\bto (?:earn|win)\b[^.\n]{0,20}\d+\s*(?:usdt|usdc|u)\b",
     ]},
     "bounty": {"weight": 1, "free": False, "patterns": [
         r"\bbount(?:y|ies)\b", r"\bambassador\b", r"content (?:creator|contest)",
@@ -202,6 +203,20 @@ DANGEROUS = (
     r"\b100% (?:profit|guaranteed|safe returns?)\b", r"dm (?:me|us) (?:to|for) (?:claim|receive|get)",
     r"contact (?:our )?(?:support|admin|agent) (?:on|via|at) (?:telegram|whatsapp)",
 )
+
+# Referral / affiliate spam (very common in user posts) and engagement bait
+REFERRAL_RE = re.compile(
+    r"join\.binance\.com|binance\.com/(?:[a-z-]+/)?(?:activity/)?(?:referral|register)[^\s]*"
+    r"|[?&](?:ref|referral|referralcode|invite)=\w+|bybit\.com/(?:[a-z-]+/)?(?:register|invite)[^\s]*"
+    r"|\b(?:referral|invite|ref(?:erral)?)\s*(?:code|id|link)\s*[:=\-]?\s*[A-Za-z0-9]{5,}"
+    r"|\b(?:sign\s*up|register|join)\b[^.\n]{0,40}\b(?:my|our|using)\b[^.\n]{0,15}\b(?:link|code|referral)\b",
+    re.IGNORECASE)
+BAIT_RE = re.compile(
+    r"\b(?:like|repost|retweet|follow|comment|tag|share)\b[^.\n]{0,45}\b(?:to win|and win|to enter|to qualify|"
+    r"to be eligible|for a chance|to get|to receive)\b"
+    r"|\bfollow (?:me|us)\b[^.\n]{0,15}\b(?:and|&)\b[^.\n]{0,15}\b(?:like|repost|comment)\b"
+    r"|\btag \d+ friends\b|\bcomment (?:\"?\w+\"?|below) (?:to|and) (?:win|get|receive)\b",
+    re.IGNORECASE)
 
 URL_RE = re.compile(r"(?:https?://|www\.)[^\s<>)\]]+", re.IGNORECASE)
 SHORTENERS = {"bit.ly", "tinyurl.com", "t.co", "goo.gl", "cutt.ly", "shorturl.at", "rb.gy",
@@ -363,6 +378,8 @@ def analyze_message(message: str, min_score: int = 45, policy: str = "free",
                 "risk_flags": ["credential_or_payment_phishing"], "cost_tier": "unstated",
                 "needs_review": False, "hard_reject": True}
     link_flags, link_hard = _link_risks(text)
+    if REFERRAL_RE.search(text):
+        link_flags = sorted(set(link_flags) | {"referral_link"})
     if link_hard:
         return {"accepted": False, "score": 0, "category": "suspicious", "cost_policy": policy,
                 "reason": "look-alike / suspicious domain impersonating an exchange",
@@ -436,6 +453,13 @@ def analyze_message(message: str, min_score: int = 45, policy: str = "free",
     risk_flags = list(link_flags)
     if "url_shortener" in link_flags:
         score -= 6
+    if "referral_link" in link_flags:
+        score -= 15
+        evidence.append("referral_link")
+    if BAIT_RE.search(text):
+        score -= 8
+        risk_flags.append("engagement_bait")
+        evidence.append("engagement_bait")
     if cost_tier == "mentioned":
         score -= min(24, 8 * len(cost["mentioned"]))
     score = max(0, min(100, score))

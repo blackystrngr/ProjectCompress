@@ -81,14 +81,15 @@ ALLOWED_KEYS = {
     'tg_listener_llm_base_url':    {'type': 'str', 'max': 200},
     'tg_listener_llm_api_key':     {'type': 'str', 'max': 300},   # write-only (never returned)
     'tg_listener_exchange_enabled': {'type': 'bool'},
+    'tg_listener_square_enabled':  {'type': 'bool'},
+    'tg_listener_byx_enabled':     {'type': 'bool'},
+    'tg_listener_byx_accounts':    {'type': 'str', 'max': 300},
+    'tg_listener_square_community': {'type': 'bool'},
+    'tg_listener_square_tags':     {'type': 'str', 'max': 600},
+    'tg_listener_square_accounts': {'type': 'str', 'max': 300},
     'tg_listener_delivery':        {'type': 'str', 'choices': ('account', 'bot')},
     'tg_listener_bot_token':       {'type': 'str', 'max': 200},   # write-only (never returned)
     'tg_listener_bot_chat':        {'type': 'str', 'max': 100},
-
-    # ── Proxy fetcher automation ─────────────────────────────
-    'proxy_continuous_enabled':  {'type': 'bool'},
-    'proxy_continuous_interval': {'type': 'int', 'min': 60, 'max': 86400},
-    'proxy_max_results':         {'type': 'int', 'min': 100, 'max': 100000},
 }
 
 
@@ -120,14 +121,6 @@ def _coerce(key: str, value, spec: dict):
         return True, i
 
     return False, 'unknown type'
-
-
-def _as_int(v, default):
-    """Defensive int conversion — never raises on stale / corrupt JSON."""
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return default
 
 
 def get_effective_config() -> dict:
@@ -170,21 +163,22 @@ def get_effective_config() -> dict:
         'tg_listener_exclude_pattern': s.get('tg_listener_exclude_pattern', ''),
         'tg_listener_forward_prefix':  s.get('tg_listener_forward_prefix', ''),
         'tg_listener_detection_mode':  s.get('tg_listener_detection_mode', 'intelligent'),
-        'tg_listener_min_score':       _as_int(s.get('tg_listener_min_score', 45), 45),
+        'tg_listener_min_score':       int(s.get('tg_listener_min_score', 45)),
         'tg_listener_cost_policy':     s.get('tg_listener_cost_policy', 'free'),
         'tg_listener_llm_mode':        s.get('tg_listener_llm_mode', 'off'),
         'tg_listener_llm_model':       s.get('tg_listener_llm_model', ''),
         'tg_listener_llm_base_url':    s.get('tg_listener_llm_base_url', ''),
         'tg_listener_llm_api_key':     s.get('tg_listener_llm_api_key', ''),
         'tg_listener_exchange_enabled': bool(s.get('tg_listener_exchange_enabled', True)),
+        'tg_listener_square_enabled':  bool(s.get('tg_listener_square_enabled', True)),
+        'tg_listener_byx_enabled':     bool(s.get('tg_listener_byx_enabled', True)),
+        'tg_listener_byx_accounts':    s.get('tg_listener_byx_accounts', ''),
+        'tg_listener_square_community': bool(s.get('tg_listener_square_community', True)),
+        'tg_listener_square_tags':     s.get('tg_listener_square_tags', ''),
+        'tg_listener_square_accounts': s.get('tg_listener_square_accounts', ''),
         'tg_listener_delivery':        s.get('tg_listener_delivery', 'account'),
         'tg_listener_bot_token':       s.get('tg_listener_bot_token', ''),
         'tg_listener_bot_chat':        s.get('tg_listener_bot_chat', ''),
-
-        # ── Proxy fetcher automation ──
-        'proxy_continuous_enabled':  bool(s.get('proxy_continuous_enabled', False)),
-        'proxy_continuous_interval': _as_int(s.get('proxy_continuous_interval', 900), 900),
-        'proxy_max_results':         _as_int(s.get('proxy_max_results', 10000), 10000),
     }
 
 
@@ -225,27 +219,28 @@ def register_routes(app):
             'tg_listener_include_pattern': cfg['tg_listener_include_pattern'],
             'tg_listener_exclude_pattern': cfg['tg_listener_exclude_pattern'],
             'tg_listener_forward_prefix':  cfg['tg_listener_forward_prefix'],
-            'tg_listener_detection_mode':  cfg['tg_listener_detection_mode'],
-            'tg_listener_min_score':       cfg['tg_listener_min_score'],
-            'tg_listener_cost_policy':     cfg['tg_listener_cost_policy'],
-            'tg_listener_llm_mode':        cfg['tg_listener_llm_mode'],
-            'tg_listener_llm_model':       cfg['tg_listener_llm_model'],
-            'tg_listener_llm_base_url':    cfg['tg_listener_llm_base_url'],
-            'tg_listener_llm_api_key':     '',
+            'tg_listener_detection_mode': cfg['tg_listener_detection_mode'],
+            'tg_listener_min_score': cfg['tg_listener_min_score'],
+            'tg_listener_cost_policy': cfg['tg_listener_cost_policy'],
+            'tg_listener_llm_mode':     cfg['tg_listener_llm_mode'],
+            'tg_listener_llm_model':    cfg['tg_listener_llm_model'],
+            'tg_listener_llm_base_url': cfg['tg_listener_llm_base_url'],
+            'tg_listener_llm_api_key':  '',
             'tg_listener_llm_api_key_set': bool(cfg['tg_listener_llm_api_key']
                                                 or os.environ.get('LLM_API_KEY')
                                                 or os.environ.get('DEEPSEEK_API_KEY')
                                                 or os.environ.get('OPENAI_API_KEY')),
             'tg_listener_exchange_enabled': cfg['tg_listener_exchange_enabled'],
-            'tg_listener_delivery':        cfg['tg_listener_delivery'],
-            'tg_listener_bot_token':       '',
-            'tg_listener_bot_token_set':   bool(cfg['tg_listener_bot_token'] or cfg.get('tg_log_bot_token')),
-            'tg_listener_bot_chat':        cfg['tg_listener_bot_chat'],
-
-            # ── Proxy fetcher automation ──
-            'proxy_continuous_enabled':  cfg['proxy_continuous_enabled'],
-            'proxy_continuous_interval': cfg['proxy_continuous_interval'],
-            'proxy_max_results':         cfg['proxy_max_results'],
+            'tg_listener_square_enabled':  cfg['tg_listener_square_enabled'],
+            'tg_listener_byx_enabled':     cfg['tg_listener_byx_enabled'],
+            'tg_listener_byx_accounts':    cfg['tg_listener_byx_accounts'],
+            'tg_listener_square_community': cfg['tg_listener_square_community'],
+            'tg_listener_square_tags':     cfg['tg_listener_square_tags'],
+            'tg_listener_square_accounts': cfg['tg_listener_square_accounts'],
+            'tg_listener_delivery':     cfg['tg_listener_delivery'],
+            'tg_listener_bot_token':    '',
+            'tg_listener_bot_token_set': bool(cfg['tg_listener_bot_token'] or cfg.get('tg_log_bot_token')),
+            'tg_listener_bot_chat':     cfg['tg_listener_bot_chat'],
 
             'env':                     env_info,
             'settings_file':           SETTINGS_FILE,
@@ -330,16 +325,6 @@ def register_routes(app):
                 logger.exception("Failed to apply tg_listener settings")
                 errors['tg_listener'] = str(e)
 
-        # ── NEW: proxy fetcher automation ──
-        if any(k.startswith('proxy_') for k in updated):
-            try:
-                from .proxy_fetcher import reconfigure as _proxy_reconfigure
-                _proxy_reconfigure()
-                applied.append('proxy_fetcher')
-            except Exception as e:
-                logger.exception("Failed to apply proxy settings")
-                errors['proxy'] = str(e)
-
         logger.info(f"settings saved: updated={updated}, applied={applied}")
 
         return jsonify({
@@ -369,17 +354,11 @@ def register_routes(app):
                 info['file_writable']= os.access(SETTINGS_FILE, os.W_OK)
                 with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
                     contents = json.load(f)
-                # Mask secrets
-                if isinstance(contents, dict):
-                    for secret_key, tag in (
-                        ('tg_log_bot_token', 'tg_log_bot_token'),
-                        ('tg_listener_bot_token', 'tg_listener_bot_token'),
-                        ('tg_listener_llm_api_key', 'tg_listener_llm_api_key'),
-                    ):
-                        tok = contents.get(secret_key)
-                        if tok:
-                            contents[secret_key] = (
-                                tok[:8] + '…' + tok[-4:] if len(tok) > 16 else '••••')
+                # Mask the token
+                if isinstance(contents, dict) and contents.get('tg_log_bot_token'):
+                    tok = contents['tg_log_bot_token']
+                    contents['tg_log_bot_token'] = (
+                        tok[:8] + '…' + tok[-4:] if len(tok) > 16 else '••••')
                 info['contents'] = contents
             except Exception as e:
                 info['read_error'] = f"{type(e).__name__}: {e}"
@@ -391,6 +370,7 @@ def register_routes(app):
             ok, err = save_settings(test)
             test.pop('__test__', None)
             if ok:
+                # Restore (removes the __test__ key)
                 save_settings(test)
                 info['write_test'] = 'ok'
             else:
@@ -410,7 +390,7 @@ def register_routes(app):
 
 
 def get_effective_config_without_token() -> dict:
-    """Same as get_effective_config but with secrets replaced by a bool."""
+    """Same as get_effective_config but with token replaced by a bool."""
     cfg = get_effective_config()
     token = cfg.get('tg_log_bot_token') or ''
     cfg['tg_log_bot_token'] = ''

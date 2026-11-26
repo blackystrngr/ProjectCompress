@@ -6,7 +6,7 @@ from unittest import mock
 from tests import _loader  # noqa: F401
 from features import exchange_events as ex
 
-CFG = {"enabled": True, "exchange": True, "mode": "intelligent", "min_score": 45, "cost_policy": "free",
+CFG = {"enabled": True, "exchange": True, "square": False, "byx": False, "mode": "intelligent", "min_score": 45, "cost_policy": "free",
        "llm_mode": "off", "include": r"\bquiz\b", "exclude": r"\bdelisting notice\b",
        "prefix": "🧭 Crypto Opportunity"}
 
